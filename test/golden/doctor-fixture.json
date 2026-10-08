@@ -1,0 +1,54 @@
+{
+  "at": "<timestamp>",
+  "ok": true,
+  "capabilities": {
+    "config": {
+      "tier": "valid",
+      "status": "ok",
+      "required": false,
+      "detail": "config is valid"
+    },
+    "git": {
+      "tier": "repo",
+      "status": "ok",
+      "required": false,
+      "detail": "HEAD tree <hash>"
+    },
+    "browser": {
+      "tier": "chromium",
+      "status": "ok",
+      "required": true,
+      "detail": "headless Chromium <version> launched and closed"
+    },
+    "trigger": {
+      "tier": "fs-watch",
+      "status": "ok",
+      "required": true,
+      "detail": "12 screen file(s), 1 backend file(s) match the globs"
+    },
+    "barrier": {
+      "tier": "vite-hmr",
+      "status": "ok",
+      "required": false,
+      "detail": "HMR websocket connected at http://localhost:<port>"
+    },
+    "freshness": {
+      "tier": "marker",
+      "status": "ok",
+      "required": false,
+      "detail": "marker .visual-proof/hot present"
+    },
+    "login": {
+      "tier": "http-hook",
+      "status": "ok",
+      "required": false,
+      "detail": "POST /__playwright__/login -> 204"
+    },
+    "routes": {
+      "tier": "import-graph",
+      "status": "ok",
+      "required": false,
+      "detail": "7 route(s), 9 file(s) mapped, 0 unresolved"
+    }
+  }
+}
