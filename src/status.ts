@@ -3,6 +3,28 @@ import { statusFiles, type Dirs } from './paths.js';
 
 export type DaemonState = 'starting' | 'ready' | 'capturing' | 'error' | 'stopped';
 
+export interface WarmupRouteStatus {
+  /** Concrete path that was visited. */
+  route: string;
+  ms: number;
+  ok: boolean;
+  /** Vite reloads or dependency re-optimizations seen while loading it. */
+  reloads?: number;
+  error?: string;
+}
+
+/**
+ * The pre-`ready` visit of a few routes that makes Vite compile and optimize before the first real capture.
+ * `skipped`: nothing to visit or the capturer cannot prime; `timeout`: the budget ran out; `failed`: every
+ * visit failed. None of these stop the watcher from becoming ready.
+ */
+export interface WarmupStatus {
+  state: 'running' | 'done' | 'skipped' | 'failed' | 'timeout';
+  /** Total warm-up time (absent while running). */
+  ms?: number;
+  routes: WarmupRouteStatus[];
+}
+
 /** What the watcher keeps in `status.json`. `finish` adds `lastFinish` to the same file. */
 export interface Status {
   state: DaemonState;
@@ -22,6 +44,8 @@ export interface Status {
   pendingSince: string | null;
   lastError: string | null;
   frames: number;
+  /** Absent until the watcher reaches the warm-up step; `state` stays `starting` until it is finished. */
+  warmup?: WarmupStatus;
   /** Written by `finish`, not by the watcher; carried over on every status write so it is never lost. */
   lastFinish?: unknown;
 }
@@ -31,6 +55,16 @@ export function readStatusFile(file: string): Partial<Status> | null {
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
     return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as Partial<Status>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A JSON file holding an object, or null when it is missing, torn or not an object. */
+export function readJsonObject(file: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
   } catch {
     return null;
   }
@@ -86,3 +120,25 @@ export function watcherPid(dirs: Dirs, status: Partial<Status> | null = readStat
   for (const pid of candidates) if (typeof pid === 'number' && pid > 0 && isAlive(pid)) return pid;
   return null;
 }
+
+const RUNNING_STATES = ['starting', 'ready', 'capturing'];
+
+/**
+ * The status file as it should be read: a status that claims the watcher is running while its
+ * process is gone (killed, crashed, rebooted) is reported as stopped and stale rather than trusted.
+ */
+export function readLiveStatus(dirs: Dirs): Record<string, unknown> {
+  const stored = readStatusFile(statusFiles(dirs).status);
+  if (stored === null) return { state: 'stopped' };
+  if (RUNNING_STATES.includes(stored.state as string) && watcherPid(dirs, stored) === null) {
+    return {
+      ...stored,
+      state: 'stopped',
+      stale: true,
+      pending: false,
+      lastError: 'watcher exited without stopping',
+    };
+  }
+  return { ...stored };
+}
+

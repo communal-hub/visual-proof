@@ -5,7 +5,7 @@ import { main, parseArgs, UsageError } from '../../src/cli.js';
 import { tmpDir } from './helpers.js';
 
 describe('parseArgs', () => {
-  it.each(['start', 'stop', 'status', 'watch', 'finish', 'doctor'] as const)('parses %s', (command) => {
+  it.each(['start', 'stop', 'status', 'ready', 'watch', 'finish', 'doctor'] as const)('parses %s', (command) => {
     expect(parseArgs([command])).toMatchObject({ command, hook: false, help: false });
   });
 
@@ -19,6 +19,26 @@ describe('parseArgs', () => {
     expect(parseArgs(['doctor', '--json'])).toMatchObject({ command: 'doctor', json: true });
     expect(parseArgs(['doctor'])).toMatchObject({ json: false });
     expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish and doctor/);
+  });
+
+  it('parses status --wait and --timeout, and the ready alias', () => {
+    expect(parseArgs(['status', '--wait'])).toMatchObject({ command: 'status', wait: true });
+    expect(parseArgs(['status', '--wait']).timeoutSec).toBeUndefined();
+    expect(parseArgs(['status', '--wait', '--timeout', '30'])).toMatchObject({ wait: true, timeoutSec: 30 });
+    expect(parseArgs(['status', '--wait', '--timeout=1.5'])).toMatchObject({ timeoutSec: 1.5 });
+    expect(parseArgs(['ready', '--timeout', '10'])).toMatchObject({ command: 'ready', timeoutSec: 10 });
+    expect(parseArgs(['status'])).toMatchObject({ wait: false });
+  });
+
+  it.each([
+    [['finish', '--wait'], /--wait is only valid with the status command/],
+    [['status', '--timeout', '5'], /--timeout is only valid with status --wait or ready/],
+    [['status', '--wait', '--timeout'], /--timeout requires a positive number/],
+    [['status', '--wait', '--timeout', 'soon'], /--timeout requires a positive number/],
+    [['status', '--wait', '--timeout', '0'], /--timeout requires a positive number/],
+  ])('rejects %j', (argv, message) => {
+    expect(() => parseArgs(argv)).toThrow(UsageError);
+    expect(() => parseArgs(argv)).toThrow(message);
   });
 
   it('parses finish --hook', () => {
