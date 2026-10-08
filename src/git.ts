@@ -95,6 +95,25 @@ export async function headCommit(repoDir: string): Promise<string | null> {
   return ok ? stdout.trim() : null;
 }
 
+/** Absolute path of the git toplevel containing `repoDir`, or null outside a repo. */
+export async function repoToplevel(repoDir: string): Promise<string | null> {
+  const { stdout, ok } = await git(repoDir, ['rev-parse', '--show-toplevel'], {}, true);
+  return ok && stdout.trim() ? stdout.trim() : null;
+}
+
+/** Current branch name, `(detached)` on a detached HEAD, or null outside a repo / without commits. */
+export async function currentBranch(repoDir: string): Promise<string | null> {
+  const named = await git(repoDir, ['symbolic-ref', '--short', '--quiet', 'HEAD'], {}, true);
+  if (named.ok && named.stdout.trim()) return named.stdout.trim();
+  return (await headCommit(repoDir)) ? '(detached)' : null;
+}
+
+/** Whether `ancestor` is HEAD or one of its ancestors (false when it does not resolve). */
+export async function isAncestorOfHead(repoDir: string, ancestor: string): Promise<boolean> {
+  if (!(await refExists(repoDir, ancestor))) return false;
+  return (await git(repoDir, ['merge-base', '--is-ancestor', ancestor, 'HEAD'], {}, true)).ok;
+}
+
 /**
  * Repo-relative POSIX paths changed on this branch: committed changes plus anything uncommitted
  * (staged, unstaged, untracked-and-not-ignored).
