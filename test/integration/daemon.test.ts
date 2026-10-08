@@ -25,7 +25,7 @@ afterAll(async () => {
   const pid = readPid(files.pid);
   if (pid !== null && isAlive(pid)) process.kill(pid, 'SIGKILL');
   try {
-    execFileSync('pkill', ['-f', `--config ${h.dir}`]);
+    execFileSync('pkill', ['-f', '--', `--config ${h.dir}`]);
   } catch {
     // nothing matched
   }

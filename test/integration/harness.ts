@@ -1,20 +1,28 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import type { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { loadConfig, type Config } from '../../src/config.js';
+import { runFinish, type FinishOptions, type FinishResult } from '../../src/finish.js';
 import { resolveDirs, statusFiles, type Dirs } from '../../src/paths.js';
 import { Timeline } from '../../src/timeline.js';
 import { startWatch, type FrameEvent, type WatchHandle, type WatchOptions } from '../../src/watch.js';
+
+const execFileAsync = promisify(execFile);
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const FIXTURE_DIR = path.join(REPO_ROOT, 'fixtures/vite-vue');
 
 export interface Harness {
-  /** Throwaway git repo: a copy of the fixture with `node_modules` symlinked. */
+  /**
+   * Throwaway git repo: a copy of the fixture with `node_modules` symlinked. `main` holds the
+   * initial commit (the config's `baseRef`) and work happens on the `work` branch, so
+   * `main...HEAD` is meaningful for `finish`.
+   */
   dir: string;
   port: number;
   appUrl: string;
@@ -35,6 +43,14 @@ export interface Harness {
   edit(file: string, fn: (content: string) => string): void;
   /** `git add -A && git commit`; returns the new `HEAD^{tree}`. */
   commitAll(message?: string): string;
+  /** Run git in the repo and return trimmed stdout. */
+  git(...args: string[]): string;
+  /** Run the module-level `finish` against this repo and its status/artifact dirs. */
+  finish(options?: FinishOptions): Promise<FinishResult>;
+  /** Run the real CLI (`src/cli.ts` under tsx) with `--config` pointing at this repo; never throws on a non-zero exit. */
+  cli(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }>;
+  /** Stop the Vite dev server (it removes the freshness marker on close), leaving everything else running. */
+  stopDevServer(): Promise<void>;
   /**
    * Resolve with the first frame matching `predicate`, among frames that arrive after this call
    * (or from index `options.from` of {@link Harness.frames}). Rejects on timeout.
@@ -68,6 +84,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
   git(dir, 'config', 'commit.gpgsign', 'false');
   git(dir, 'add', '-A');
   git(dir, 'commit', '-q', '-m', 'fixture');
+  git(dir, 'checkout', '-q', '-b', 'work');
 
   let vite: ViteProcess | null = null;
   let watch: WatchHandle | null = null;
@@ -138,6 +155,24 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
         const target = path.join(dir, file);
         fs.writeFileSync(target, fn(fs.readFileSync(target, 'utf8')));
       },
+      git: (...args) => git(dir, ...args),
+      finish: (finishOptions = {}) => runFinish(config, { env, ...finishOptions }),
+      async cli(...args) {
+        try {
+          const { stdout, stderr } = await execFileAsync(
+            process.execPath,
+            ['--import', 'tsx', path.join(REPO_ROOT, 'src/cli.ts'), ...args, '--config', configPath],
+            { cwd: REPO_ROOT, env, timeout: 60_000 },
+          );
+          return { code: 0, stdout, stderr };
+        } catch (err) {
+          const e = err as { code?: number; stdout?: string; stderr?: string };
+          return { code: typeof e.code === 'number' ? e.code : 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' };
+        }
+      },
+      async stopDevServer() {
+        await vite?.stop();
+      },
       commitAll(message = 'change') {
         git(dir, 'add', '-A');
         git(dir, 'commit', '-q', '--allow-empty', '-m', message);
@@ -159,7 +194,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
             if (predicate(event)) done(() => resolve(event));
           };
           const timer = setTimeout(
-            () => done(() => reject(new Error(`no matching frame within ${timeoutMs} ms; saw ${JSON.stringify(frames.slice(from).map((f) => [f.frame.route, f.frame.status]))}`))),
+            () => done(() => reject(new Error(`no matching frame within ${timeoutMs} ms; saw ${JSON.stringify(frames.slice(from).map((f) => [f.frame.route, f.frame.status, ...f.frame.reasons]))}`))),
             timeoutMs,
           );
           handle.events.on('frame', onFrame);
