@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { CaptureResult, CaptureSignals, Capturer } from '../../src/browser.js';
+import type { CaptureResult, CaptureSignals, Capturer, PrimeResult } from '../../src/browser.js';
 import { parseConfig, type Config } from '../../src/config.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
@@ -30,6 +30,8 @@ class FakeCapturer implements Capturer {
   onCapture: (url: string) => Promise<void> | void = () => {};
   signalsFor: (url: string) => Partial<CaptureSignals> = () => ({});
   failFor: (url: string) => boolean = () => false;
+  /** Set to make the fake warm-up capable; the default fake cannot prime, like a capturer without the method. */
+  prime?: (url: string) => Promise<PrimeResult>;
   async warm() {
     this.warmed = true;
   }
@@ -703,5 +705,174 @@ describe('errors and shutdown', () => {
     expect(timeline().list()).toEqual([]);
     expect(capturer.urls).toEqual(['http://app.test/']);
     await expect(h.stop()).resolves.toBeUndefined();
+  });
+});
+
+const primed = (reloads = 0): PrimeResult => ({ passes: reloads > 0 ? 2 : 1, reloads, navOk: true, httpStatus: 200 });
+
+describe('warm-up', () => {
+  const routeGraph: ImportGraph = {
+    fileToRoutes: graph.fileToRoutes,
+    routes: ['/invoices/:id', '/orders/:oid', '/', '/about'].map((p) => ({
+      path: p,
+      routeFile: 'src/router/index.js',
+      component: null,
+      layouts: [],
+      dynamic: false,
+    })),
+    unresolved: [],
+  };
+  let primedUrls: string[];
+  beforeEach(() => {
+    primedUrls = [];
+    capturer.prime = async (url) => {
+      primedUrls.push(url);
+      return primed();
+    };
+  });
+
+  it('visits the first route of the import graph without unfilled params, before reporting ready', async () => {
+    // /invoices/:id has a routeParams entry; /orders/:oid has none, but the first resolvable route wins anyway.
+    await start({ buildGraph: async () => routeGraph });
+    expect(primedUrls).toEqual(['http://app.test/invoices/1']);
+    expect(capturer.urls).toEqual([]); // no screenshots, no frames
+    expect(statusJson()).toMatchObject({ state: 'ready', warmup: { state: 'done', routes: [{ route: '/invoices/1', ok: true }] } });
+    const log = logText();
+    expect(log.indexOf('warmup: done in')).toBeGreaterThan(-1);
+    expect(log.indexOf('warmup: done in')).toBeLessThan(log.indexOf(' ready (trigger'));
+  });
+
+  it('skips graph routes whose params cannot be filled, and falls back to / without any', async () => {
+    config = { ...config, routeParams: {} };
+    await start({
+      buildGraph: async () => ({ ...routeGraph, routes: routeGraph.routes.filter((r) => r.path !== '/invoices/:id') }),
+    });
+    expect(primedUrls).toEqual(['http://app.test/']); // /orders/:oid skipped, / is next
+
+    await handle!.stop();
+    handle = null;
+    primedUrls = [];
+    await start({ buildGraph: async () => ({ ...routeGraph, routes: [] }) });
+    expect(primedUrls).toEqual(['http://app.test/']);
+  });
+
+  it('visits warmupRoutes: route keys through routeParams, concrete paths as they are, unresolvable ones skipped', async () => {
+    config = { ...config, warmupRoutes: ['/invoices/:id', '/about', '/orders/:oid', '/about'] };
+    await start();
+    expect(primedUrls).toEqual(['http://app.test/invoices/1', 'http://app.test/about']);
+    expect(logText()).toContain('warmup: skipped /orders/:oid');
+  });
+
+  it('an empty warmupRoutes disables the warm-up', async () => {
+    config = { ...config, warmupRoutes: [] };
+    await start();
+    expect(primedUrls).toEqual([]);
+    expect(statusJson()).toMatchObject({ state: 'ready', warmup: { state: 'skipped' } });
+  });
+
+  it('does not warm up with a capturer that cannot prime', async () => {
+    capturer.prime = undefined;
+    await start({ buildGraph: async () => routeGraph });
+    expect(statusJson()).toMatchObject({ state: 'ready', warmup: { state: 'skipped' } });
+  });
+
+  it('stays starting while it warms up, then ready; reloads are reported', async () => {
+    let seen: Record<string, unknown> | null = null;
+    capturer.prime = async () => {
+      seen = statusJson();
+      return primed(1);
+    };
+    await start();
+    expect(seen).toMatchObject({ state: 'starting', warmup: { state: 'running' } });
+    expect(statusJson()).toMatchObject({ state: 'ready', warmup: { state: 'done', routes: [{ reloads: 1 }] } });
+    expect(logText()).toContain('1 reload(s) from Vite, 2 passes');
+  });
+
+  it('never fails startup: a throwing prime is logged and the watcher becomes ready', async () => {
+    capturer.prime = async () => {
+      throw new Error('net::ERR_CONNECTION_REFUSED');
+    };
+    await start();
+    expect(statusJson()).toMatchObject({ state: 'ready', warmup: { state: 'failed', routes: [{ ok: false, error: 'net::ERR_CONNECTION_REFUSED' }] } });
+    expect(logText()).toContain('warmup: / failed: net::ERR_CONNECTION_REFUSED');
+  });
+
+  it('is bounded by warmupBudgetMs', async () => {
+    config = { ...config, warmupBudgetMs: 60, warmupRoutes: ['/', '/about'] };
+    capturer.prime = async (url) => {
+      primedUrls.push(url);
+      await new Promise((r) => setTimeout(r, 2000));
+      return primed();
+    };
+    const t0 = Date.now();
+    await start();
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(primedUrls).toEqual(['http://app.test/']);
+    expect(statusJson()).toMatchObject({ state: 'ready', warmup: { state: 'timeout' } });
+  });
+
+  it('queues file events that arrive during the warm-up and captures them once ready', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    capturer.prime = async () => {
+      // the trigger is already live: a save during warm-up is held, not captured against a cold server
+      pushBatch({ screen: ['src/pages/Home.vue'] });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(capturer.urls).toEqual([]);
+      expect(statusJson()).toMatchObject({ state: 'starting', pending: true });
+      await gate;
+      return primed();
+    };
+    setTimeout(release, 50);
+    await start();
+    await nextBatch();
+    expect(capturer.urls).toEqual(['http://app.test/']);
+    expect(statusJson()).toMatchObject({ state: 'ready', pending: false, frames: 1 });
+  });
+});
+
+describe('unmapped screen changes', () => {
+  it('re-capture every route captured this session, so frames stay at HEAD', async () => {
+    await start();
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    capturer.urls = [];
+
+    tree = 'b'.repeat(40);
+    pushBatch({ screen: ['src/helpers/orphan.vue'] });
+    await nextBatch(3);
+    expect(capturer.urls.sort()).toEqual(['http://app.test/', 'http://app.test/invoices/1']);
+    const latest = timeline().list().slice(-2);
+    expect(latest.map((f) => [f.treeHash, f.trigger, f.sourceFile])).toEqual([
+      ['b'.repeat(40), 'screen', 'src/helpers/orphan.vue'],
+      ['b'.repeat(40), 'screen', 'src/helpers/orphan.vue'],
+    ]);
+    expect(logText()).toContain('no route for src/helpers/orphan.vue: re-capturing 2 route(s) captured this session');
+  });
+
+  it('capture nothing when no route was captured yet', async () => {
+    await start();
+    pushBatch({ screen: ['src/helpers/orphan.vue'] });
+    await nextBatch();
+    expect(batches[0]!.outcome).toBe('no-routes');
+    expect(logText()).toContain('no route for src/helpers/orphan.vue: no routes captured this session yet');
+  });
+
+  it('a mapped change in the same batch keeps its own trigger and source file', async () => {
+    await start();
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    capturer.urls = [];
+    pushBatch({ screen: ['src/pages/Home.vue', 'src/helpers/orphan.vue'] });
+    await nextBatch(3);
+    const last = timeline().list().slice(-2);
+    expect(Object.fromEntries(last.map((f) => [f.route, [f.trigger, f.sourceFile]]))).toEqual({
+      '/': ['screen', 'src/pages/Home.vue'],
+      '/invoices/1': ['screen', 'src/helpers/orphan.vue'],
+    });
   });
 });

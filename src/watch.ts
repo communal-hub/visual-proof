@@ -5,6 +5,7 @@ import path from 'node:path';
 import picomatch from 'picomatch';
 import { Browser, type Capturer, type CaptureSignals } from './browser.js';
 import type { Config } from './config.js';
+import { resolveAnchor } from './anchor.js';
 import { headCommit, workingTreeHash } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
@@ -13,7 +14,7 @@ import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
 import { Timeline, type Frame, type Trigger } from './timeline.js';
 import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-watch.js';
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
-import { type DaemonState, type Status } from './status.js';
+import { type DaemonState, type Status, type WarmupRouteStatus } from './status.js';
 import { triage } from './triage.js';
 
 export type { DaemonState, Status };
@@ -112,6 +113,8 @@ class Watcher {
   private pending: Pending | null = null;
   /** True from the first file event of a change until its batch is handed to {@link enqueue}. */
   private debouncing = false;
+  /** True while the warm-up visits routes; batches queue up but are not captured until it is over. */
+  private warmingUp = false;
   private running: Promise<void> | null = null;
   private stopping = false;
   private stopped: Promise<void> | null = null;
@@ -160,7 +163,7 @@ class Watcher {
     try {
       const treeHash = this.opts.treeHash ?? workingTreeHash;
       await treeHash(this.config.repoDir, this.dirs.scratchDir); // fail fast outside a git repo
-      this.status.anchor = await (this.opts.headCommit ?? headCommit)(this.config.repoDir).catch(() => null);
+      await this.resolveAnchor();
 
       await this.startBarrier();
 
@@ -185,6 +188,12 @@ class Watcher {
         onBatch: (batch) => this.enqueue(batch),
         onError: (err) => this.fail(err),
       });
+
+      await this.warmUp().catch((err: Error) => {
+        // Never fatal: the watcher works without a warm Vite, only its first capture is slower.
+        this.log(`warmup: failed: ${err.message.split('\n')[0]}`);
+        this.status.warmup = { state: 'failed', routes: this.status.warmup?.routes ?? [] };
+      });
     } catch (err) {
       this.status.lastError = (err as Error).message;
       this.status.state = 'error';
@@ -197,6 +206,134 @@ class Watcher {
     this.status.state = 'ready';
     this.writeStatus();
     this.log(`ready (trigger=fs-watch, barrier=${this.status.barrier})`);
+    this.endWarmup();
+  }
+
+  private async resolveAnchor(): Promise<void> {
+    const result = await resolveAnchor({
+      repoDir: this.config.repoDir,
+      statusDir: this.dirs.statusDir,
+      headCommit: this.opts.headCommit ?? headCommit,
+    });
+    this.status.anchor = result.anchor;
+    if (result.discarded) this.log(`anchor: ${result.discarded}`);
+    if (result.anchor) {
+      const how = result.source === 'reused' ? 'reused from an earlier session of this branch' : result.source === 'new' ? 'HEAD' : 'HEAD, not persisted';
+      this.log(`anchor ${result.anchor.slice(0, 8)} (${how})`);
+    }
+  }
+
+  // ---- warm-up -------------------------------------------------------------
+
+  /**
+   * Visit a few routes so Vite compiles them and optimizes dependencies before the first real capture
+   * (a cold dev server spends seconds on this and reloads the page while it does). Bounded by
+   * `warmupBudgetMs`; any failure is logged and startup carries on. File events that arrive meanwhile are
+   * queued and handled once the watcher is ready.
+   */
+  private async warmUp(): Promise<void> {
+    const capturer = this.capturer;
+    if (!capturer?.prime) {
+      this.log('warmup: skipped (the capturer cannot prime pages)');
+      this.status.warmup = { state: 'skipped', routes: [] };
+      return;
+    }
+    const targets = await this.warmupTargets();
+    if (targets.length === 0) {
+      this.log('warmup: skipped (no routes to visit)');
+      this.status.warmup = { state: 'skipped', routes: [] };
+      return;
+    }
+
+    this.warmingUp = true;
+    const routes: WarmupRouteStatus[] = [];
+    this.status.warmup = { state: 'running', routes };
+    this.writeStatus();
+    const budget = this.config.warmupBudgetMs;
+    const t0 = Date.now();
+    this.log(`warmup: visiting ${targets.map((t) => t.path).join(', ')} (budget ${budget} ms)`);
+    let timedOut = false;
+    for (const target of targets) {
+      const left = budget - (Date.now() - t0);
+      if (left <= 0 || this.stopping) {
+        timedOut = left <= 0;
+        break;
+      }
+      const started = Date.now();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const outcome = await Promise.race([
+          capturer.prime(target.url),
+          new Promise<'timeout'>((resolve) => {
+            timer = setTimeout(() => resolve('timeout'), left);
+          }),
+        ]);
+        const ms = Date.now() - started;
+        if (outcome === 'timeout') {
+          timedOut = true;
+          routes.push({ route: target.path, ms, ok: false, error: `not finished within the ${budget} ms budget` });
+          this.log(`warmup: ${target.path} did not finish within the budget`);
+          break;
+        }
+        const ok = outcome.navOk && (outcome.httpStatus === null || outcome.httpStatus < 500);
+        routes.push({ route: target.path, ms, ok, reloads: outcome.reloads, ...(ok ? {} : { error: `HTTP ${outcome.httpStatus ?? 'n/a'}` }) });
+        this.log(
+          `warmup: ${target.path} ${ok ? 'ok' : 'failed'} in ${ms} ms` +
+            (outcome.reloads > 0 ? ` (${outcome.reloads} reload(s) from Vite, ${outcome.passes} passes)` : ''),
+        );
+      } catch (err) {
+        const message = (err as Error).message.split('\n')[0] ?? 'unknown error';
+        routes.push({ route: target.path, ms: Date.now() - started, ok: false, error: message });
+        this.log(`warmup: ${target.path} failed: ${message}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const ms = Date.now() - t0;
+    const state = timedOut ? 'timeout' : routes.some((r) => r.ok) ? 'done' : 'failed';
+    this.status.warmup = { state, ms, routes };
+    this.log(`warmup: ${state} in ${ms} ms (${routes.map((r) => `${r.route} ${r.ms} ms`).join(', ')})`);
+    this.writeStatus();
+  }
+
+  /** Release batches that were held back while warming up. Called once `ready` is reported. */
+  private endWarmup(): void {
+    if (!this.warmingUp) return;
+    this.warmingUp = false;
+    if (this.pending && !this.running && !this.stopping) this.running = this.drain();
+    this.refreshPending();
+  }
+
+  private async warmupTargets(): Promise<Array<{ path: string; url: string }>> {
+    const params = this.readRouteParams();
+    const paths: string[] = [];
+    const add = (key: string): void => {
+      const concrete = concretePath(key, params);
+      if (!concrete.ok) {
+        this.log(`warmup: skipped ${key}: ${concrete.reason}`);
+      } else if (!paths.includes(concrete.path)) {
+        paths.push(concrete.path);
+      }
+    };
+
+    const configured = this.config.warmupRoutes;
+    if (configured !== undefined) {
+      for (const key of configured) add(key);
+    } else {
+      try {
+        const graph = await this.getGraph();
+        for (const route of graph.routes) {
+          if (concretePath(route.path, params).ok) {
+            add(route.path);
+            break;
+          }
+        }
+      } catch (err) {
+        this.log(`warmup: import graph unavailable: ${(err as Error).message.split('\n')[0]}`);
+      }
+      if (paths.length === 0) paths.push('/');
+    }
+    return paths.map((p) => ({ path: p, url: joinUrl(this.config.appUrl, p) }));
   }
 
   stop(): Promise<void> {
@@ -272,7 +409,7 @@ class Watcher {
       return;
     }
     this.merge({ screen: batch.screen, backend: batch.backend, startedAt: batch.startedAt, attempts: 0 });
-    this.running ??= this.drain();
+    if (!this.warmingUp) this.running ??= this.drain();
     this.refreshPending();
     this.writeStatus(); // carries the final lastEventAt of this change
   }
@@ -338,6 +475,8 @@ class Watcher {
 
       const params = this.readRouteParams();
       const targets = new Map<string, Target>();
+      // Routes captured earlier this session are re-captured when the change cannot be traced to a route.
+      let recapture: { trigger: Trigger; why: string; sourceFile: string } | null = null;
       if (screen.length > 0) {
         const [barrier, resolution] = await Promise.all([
           this.waitBarrier(batch.startedAt, screen),
@@ -345,20 +484,29 @@ class Watcher {
         ]);
         mark('barrier+routes');
         this.log(`batch screen=${screen.join(',')} barrier=${barrier}`);
-        for (const route of resolution) targets.set(route.path, route);
+        for (const route of resolution.targets) targets.set(route.path, route);
+        if (resolution.unmapped.length > 0) {
+          // The file feeds routes the graph cannot see (a layout imported dynamically, a shared helper):
+          // keep every frame of the session at HEAD, as for a backend change.
+          recapture = { trigger: 'screen', why: `no route for ${resolution.unmapped.join(',')}`, sourceFile: resolution.unmapped[0]! };
+        }
       }
       if (backend.length > 0) {
         if (screen.length === 0) this.log(`batch backend=${backend.join(',')}`);
+        recapture = { trigger: 'backend', why: 'backend change', sourceFile: backend[0]! };
+      }
+      if (recapture) {
         for (const [capturedPath, route] of this.sessionRoutes) {
           // Re-resolve: a re-run seeder may have moved a param route to a new id since it was captured.
           const concrete = concretePath(route.routeKey, params);
           const routePath = concrete.ok ? concrete.path : capturedPath;
           const url = concrete.ok ? joinUrl(this.config.appUrl, routePath) : route.url;
           if (!targets.has(routePath)) {
-            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: 'backend', sourceFile: backend[0] });
+            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: recapture.trigger, sourceFile: recapture.sourceFile });
           }
         }
-        if (this.sessionRoutes.size === 0) this.log('backend change: no routes captured this session yet');
+        if (this.sessionRoutes.size === 0) this.log(`${recapture.why}: no routes captured this session yet`);
+        else if (recapture.trigger === 'screen') this.log(`${recapture.why}: re-capturing ${this.sessionRoutes.size} route(s) captured this session`);
       }
 
       if (targets.size === 0) {
@@ -369,13 +517,13 @@ class Watcher {
 
       const before = await beforeP;
       mark('resolve');
-      const captured: Array<{ target: Target; at: string; png: Buffer; signals: CaptureSignals }> = [];
+      const captured: Array<{ target: Target; at: string; png: Buffer; signals: CaptureSignals; renderedFiles: string[] | null }> = [];
       let captureFailed = false;
       for (const target of targets.values()) {
         if (this.stopping) return;
         try {
           const result = await this.capturer!.capture(target.url);
-          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals });
+          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null });
         } catch (err) {
           captureFailed = true;
           this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
@@ -403,7 +551,7 @@ class Watcher {
         return;
       }
 
-      for (const { target, at, png, signals } of captured) {
+      for (const { target, at, png, signals, renderedFiles } of captured) {
         const verdict = triage(signals);
         const frame = this.timeline.append(
           {
@@ -416,6 +564,7 @@ class Watcher {
             sourceFile: target.sourceFile,
             status: verdict.status,
             reasons: verdict.reasons,
+            renderedFiles,
           },
           png,
         );
@@ -466,7 +615,10 @@ class Watcher {
     return result.params;
   }
 
-  private async resolveScreen(files: string[], params: Record<string, string>): Promise<Target[]> {
+  private async resolveScreen(
+    files: string[],
+    params: Record<string, string>,
+  ): Promise<{ targets: Target[]; unmapped: string[] }> {
     let graph = await this.getGraph();
     const touchesRoutes = files.some((f) => this.isRouteFile(f));
     const unknown = files.some((f) => !graph.fileToRoutes.has(f) && !this.config.staticRoutes[f]);
@@ -483,13 +635,14 @@ class Watcher {
     const resolution = resolveRoutes(files, graph, { ...this.config, routeParams: params });
     for (const file of resolution.unmapped) this.log(`no route for ${file}`);
     for (const skip of resolution.skipped) this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
-    return resolution.routes.map((r) => ({
+    const targets = resolution.routes.map((r) => ({
       path: r.path,
       routeKey: r.routeKey,
       url: r.url,
       trigger: 'screen' as const,
       sourceFile: r.sourceFiles[0],
     }));
+    return { targets, unmapped: resolution.unmapped };
   }
 
   private getGraph(): Promise<ImportGraph> {

@@ -14,7 +14,7 @@ import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
 
-export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params';
+export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'renderCheck';
 /** `ok`: working at its best tier. `warn`: working at a fallback tier. `missing`: not working. `skipped`: not probed. */
 export type CapabilityStatus = 'ok' | 'warn' | 'missing' | 'skipped';
 
@@ -67,6 +67,7 @@ export const CAPABILITY_ORDER: CapabilityName[] = [
   'login',
   'routes',
   'params',
+  'renderCheck',
 ];
 
 const BROWSER_MS = 8000;
@@ -104,6 +105,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   caps.login = login;
   caps.routes = routes;
   caps.params = cfg ? checkParams(cfg) : skipped('config is invalid');
+  caps.renderCheck = cfg ? checkRenderCheck(cfg) : skipped('config is invalid');
 
   const ordered = {} as Record<CapabilityName, Capability>;
   for (const name of CAPABILITY_ORDER) ordered[name] = caps[name];
@@ -248,6 +250,17 @@ function checkParams(config: Config): Capability {
     return { tier: 'seed-file', status: 'warn', required: false, detail: `${detail}; ${seed.warnings[0]}${more}` };
   }
   return { tier: 'seed-file', status: 'ok', required: false, detail };
+}
+
+/** The mode of the rendered-component check in `finish`. Informational, never required. */
+function checkRenderCheck(config: Config): Capability {
+  if (config.renderCheck === 'fail') {
+    return { tier: 'fail', status: 'ok', required: false, detail: 'finish fails when a changed .vue file never rendered on its routes' };
+  }
+  if (config.renderCheck === 'warn') {
+    return { tier: 'warn', status: 'warn', required: false, detail: 'finish only notes a changed .vue file that never rendered (renderCheck: "warn")' };
+  }
+  return { tier: 'off', status: 'warn', required: false, detail: 'rendered components are not checked (renderCheck: "off")' };
 }
 
 function entries(n: number): string {

@@ -735,3 +735,100 @@ describe('finishCommand', () => {
     expect(fs.readdirSync(dirs.statusDir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
 });
+
+describe('render check', () => {
+  const RENDERED = (...files: string[]) => ({ renderedFiles: files });
+
+  it('fails a changed .vue file that is not among the rendered components of any of its routes', async () => {
+    editAndCommit('src/shared/S.vue');
+    await frame('/a', 'clean', RENDERED('src/App.vue', 'src/pages/A.vue'));
+    await frame('/c', 'clean', RENDERED('src/App.vue', 'src/pages/C.vue'));
+    const result = await finish();
+    expect(result.ok).toBe(false);
+    expect(result.failures).toEqual([
+      'src/shared/S.vue never rendered on /a, /c; seed the state that shows it (RecordsVisualProofRoutes) or add it to ignoreScreenGlobs',
+    ]);
+    const block = fs.readFileSync(result.proofBlockPath, 'utf8');
+    expect(block).toContain('never rendered on /a, /c');
+  });
+
+  it('passes when at least one route rendered it, noting the routes where it did not', async () => {
+    editAndCommit('src/shared/S.vue');
+    await frame('/a', 'clean', RENDERED('src/App.vue', 'src/shared/S.vue'));
+    await frame('/c', 'clean', RENDERED('src/App.vue'));
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.notes).toContain('src/shared/S.vue rendered on /a but not on /c');
+  });
+
+  it('counts a parent or layout in the tree as rendered', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a', 'clean', RENDERED('src/App.vue', 'src/pages/A.vue', 'src/components/Deep.vue'));
+    expect((await finish()).failures).toEqual([]);
+  });
+
+  it('skips frames without rendered-component data and says so', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a', 'clean', { renderedFiles: null });
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+    expect(result.notes.some((n) => n.startsWith('render check skipped for src/pages/A.vue') && n.includes('/a'))).toBe(true);
+  });
+
+  it('treats frames from before the check existed (no field at all) as unknown', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a');
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+    expect(result.notes.some((n) => n.startsWith('render check skipped for src/pages/A.vue'))).toBe(true);
+  });
+
+  it('does not let unknown frames hide a rendered one, nor fail a file the known frames lack', async () => {
+    editAndCommit('src/shared/S.vue');
+    await frame('/a', 'clean', RENDERED('src/shared/S.vue'));
+    await frame('/c', 'clean', { renderedFiles: null });
+    expect((await finish()).failures).toEqual([]);
+  });
+
+  it('warn mode turns the failure into a note; off mode ignores the check', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a', 'clean', RENDERED('src/App.vue'));
+    configure({ renderCheck: 'warn' });
+    const warned = await finish();
+    expect(warned.failures).toEqual([]);
+    expect(warned.notes).toContain(
+      'src/pages/A.vue never rendered on /a; seed the state that shows it (RecordsVisualProofRoutes) or add it to ignoreScreenGlobs',
+    );
+
+    configure({ renderCheck: 'off' });
+    const off = await finish();
+    expect(off.failures).toEqual([]);
+    expect(off.notes.some((n) => n.includes('never rendered'))).toBe(false);
+  });
+
+  it('only checks files that can appear as components: .vue', async () => {
+    configure({ screenGlobs: ['src/**'] });
+    editAndCommit('src/pages/A.vue');
+    write(repo, 'src/pages/helper.js', 'export const x = 1\n');
+    commitAll(repo, 'helper');
+    const noRoute = { ...GRAPH, fileToRoutes: new Map([...GRAPH.fileToRoutes, ['src/pages/helper.js', ['/a']]]) };
+    await frame('/a', 'clean', RENDERED('src/pages/A.vue'));
+    const result = await finish({ buildGraph: async () => noRoute });
+    expect(result.failures).toEqual([]);
+  });
+
+  it('does not stack a "never rendered" failure on a route that has no clean frame', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a', 'error', RENDERED('src/App.vue'));
+    const result = await finish();
+    expect(result.failures).toEqual(['/a final frame is error: error reason']);
+  });
+
+  it('does not apply to routes pulled in only by a backend change', async () => {
+    editAndCommit('server/data.json', '{"changed":true}\n');
+    await frame('/a', 'clean', RENDERED('src/App.vue'), );
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+  });
+});

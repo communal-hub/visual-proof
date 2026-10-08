@@ -24,7 +24,7 @@
       "tier": "fs-watch",
       "status": "ok",
       "required": true,
-      "detail": "12 screen file(s), 1 backend file(s) match the globs"
+      "detail": "16 screen file(s), 1 backend file(s) match the globs"
     },
     "barrier": {
       "tier": "vite-hmr",
@@ -48,13 +48,19 @@
       "tier": "import-graph",
       "status": "ok",
       "required": false,
-      "detail": "7 route(s), 9 file(s) mapped, 0 unresolved"
+      "detail": "9 route(s), 13 file(s) mapped, 0 unresolved"
     },
     "params": {
       "tier": "config",
       "status": "ok",
       "required": false,
       "detail": "1 entry"
+    },
+    "renderCheck": {
+      "tier": "fail",
+      "status": "ok",
+      "required": false,
+      "detail": "finish fails when a changed .vue file never rendered on its routes"
     }
   }
 }

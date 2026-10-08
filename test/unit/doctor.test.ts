@@ -69,7 +69,7 @@ describe('runDoctor', () => {
   it('reports every capability, writes doctor.json, and is ok when all probes pass', async () => {
     const report = await doctor(configure());
     expect(report.ok).toBe(true);
-    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params']);
+    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'renderCheck']);
     expect(report.capabilities).toMatchObject({
       config: { tier: 'valid', status: 'ok' },
       git: { tier: 'repo', status: 'ok' },
@@ -142,6 +142,14 @@ describe('runDoctor', () => {
     const unconfigured = configure();
     delete unconfigured.freshnessMarker;
     expect((await doctor(unconfigured)).capabilities.freshness).toMatchObject({ tier: 'none', status: 'ok' });
+  });
+
+  describe('renderCheck', () => {
+    it('reports the mode of the rendered-component check, never required', async () => {
+      expect((await doctor(configure())).capabilities.renderCheck).toMatchObject({ tier: 'fail', status: 'ok', required: false });
+      expect((await doctor(configure({ renderCheck: 'warn' }))).capabilities.renderCheck).toMatchObject({ tier: 'warn', status: 'warn' });
+      expect((await doctor(configure({ renderCheck: 'off' }))).capabilities.renderCheck).toMatchObject({ tier: 'off', status: 'warn', required: false });
+    });
   });
 
   describe('params', () => {
@@ -310,7 +318,7 @@ describe('formatReport and doctorCommand', () => {
   it('prints one aligned row per capability', async () => {
     const text = formatReport(await doctor(configure({ screenGlobs: ['nothing/**'] })));
     const lines = text.trimEnd().split('\n');
-    expect(lines).toHaveLength(10);
+    expect(lines).toHaveLength(11);
     expect(lines[0]).toMatch(/^capability\s+tier\s+status\s+detail$/);
     expect(lines.find((l) => l.startsWith('trigger'))).toMatch(/^trigger\s+fs-watch\s+MISSING\s+no files match/);
     // Columns line up: every row's tier column starts at the same offset.

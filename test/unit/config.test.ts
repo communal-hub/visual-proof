@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig, parseConfig } from '../../src/config.js';
+import { ConfigError, DEFAULT_HIDE_SELECTORS, loadConfig, parseConfig } from '../../src/config.js';
 import { tmpDir, write } from './helpers.js';
 
 const dirs: string[] = [];
@@ -184,5 +184,65 @@ describe('loadConfig', () => {
 describe('parseConfig', () => {
   it('works on an in-memory object', () => {
     expect(parseConfig({ appUrl: 'http://x.test' }, '/repo', {}).repoDir).toBe('/repo');
+  });
+});
+
+describe('capture-quality fields (v0.3)', () => {
+  const base = { appUrl: 'http://localhost:5173' };
+  const parse = (extra: Record<string, unknown> = {}) => parseConfig({ ...base, ...extra }, '/repo', {});
+
+  it('has defaults', () => {
+    const config = parse();
+    expect(config).toMatchObject({ warmupBudgetMs: 60_000, maxCaptureHeight: 6000, renderCheck: 'fail' });
+    expect(config.warmupRoutes).toBeUndefined();
+    expect(config.scrollContainer).toBeUndefined();
+    expect(config.hideSelectors).toEqual([...DEFAULT_HIDE_SELECTORS]);
+  });
+
+  it('never hides the Vite error overlay or every element carrying data-v-inspector', () => {
+    const joined = DEFAULT_HIDE_SELECTORS.join(' ');
+    expect(joined).not.toContain('vite-error-overlay');
+    expect(joined).not.toContain('[data-v-inspector]');
+  });
+
+  it('extends the default hide selectors, deduplicated, or replaces them', () => {
+    const extended = parse({ hideSelectors: ['.cookie-banner', '.vue-devtools__anchor'] }).hideSelectors;
+    expect(extended).toEqual([...DEFAULT_HIDE_SELECTORS, '.cookie-banner']);
+    expect(parse({ hideSelectors: ['.only'], hideSelectorsReplace: true }).hideSelectors).toEqual(['.only']);
+    expect(parse({ hideSelectorsReplace: true }).hideSelectors).toEqual([]);
+  });
+
+  it('reads the warm-up, scroll and cap fields', () => {
+    expect(parse({ warmupRoutes: ['/', '/a/:id'], warmupBudgetMs: 5000, scrollContainer: 'main.app', maxCaptureHeight: 3000 })).toMatchObject({
+      warmupRoutes: ['/', '/a/:id'],
+      warmupBudgetMs: 5000,
+      scrollContainer: 'main.app',
+      maxCaptureHeight: 3000,
+    });
+    expect(parse({ warmupRoutes: [] }).warmupRoutes).toEqual([]);
+  });
+
+  it('reads renderCheck and rejects anything else', () => {
+    for (const mode of ['fail', 'warn', 'off']) expect(parse({ renderCheck: mode }).renderCheck).toBe(mode);
+    expect(() => parse({ renderCheck: 'maybe' })).toThrow('"renderCheck" must be "fail", "warn" or "off", got "maybe"');
+  });
+
+  it('rejects wrong types', () => {
+    const message = (() => {
+      try {
+        parse({ warmupRoutes: '/', maxCaptureHeight: -1, hideSelectorsReplace: 'yes', scrollContainer: '' });
+      } catch (err) {
+        return (err as Error).message;
+      }
+      return '';
+    })();
+    for (const expected of [
+      '"warmupRoutes" must be an array of strings',
+      '"maxCaptureHeight" must be a positive integer',
+      '"hideSelectorsReplace" must be a boolean',
+      '"scrollContainer" must be a non-empty string',
+    ]) {
+      expect(message).toContain(expected);
+    }
   });
 });

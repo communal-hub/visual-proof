@@ -10,7 +10,7 @@ import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
 import { readStatusFile, watcherPid, writeFileAtomic, type Status } from './status.js';
 import { describeError } from './text.js';
-import { Timeline } from './timeline.js';
+import { Timeline, type Frame } from './timeline.js';
 import type { FrameStatus } from './triage.js';
 
 export interface FinishOptions {
@@ -269,6 +269,7 @@ async function gather(
   if (state.closed) return;
   const shortTree = tree.slice(0, SHORT_TREE);
   const used = new Set<string>();
+  const headlines = new Map<RouteProof, Frame>();
   for (const route of list) {
     if (state.closed) return;
     if (now() >= deadline) {
@@ -301,7 +302,52 @@ async function gather(
     if (frame.status !== 'clean') {
       const why = frame.reasons.length > 0 ? `: ${frame.reasons.join('; ')}` : '';
       state.failures.push(`${route.route} final frame is ${frame.status}${why}`);
+    } else {
+      headlines.set(route, frame);
     }
+  }
+  if (!state.closed && !state.truncated) checkRendered(config, state, list, headlines);
+}
+
+/** Only Vue single-file components carry the `__file` the render check reads. */
+const RENDER_CHECKED = /\.vue$/;
+
+/**
+ * A clean still proves nothing about a changed component that never made it into the page (behind a `v-if`,
+ * or the seeded data does not reach it). For each changed `.vue` screen with routes, at least one of its
+ * routes must have a clean headline frame that lists the file among its rendered components. Parents and
+ * layouts count: they are in the mounted tree. Frames without the data (production build, non-Vue app, older
+ * frames) cannot say either way, so they never fail a file; the skip is noted.
+ */
+function checkRendered(config: Config, state: State, list: RouteProof[], headlines: Map<RouteProof, Frame>): void {
+  if (config.renderCheck === 'off') return;
+  const files = new Set<string>();
+  for (const route of list) if (route.via === 'screen') for (const f of route.sourceFiles) if (RENDER_CHECKED.test(f)) files.add(f);
+
+  for (const file of [...files].sort()) {
+    const routes = list.filter((r) => r.via === 'screen' && r.sourceFiles.includes(file));
+    const seen = routes.filter((r) => headlines.has(r));
+    if (seen.length === 0) continue; // no clean frame to look at; the failure for that is already recorded
+    const known = seen.filter((r) => Array.isArray(headlines.get(r)!.renderedFiles));
+    const unknown = seen.filter((r) => !Array.isArray(headlines.get(r)!.renderedFiles));
+    const rendered = known.filter((r) => headlines.get(r)!.renderedFiles!.includes(file));
+
+    if (rendered.length > 0) {
+      const missing = known.filter((r) => !rendered.includes(r));
+      if (missing.length > 0) {
+        state.notes.push(`${file} rendered on ${rendered.map((r) => r.route).join(', ')} but not on ${missing.map((r) => r.route).join(', ')}`);
+      }
+      continue;
+    }
+    if (unknown.length > 0) {
+      state.notes.push(
+        `render check skipped for ${file}: no rendered-component data for ${unknown.map((r) => r.route).join(', ')} (production build or not a Vue 3 dev app)`,
+      );
+      continue;
+    }
+    const message = `${file} never rendered on ${routes.map((r) => r.route).join(', ')}; seed the state that shows it (RecordsVisualProofRoutes) or add it to ignoreScreenGlobs`;
+    if (config.renderCheck === 'warn') state.notes.push(message);
+    else state.failures.push(message);
   }
 }
 
