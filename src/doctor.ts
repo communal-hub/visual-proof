@@ -334,8 +334,20 @@ async function countMatches(config: Config, ignored: string[]): Promise<{ screen
   return { screen, backend, capped: visited >= SCAN_CAP };
 }
 
+/**
+ * One readable line for a failure. Node's connect errors for `localhost` (tried over IPv4 and IPv6)
+ * are AggregateErrors with an empty message, so fall back to the error code.
+ */
 function firstLine(err: unknown): string {
-  return (err instanceof Error ? err.message : String(err)).split('\n')[0] ?? 'unknown error';
+  if (err instanceof Error) {
+    const line = err.message.split('\n')[0];
+    if (line) return line;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code) return code;
+    if (err instanceof AggregateError && err.errors.length > 0) return firstLine(err.errors[0]);
+    return err.name;
+  }
+  return String(err).split('\n')[0] || 'unknown error';
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {

@@ -303,3 +303,19 @@ describe('formatReport and doctorCommand', () => {
     expect(r.stdout).toMatch(/^config\s+invalid\s+MISSING\s+config file not found/m);
   });
 });
+
+describe('real probes against localhost (IPv4 and IPv6 both refused)', () => {
+  it('names the error code when the connect error has an empty message', async () => {
+    const server = http.createServer();
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    await new Promise((r) => server.close(r));
+    const report = await runDoctor(configure({ appUrl: `http://localhost:${port}`, viteUrl: `http://localhost:${port}` }), {
+      dirs,
+      probes: { launchBrowser: async () => '1' },
+      timeouts: { barrierMs: 500 },
+    });
+    expect(report.capabilities.login.detail).toMatch(/failed: \S+/);
+    expect(report.capabilities.login.detail).toContain('ECONNREFUSED');
+  });
+});
