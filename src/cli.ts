@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { runWatch, startDaemon, stopDaemon } from './daemon.js';
+import { doctorCommand } from './doctor.js';
 import { finishCommand } from './finish.js';
 import { resolveDirs, statusFiles } from './paths.js';
 
@@ -87,6 +88,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
   if (args.command === 'stop') return stopDaemon({ configPath: args.configPath, env });
   if (args.command === 'watch') return runWatch({ configPath: args.configPath, env });
   if (args.command === 'finish') return finishCommand({ configPath: args.configPath, hook: args.hook, env });
+  if (args.command === 'doctor') return doctorCommand({ configPath: args.configPath, env });
 
   process.stderr.write(`visual-proof ${args.command}: not implemented\n`);
   return 2;
@@ -110,8 +112,8 @@ if (entry && import.meta.url === pathToFileURL(entry).href) {
   process.exitCode = code;
   // The foreground watcher owns a browser and sockets; do not let a stray handle keep it alive after shutdown.
   if (argv.includes('watch')) process.exit(code);
-  // finish is time-boxed: a step that outlived the budget must not keep the process (or the agent) waiting.
-  if (argv.includes('finish')) {
+  // finish and doctor are time-boxed: a step that outlived its budget must not keep the process (or the agent) waiting.
+  if (argv.includes('finish') || argv.includes('doctor')) {
     await new Promise<void>((resolve) => process.stdout.write('', () => resolve()));
     await new Promise<void>((resolve) => process.stderr.write('', () => resolve()));
     process.exit(code);

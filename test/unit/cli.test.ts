@@ -66,11 +66,6 @@ describe('main', () => {
     expect(err).toContain('Usage:');
   });
 
-  it.each(['doctor'])('%s is not implemented yet and exits 2', async (command) => {
-    expect(await main([command], {})).toBe(2);
-    expect(err).toContain(`${command}: not implemented`);
-  });
-
   it('start fails with a one-line reason (no stack) when the config is missing', async () => {
     const env = { VISUAL_PROOF_STATUS_DIR: tmpDir() };
     expect(await main(['start', '--config', path.join(tmpDir(), 'nope.json')], env)).toBe(1);

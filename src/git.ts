@@ -53,6 +53,12 @@ export async function workingTreeHash(repoDir: string, scratchDir: string): Prom
   }
 }
 
+/** Whether `repoDir` is inside a git work tree. */
+export async function isGitRepo(repoDir: string): Promise<boolean> {
+  const { stdout, ok } = await git(repoDir, ['rev-parse', '--is-inside-work-tree'], {}, true);
+  return ok && stdout.trim() === 'true';
+}
+
 /** `HEAD^{tree}`, or null when the repo has no commits yet. */
 export async function headTree(repoDir: string): Promise<string | null> {
   const { stdout, ok } = await git(repoDir, ['rev-parse', '--verify', '--quiet', 'HEAD^{tree}'], {}, true);
