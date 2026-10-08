@@ -69,7 +69,7 @@ describe('runDoctor', () => {
   it('reports every capability, writes doctor.json, and is ok when all probes pass', async () => {
     const report = await doctor(configure());
     expect(report.ok).toBe(true);
-    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes']);
+    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params']);
     expect(report.capabilities).toMatchObject({
       config: { tier: 'valid', status: 'ok' },
       git: { tier: 'repo', status: 'ok' },
@@ -79,6 +79,7 @@ describe('runDoctor', () => {
       freshness: { tier: 'marker', status: 'ok' },
       login: { tier: 'http-hook', status: 'ok' },
       routes: { tier: 'import-graph', status: 'ok', detail: '3 route(s), 5 file(s) mapped, 1 unresolved' },
+      params: { tier: 'none', status: 'ok', required: false },
     });
     expect(report.capabilities.git.detail).toMatch(/^HEAD tree [0-9a-f]{8}$/);
     expect(JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'doctor.json'), 'utf8'))).toEqual(report);
@@ -141,6 +142,57 @@ describe('runDoctor', () => {
     const unconfigured = configure();
     delete unconfigured.freshnessMarker;
     expect((await doctor(unconfigured)).capabilities.freshness).toMatchObject({ tier: 'none', status: 'ok' });
+  });
+
+  describe('params', () => {
+    const seedFile = '.visual-proof/params.json';
+
+    it('is none without routeParams or a file, config with routeParams', async () => {
+      expect((await doctor(configure())).capabilities.params).toMatchObject({ tier: 'none', status: 'ok', required: false });
+      expect((await doctor(configure({ routeParams: { '/a/:id': '/a/1' } }))).capabilities.params).toMatchObject({
+        tier: 'config',
+        status: 'ok',
+        detail: '1 entry',
+      });
+    });
+
+    it('is seed-file when the file is present, counting its entries', async () => {
+      write(repo, seedFile, JSON.stringify({ routes: { '/a/:id': '/a/1', '/b/:id': '/b/2' } }));
+      const report = await doctor(configure({ routeParamsFile: seedFile, routeParams: { '/c/:id': '/c/3' } }));
+      expect(report.capabilities.params).toMatchObject({
+        tier: 'seed-file',
+        status: 'ok',
+        required: false,
+        detail: `2 entries from ${seedFile}`,
+      });
+    });
+
+    it('warns "routeParamsFile not found" and falls back to the config tier when the file is missing', async () => {
+      const report = await doctor(configure({ routeParamsFile: seedFile, routeParams: { '/c/:id': '/c/3' } }));
+      expect(report.capabilities.params).toMatchObject({ tier: 'config', status: 'warn', required: false });
+      expect(report.capabilities.params.detail).toContain(`routeParamsFile not found: ${path.join(repo, seedFile)}`);
+      expect(report.ok).toBe(true);
+    });
+
+    it('reports invalid JSON and a wrong shape as errors without failing the run', async () => {
+      write(repo, seedFile, '{ nope');
+      const bad = await doctor(configure({ routeParamsFile: seedFile }));
+      expect(bad.capabilities.params).toMatchObject({ tier: 'invalid', status: 'missing', required: false });
+      expect(bad.capabilities.params.detail).toContain('is not valid JSON');
+      expect(bad.ok).toBe(true);
+
+      write(repo, seedFile, '[1]');
+      const shape = await doctor(configure({ routeParamsFile: seedFile }));
+      expect(shape.capabilities.params.detail).toContain('has the wrong shape');
+    });
+
+    it('warns about ignored values but still counts the valid entries', async () => {
+      write(repo, seedFile, JSON.stringify({ '/a/:id': '/a/1', '/b/:id': 7 }));
+      const report = await doctor(configure({ routeParamsFile: seedFile }));
+      expect(report.capabilities.params).toMatchObject({ tier: 'seed-file', status: 'warn' });
+      expect(report.capabilities.params.detail).toContain(`1 entry from ${seedFile}`);
+      expect(report.capabilities.params.detail).toContain('"/b/:id" ignored');
+    });
   });
 
   it('routes: import-graph, static-map fallback, none', async () => {
@@ -258,7 +310,7 @@ describe('formatReport and doctorCommand', () => {
   it('prints one aligned row per capability', async () => {
     const text = formatReport(await doctor(configure({ screenGlobs: ['nothing/**'] })));
     const lines = text.trimEnd().split('\n');
-    expect(lines).toHaveLength(9);
+    expect(lines).toHaveLength(10);
     expect(lines[0]).toMatch(/^capability\s+tier\s+status\s+detail$/);
     expect(lines.find((l) => l.startsWith('trigger'))).toMatch(/^trigger\s+fs-watch\s+MISSING\s+no files match/);
     // Columns line up: every row's tier column starts at the same offset.

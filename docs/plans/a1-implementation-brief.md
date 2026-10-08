@@ -44,6 +44,7 @@ src/
     fs-watch.ts     trigger: screen + backend globs
   resolve/
     import-graph.ts static import graph from route files -> file-to-routes map
+    route-params.ts routeParams merged with the routeParamsFile seed file (re-read on every call)
     routes.ts       chain: import graph, then config static map, then skip+log
   browser.ts        warm Chromium, one context, login, capture(route) -> Frame
   triage.ts         DOM heuristics -> clean | loading | error | blank
@@ -76,6 +77,7 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "aliases": { "@": "src" },
   "staticRoutes": { "src/pages/Reports.vue": ["/reports"] },
   "routeParams": { "/invoices/:id": "/invoices/1" },
+  "routeParamsFile": ".visual-proof/route-params.json", // params written at runtime by the app (e.g. a seeder); relative to the config dir
   "screenGlobs": ["src/**/*.vue"],
   "ignoreScreenGlobs": [],                      // files matching these are never screens (shared helpers, stories)
   "backendGlobs": ["server/**"],
@@ -93,6 +95,14 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "baseRef": "main"
 }
 ```
+
+`routeParamsFile` points at a JSON file of either shape `{ "routes": { "<route key>": "<concrete path>" } }` or the flat `{ "<route key>": "<concrete path>" }`. Semantics:
+
+- Entries from the file override `routeParams` for the same key; other keys merge.
+- The file is re-read whenever params are needed (watch batches, `finish`, `doctor`); nothing is cached, so a file written after the daemon started is picked up without a restart. Backend-triggered re-captures re-resolve each captured route key against the current params.
+- A missing file is empty, with no error. Invalid JSON or a wrong shape never crashes: `doctor` reports an error, `watcher.log` gets a one-line `warning: ...` (repeated only when the problem changes), and `finish` adds a note; all three fall back to config `routeParams`.
+- Values must be strings starting with `/`; others are ignored with a warning (same three places).
+- `doctor` gains a `params` capability, never required: tier `seed-file` (`N entries from <file>`) when the file is present, else `config` (`N entries`), else `none`. A missing file is a `warn` (`routeParamsFile not found: <path>`); an unreadable or invalid file is tier `invalid`.
 
 Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`), `VISUAL_PROOF_SCRATCH_DIR` (default `<statusDir>/scratch`).
 

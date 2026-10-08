@@ -8,7 +8,8 @@ import type { Config } from './config.js';
 import { headCommit, workingTreeHash } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
-import { joinUrl, resolveRoutes } from './resolve/routes.js';
+import { loadRouteParams } from './resolve/route-params.js';
+import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
 import { Timeline, type Frame, type Trigger } from './timeline.js';
 import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-watch.js';
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
@@ -117,6 +118,8 @@ class Watcher {
 
   private graph: Promise<ImportGraph> | null = null;
   private graphStale = false;
+  /** The route-params problems last logged, so an unchanged bad file does not log on every batch. */
+  private lastParamsProblems = '';
   /** Concrete path -> route, for every route that produced a frame this session. */
   private readonly sessionRoutes = new Map<string, { routeKey: string; url: string }>();
 
@@ -333,11 +336,12 @@ class Watcher {
       const beforeP = treeHash(this.config.repoDir, this.dirs.scratchDir);
       beforeP.catch(() => {});
 
+      const params = this.readRouteParams();
       const targets = new Map<string, Target>();
       if (screen.length > 0) {
         const [barrier, resolution] = await Promise.all([
           this.waitBarrier(batch.startedAt, screen),
-          this.resolveScreen(screen),
+          this.resolveScreen(screen, params),
         ]);
         mark('barrier+routes');
         this.log(`batch screen=${screen.join(',')} barrier=${barrier}`);
@@ -345,9 +349,13 @@ class Watcher {
       }
       if (backend.length > 0) {
         if (screen.length === 0) this.log(`batch backend=${backend.join(',')}`);
-        for (const [routePath, route] of this.sessionRoutes) {
+        for (const [capturedPath, route] of this.sessionRoutes) {
+          // Re-resolve: a re-run seeder may have moved a param route to a new id since it was captured.
+          const concrete = concretePath(route.routeKey, params);
+          const routePath = concrete.ok ? concrete.path : capturedPath;
+          const url = concrete.ok ? joinUrl(this.config.appUrl, routePath) : route.url;
           if (!targets.has(routePath)) {
-            targets.set(routePath, { path: routePath, ...route, trigger: 'backend', sourceFile: backend[0] });
+            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: 'backend', sourceFile: backend[0] });
           }
         }
         if (this.sessionRoutes.size === 0) this.log('backend change: no routes captured this session yet');
@@ -446,7 +454,19 @@ class Watcher {
 
   // ---- routes --------------------------------------------------------------
 
-  private async resolveScreen(files: string[]): Promise<Target[]> {
+  /** Config `routeParams` plus the seed file, re-read per batch. Problems are logged once per distinct message. */
+  private readRouteParams(): Record<string, string> {
+    const result = loadRouteParams(this.config);
+    const problems = [...(result.error ? [result.error] : []), ...result.warnings];
+    const key = problems.join('\n');
+    if (key !== this.lastParamsProblems) {
+      this.lastParamsProblems = key;
+      for (const problem of problems) this.log(`warning: ${problem}`);
+    }
+    return result.params;
+  }
+
+  private async resolveScreen(files: string[], params: Record<string, string>): Promise<Target[]> {
     let graph = await this.getGraph();
     const touchesRoutes = files.some((f) => this.isRouteFile(f));
     const unknown = files.some((f) => !graph.fileToRoutes.has(f) && !this.config.staticRoutes[f]);
@@ -460,7 +480,7 @@ class Watcher {
       this.graphStale = true;
     }
 
-    const resolution = resolveRoutes(files, graph, this.config);
+    const resolution = resolveRoutes(files, graph, { ...this.config, routeParams: params });
     for (const file of resolution.unmapped) this.log(`no route for ${file}`);
     for (const skip of resolution.skipped) this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
     return resolution.routes.map((r) => ({

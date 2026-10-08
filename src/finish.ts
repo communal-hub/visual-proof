@@ -6,6 +6,7 @@ import { changeSet, headTree, isGitRepo, workingTreeHash } from './git.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
+import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
 import { readStatusFile, watcherPid, writeFileAtomic, type Status } from './status.js';
 import { describeError } from './text.js';
@@ -196,7 +197,10 @@ async function gather(
   const timeline = new Timeline(dirs.scratchDir, config.maxFrames);
   const expected = new Map<string, RouteProof>();
 
-  const resolution = resolveRoutes(screenFiles, graph, config);
+  const seed = loadRouteParams(config);
+  if (seed.error) state.notes.push(`${seed.error}; using routeParams from the config only`);
+  for (const warning of seed.warnings) state.notes.push(warning);
+  const resolution = resolveRoutes(screenFiles, graph, { ...config, routeParams: seed.params });
   for (const route of resolution.routes) {
     expected.set(route.routeKey, {
       route: route.path,
@@ -232,7 +236,7 @@ async function gather(
         state.notes.push(`captured route ${lastRoute} no longer resolves to a route; skipped`);
         continue;
       }
-      const concrete = concretePath(routeKey, config.routeParams);
+      const concrete = concretePath(routeKey, seed.params);
       if (!concrete.ok) {
         state.failures.push(`cannot capture ${routeKey}: ${concrete.reason} (add routeParams)`);
         continue;

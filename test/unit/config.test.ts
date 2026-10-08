@@ -41,6 +41,7 @@ describe('loadConfig', () => {
       baseRef: 'main',
     });
     expect(config.freshnessMarker).toBeUndefined();
+    expect(config.routeParamsFile).toBeUndefined();
   });
 
   it('keeps explicit values and defaults viteUrl to appUrl only when absent', () => {
@@ -64,6 +65,15 @@ describe('loadConfig', () => {
       tokenFile: '.visual-proof/token',
     });
     expect(config.maxFrames).toBe(5);
+  });
+
+  it('reads routeParamsFile and rejects a non-string', () => {
+    expect(loadConfig({ cwd: project({ appUrl: 'http://a.test', routeParamsFile: '.visual-proof/params.json' }), env: {} }).routeParamsFile).toBe(
+      '.visual-proof/params.json',
+    );
+    expect(() => loadConfig({ cwd: project({ appUrl: 'http://a.test', routeParamsFile: 3 }), env: {} })).toThrow(
+      /"routeParamsFile" must be a non-empty string/,
+    );
   });
 
   it('reads ignoreScreenGlobs and rejects a non-array', () => {

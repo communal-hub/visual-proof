@@ -68,7 +68,7 @@ describe('doctor against the vite-vue fixture', () => {
     expect(cli.code).toBe(0);
     expect(cli.stderr).toBe('');
     const lines = cli.stdout.trimEnd().split('\n');
-    expect(lines).toHaveLength(10);
+    expect(lines).toHaveLength(11);
     expect(lines.at(-1)).toBe(`details: ${path.join(h.dirs.statusDir, 'doctor.json')}`);
     expect(cli.stdout).toMatch(/^barrier\s+vite-hmr\s+ok\s/m);
     expect(cli.stdout).toMatch(/^login\s+http-hook\s+ok\s/m);
