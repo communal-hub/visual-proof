@@ -44,7 +44,15 @@ export async function workingTreeHash(repoDir: string, scratchDir: string): Prom
   fs.mkdirSync(scratchDir, { recursive: true });
   const tempIndex = path.join(scratchDir, `index.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   try {
-    if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tempIndex);
+    if (fs.existsSync(realIndex)) {
+      fs.copyFileSync(realIndex, tempIndex);
+      // Git decides whether an entry's stat data can be trusted by comparing it with the index
+      // file's own mtime ("racily clean" entries are re-hashed). A fresh copy would have mtime
+      // "now", making a same-size edit made in the same second as the last index write look
+      // unchanged, so keep the real index's timestamps.
+      const { atime, mtime } = fs.statSync(realIndex);
+      fs.utimesSync(tempIndex, atime, mtime);
+    }
     const env = { GIT_INDEX_FILE: tempIndex };
     await git(repoDir, ['add', '-A'], env);
     return (await git(repoDir, ['write-tree'], env)).stdout.trim();

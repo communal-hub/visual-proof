@@ -31,6 +31,24 @@ describe('workingTreeHash', () => {
     expect(await workingTreeHash(repo, scratch)).toBe(clean);
   });
 
+  it('sees a same-size edit made in the same second as the last index write', async () => {
+    // Reproduce git's "racily clean" window deterministically: the file and the index share an
+    // mtime, and the edit keeps the size. A copy of the index with a fresh mtime would hide it.
+    git(repo, 'config', 'core.trustctime', 'false');
+    const second = new Date(Date.now() - 100_000);
+    const file = path.join(repo, 'a.txt');
+    fs.utimesSync(file, second, second);
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-q', '--allow-empty', '-m', 'restamp');
+    git(repo, 'update-index', '--refresh');
+    fs.utimesSync(path.join(repo, '.git', 'index'), second, second);
+
+    const clean = await workingTreeHash(repo, scratch);
+    write(repo, 'a.txt', 'two\n');
+    fs.utimesSync(file, second, second);
+    expect(await workingTreeHash(repo, scratch)).not.toBe(clean);
+  });
+
   it('equals the new HEAD^{tree} after committing the edit', async () => {
     write(repo, 'a.txt', 'two\n');
     write(repo, 'new.txt', 'new\n');
