@@ -19,8 +19,23 @@ export interface ViteHmrOptions {
   log?: (message: string) => void;
 }
 
-/** Vite HMR payload types that mean "the module graph was just invalidated and clients should refetch". */
-const BARRIER_TYPES = new Set(['update', 'full-reload']);
+/** One `update` / `full-reload` message, kept briefly so a barrier wait can be credited with one that beat it. */
+interface BarrierMessage {
+  at: number;
+  /** `full-reload` invalidates everything; an `update` only the listed modules. */
+  full: boolean;
+  /** URL paths named by an `update` (`path` and `acceptedPath` of each entry), normalised: no query, no leading slash. */
+  paths: Set<string>;
+}
+
+interface Waiter {
+  /** Normalised repo-relative paths this wait cares about; undefined means any barrier message. */
+  files: Set<string> | undefined;
+  resolve: (result: BarrierResult) => void;
+}
+
+const RECENT_MESSAGE_MS = 30_000;
+const RECENT_MESSAGE_MAX = 100;
 
 /**
  * `const wsToken = "..."` from the served `/@vite/client`. Returns null when absent (Vite < 5.1
@@ -60,8 +75,8 @@ export class ViteHmrClient extends EventEmitter {
   private stopped = true;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private backoffMs: number;
-  private lastBarrierAt = 0;
-  private readonly waiters = new Set<(result: BarrierResult) => void>();
+  private recent: BarrierMessage[] = [];
+  private readonly waiters = new Set<Waiter>();
   private abort = new AbortController();
 
   constructor(private readonly options: ViteHmrOptions) {
@@ -90,7 +105,7 @@ export class ViteHmrClient extends EventEmitter {
       ws.terminate();
     }
     this.setState('disconnected');
-    for (const resolve of [...this.waiters]) resolve('timeout');
+    for (const waiter of [...this.waiters]) waiter.resolve('timeout');
   }
 
   /** Resolves true once connected, false after `timeoutMs` without a connection. */
@@ -111,20 +126,31 @@ export class ViteHmrClient extends EventEmitter {
   }
 
   /**
-   * Resolve `hmr` on the next `update` or `full-reload` message, else `timeout`. With
-   * `since` (epoch ms), a barrier message that already arrived at or after that time counts, which
-   * covers Vite announcing the change before the caller's own debounce finished.
+   * Resolve `hmr` on the next barrier message, else `timeout`. A barrier message is `full-reload`
+   * (always) or an `update` that names one of `files` (repo-relative paths, matched against each
+   * entry's `path` and `acceptedPath`, which are URL paths such as `/src/pages/A.vue`). An `update`
+   * for some other module says nothing about the files being waited on. Without `files`, any
+   * barrier message counts. With `since` (epoch ms), a matching message that already arrived at or
+   * after that time counts, which covers Vite announcing the change before the caller's own
+   * debounce finished.
    */
-  waitForNextMessage(timeoutMs: number, options: { since?: number } = {}): Promise<BarrierResult> {
-    if (options.since !== undefined && this.lastBarrierAt >= options.since) return Promise.resolve('hmr');
+  waitForNextMessage(timeoutMs: number, options: { since?: number; files?: string[] } = {}): Promise<BarrierResult> {
+    const files = options.files ? new Set(options.files.map((f) => normalizePath(f, ''))) : undefined;
+    if (options.since !== undefined) {
+      const since = options.since;
+      if (this.recent.some((m) => m.at >= since && matches(m, files))) return Promise.resolve('hmr');
+    }
     return new Promise((resolve) => {
-      const done = (result: BarrierResult): void => {
-        clearTimeout(timer);
-        this.waiters.delete(done);
-        resolve(result);
+      const waiter: Waiter = {
+        files,
+        resolve: (result) => {
+          clearTimeout(timer);
+          this.waiters.delete(waiter);
+          resolve(result);
+        },
       };
-      const timer = setTimeout(() => done('timeout'), timeoutMs);
-      this.waiters.add(done);
+      const timer = setTimeout(() => waiter.resolve('timeout'), timeoutMs);
+      this.waiters.add(waiter);
     });
   }
 
@@ -201,16 +227,49 @@ export class ViteHmrClient extends EventEmitter {
   }
 
   private onMessage(text: string): void {
-    let type: unknown;
+    let payload: { type?: unknown; updates?: unknown };
     try {
-      type = (JSON.parse(text) as { type?: unknown }).type;
+      payload = JSON.parse(text) as { type?: unknown; updates?: unknown };
     } catch {
       return;
     }
-    if (typeof type !== 'string' || !BARRIER_TYPES.has(type)) return;
-    this.lastBarrierAt = Date.now();
-    for (const resolve of [...this.waiters]) resolve('hmr');
+    const basePath = new URL(withTrailingSlash(this.options.viteUrl)).pathname;
+    let message: BarrierMessage;
+    if (payload.type === 'full-reload') {
+      message = { at: Date.now(), full: true, paths: new Set() };
+    } else if (payload.type === 'update') {
+      const paths = new Set<string>();
+      for (const update of Array.isArray(payload.updates) ? (payload.updates as unknown[]) : []) {
+        if (typeof update !== 'object' || update === null) continue;
+        const { path, acceptedPath } = update as { path?: unknown; acceptedPath?: unknown };
+        for (const p of [path, acceptedPath]) if (typeof p === 'string') paths.add(normalizePath(p, basePath));
+      }
+      message = { at: Date.now(), full: false, paths };
+    } else {
+      return;
+    }
+    this.recent = [...this.recent.filter((m) => message.at - m.at <= RECENT_MESSAGE_MS), message].slice(-RECENT_MESSAGE_MAX);
+    for (const waiter of [...this.waiters]) if (matches(message, waiter.files)) waiter.resolve('hmr');
   }
+}
+
+/** Whether a barrier message tells a waiter that its files were invalidated. */
+function matches(message: BarrierMessage, files: Set<string> | undefined): boolean {
+  if (message.full || files === undefined) return true;
+  for (const file of files) if (message.paths.has(file)) return true;
+  return false;
+}
+
+/** `/base/src/A.vue?vue&type=style#x` -> `src/A.vue`: no query or hash, no `base` prefix, no leading slash. */
+function normalizePath(urlPath: string, basePath: string): string {
+  let p = urlPath.replace(/[?#].*$/, '');
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    // keep the raw path
+  }
+  if (basePath !== '' && basePath !== '/' && p.startsWith(basePath)) p = p.slice(basePath.length);
+  return p.replace(/^\/+/, '');
 }
 
 function withTrailingSlash(url: string): string {

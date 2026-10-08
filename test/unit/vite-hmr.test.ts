@@ -44,7 +44,7 @@ class FakeVite {
   constructor(tls?: https.ServerOptions) {
     const handler: http.RequestListener = (req, res) => {
       this.clientFetches++;
-      if (req.url === '/@vite/client') {
+      if (req.url?.endsWith('/@vite/client')) {
         res.end(`const hmrPort = null;\nconst wsToken = "${this.token}";\n`);
       } else {
         res.statusCode = 404;
@@ -172,6 +172,74 @@ describe('ViteHmrClient', () => {
     expect(Date.now() - started).toBeLessThan(100);
     // A message older than `since` does not count.
     expect(await c.waitForNextMessage(80, { since: Date.now() })).toBe('timeout');
+  });
+
+  describe('waiting for specific files', () => {
+    const A = 'src/pages/A.vue';
+    const update = (path: string, acceptedPath = path) => ({
+      type: 'update',
+      updates: [{ type: 'js-update', path, acceptedPath, timestamp: 1 }],
+    });
+
+    async function connected(overrides: Partial<ConstructorParameters<typeof ViteHmrClient>[0]> = {}): Promise<ViteHmrClient> {
+      const c = makeClient(overrides);
+      c.start();
+      await c.waitForConnected(2000);
+      return c;
+    }
+
+    it('ignores an update for some other module and times out', async () => {
+      const c = await connected();
+      const p = c.waitForNextMessage(250, { files: [A] });
+      vite.send(update('/src/pages/B.vue'));
+      expect(await p).toBe('timeout');
+    });
+
+    it('resolves on an update whose path or acceptedPath is the changed file (query and encoding ignored)', async () => {
+      const c = await connected();
+      let p = c.waitForNextMessage(2000, { files: [A] });
+      vite.send(update('/src/pages/A.vue'));
+      expect(await p).toBe('hmr');
+
+      p = c.waitForNextMessage(2000, { files: ['src/composables/useThing.js'] });
+      vite.send(update('/src/pages/A.vue', '/src/composables/useThing.js'));
+      expect(await p).toBe('hmr');
+
+      p = c.waitForNextMessage(2000, { files: ['src/pages/My Page.vue'] });
+      vite.send(update('/src/pages/My%20Page.vue?vue&type=style&index=0&lang.css'));
+      expect(await p).toBe('hmr');
+    });
+
+    it('resolves on a full-reload whatever the files are', async () => {
+      const c = await connected();
+      const p = c.waitForNextMessage(2000, { files: [A] });
+      vite.send({ type: 'full-reload' });
+      expect(await p).toBe('hmr');
+    });
+
+    it('matches any of several files, and strips a base path from the update', async () => {
+      const c = await connected({ viteUrl: `http://127.0.0.1:${port}/app/` });
+      const p = c.waitForNextMessage(2000, { files: [A, 'src/pages/C.vue'] });
+      vite.send(update('/app/src/pages/C.vue'));
+      expect(await p).toBe('hmr');
+    });
+
+    it('credits only a matching message that arrived since a given time', async () => {
+      const c = await connected();
+      const before = Date.now() - 1;
+      vite.send(update('/src/pages/B.vue'));
+      await new Promise((r) => setTimeout(r, 50));
+      // The only message so far is for another module: not credited.
+      expect(await c.waitForNextMessage(100, { since: before, files: [A] })).toBe('timeout');
+
+      vite.send(update('/src/pages/A.vue'));
+      await new Promise((r) => setTimeout(r, 50));
+      const started = Date.now();
+      expect(await c.waitForNextMessage(2000, { since: before, files: [A] })).toBe('hmr');
+      expect(Date.now() - started).toBeLessThan(100);
+      // ... and not by a message from before `since`.
+      expect(await c.waitForNextMessage(100, { since: Date.now(), files: [A] })).toBe('timeout');
+    });
   });
 
   it('reconnects after a drop and re-fetches the token when the server restarted', async () => {

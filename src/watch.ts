@@ -22,7 +22,7 @@ export interface BarrierSource {
   readonly state: HmrState;
   start(): void;
   stop(): Promise<void>;
-  waitForNextMessage(timeoutMs: number, options?: { since?: number }): Promise<BarrierResult>;
+  waitForNextMessage(timeoutMs: number, options?: { since?: number; files?: string[] }): Promise<BarrierResult>;
   waitForConnected(timeoutMs: number): Promise<boolean>;
   on(event: 'state', listener: (state: HmrState) => void): unknown;
 }
@@ -295,13 +295,16 @@ class Watcher {
     };
     try {
       const treeHash = this.opts.treeHash ?? workingTreeHash;
+      // Read before the first hash: a file event anywhere between here and the second hash means the
+      // pages may have rendered an intermediate state, even if the two hashes happen to be equal.
+      const eventsBefore = this.trigger?.eventCount() ?? 0;
       const beforeP = treeHash(this.config.repoDir, this.dirs.scratchDir);
       beforeP.catch(() => {});
 
       const targets = new Map<string, Target>();
       if (screen.length > 0) {
         const [barrier, resolution] = await Promise.all([
-          this.waitBarrier(batch.startedAt),
+          this.waitBarrier(batch.startedAt, screen),
           this.resolveScreen(screen),
         ]);
         mark('barrier+routes');
@@ -341,15 +344,18 @@ class Watcher {
       const after = await treeHash(this.config.repoDir, this.dirs.scratchDir);
       mark('hash');
       if (this.stopping) return;
-      if (after !== before) {
+      const eventsDuring = (this.trigger?.eventCount() ?? 0) - eventsBefore;
+      if (after !== before || eventsDuring > 0) {
         const requeue = batch.attempts < (this.opts.maxRequeues ?? 2);
-        this.log(
-          `discarded ${captured.length} frame(s): working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})` +
-            (requeue ? '; re-queued' : '; giving up after repeated changes'),
-        );
-        this.events.emit('discarded', { routes: [...targets.keys()], before, after, requeued: requeue });
+        const why =
+          after !== before
+            ? `working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})`
+            : `${eventsDuring} file event(s) arrived during capture (tree unchanged: ${after.slice(0, 8)})`;
+        this.log(`discarded ${captured.length} frame(s): ${why}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
+        this.events.emit('discarded', { routes: [...targets.keys()], before, after, requeued: requeue, events: eventsDuring });
         if (requeue) {
-          this.merge({ screen, backend, startedAt: batch.startedAt, attempts: batch.attempts + 1 });
+          // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
+          this.merge({ screen, backend, startedAt: Date.now(), attempts: batch.attempts + 1 });
         }
         done('discarded', [...targets.keys()]);
         return;
@@ -391,14 +397,16 @@ class Watcher {
     }
   }
 
-  private async waitBarrier(startedAt: number): Promise<BarrierResult> {
+  private async waitBarrier(startedAt: number, files: string[]): Promise<BarrierResult> {
     const timeout = this.opts.barrierTimeoutMs ?? 500;
     if (!this.barrier) {
       await new Promise((r) => setTimeout(r, timeout));
       return 'timeout';
     }
     // Credit a message that beat the fs debounce; 50 ms slack covers Vite noticing the save first.
-    return this.barrier.waitForNextMessage(timeout, { since: startedAt - 50 });
+    // Only a `full-reload` or an `update` naming one of these files counts: Vite's URL paths are
+    // `/<repo-relative path>`, and an update for some other module says nothing about them.
+    return this.barrier.waitForNextMessage(timeout, { since: startedAt - 50, files });
   }
 
   // ---- routes --------------------------------------------------------------

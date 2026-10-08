@@ -47,6 +47,27 @@ async function until(predicate: () => boolean, timeoutMs = 3000): Promise<void> 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 describe('startFsWatch', () => {
+  it('counts every relevant file event monotonically, even ones coalesced into a single batch', async () => {
+    const h = await start({ debounceMs: 200 });
+    expect(h.eventCount()).toBe(0);
+    write(root, 'src/notes.md', 'ignored');
+    write(root, 'other/x.vue', 'ignored');
+    await sleep(100);
+    expect(h.eventCount()).toBe(0);
+
+    write(root, 'src/a.vue', 'a2');
+    await until(() => h.eventCount() >= 1);
+    const first = h.eventCount();
+    write(root, 'server/data.json', '{"n":2}');
+    await until(() => h.eventCount() >= first + 1);
+    await until(() => batches.length > 0);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toMatchObject({ screen: ['src/a.vue'], backend: ['server/data.json'] });
+    const settled = h.eventCount();
+    await sleep(100);
+    expect(h.eventCount()).toBe(settled);
+  });
+
   it('does not report files matching ignoreScreenGlobs as screens', async () => {
     write(root, 'src/stories/s.vue', 's');
     await start({ ignoreScreenGlobs: ['src/stories/**'] });

@@ -46,7 +46,7 @@ class FakeCapturer implements Capturer {
 
 class FakeBarrier implements BarrierSource {
   state: HmrState = 'connected';
-  calls: Array<{ timeoutMs: number; since?: number }> = [];
+  calls: Array<{ timeoutMs: number; since?: number; files?: string[] }> = [];
   result: BarrierResult = 'hmr';
   started = false;
   stopped = false;
@@ -56,8 +56,8 @@ class FakeBarrier implements BarrierSource {
   async stop() {
     this.stopped = true;
   }
-  async waitForNextMessage(timeoutMs: number, options: { since?: number } = {}) {
-    this.calls.push({ timeoutMs, since: options.since });
+  async waitForNextMessage(timeoutMs: number, options: { since?: number; files?: string[] } = {}) {
+    this.calls.push({ timeoutMs, since: options.since, files: options.files });
     return this.result;
   }
   async waitForConnected() {
@@ -85,6 +85,7 @@ let capturer: FakeCapturer;
 let barrier: FakeBarrier;
 let pushBatch: (batch: Partial<WatchBatch>) => void;
 let triggerStopped: boolean;
+let eventCounter: number;
 let handle: WatchHandle | null;
 let batches: BatchEvent[];
 let tree: string;
@@ -110,6 +111,7 @@ beforeEach(() => {
   capturer = new FakeCapturer();
   barrier = new FakeBarrier();
   triggerStopped = false;
+  eventCounter = 0;
   handle = null;
   batches = [];
   tree = 'a'.repeat(40);
@@ -136,6 +138,7 @@ async function start(overrides: Parameters<typeof startWatch>[1] = {}): Promise<
       pushBatch = (batch) =>
         options.onBatch({ screen: [], backend: [], startedAt: Date.now(), ...batch });
       return {
+        eventCount: () => eventCounter,
         stop: async () => {
           triggerStopped = true;
         },
@@ -229,7 +232,7 @@ describe('screen batches', () => {
     pushBatch({ screen: ['src/pages/Detail.vue'], startedAt });
     await nextBatch();
 
-    expect(barrier.calls).toEqual([{ timeoutMs: 500, since: startedAt - 50 }]);
+    expect(barrier.calls).toEqual([{ timeoutMs: 500, since: startedAt - 50, files: ['src/pages/Detail.vue'] }]);
     expect(capturer.urls).toEqual(['http://app.test/invoices/1']);
     const frames = timeline().list();
     expect(frames).toHaveLength(1);
@@ -391,6 +394,55 @@ describe('tree stability', () => {
     expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'discarded']);
     expect(timeline().list()).toEqual([]);
     expect(logText()).toContain('giving up after repeated changes');
+  });
+
+  it('discards and re-captures when a file event arrived during the capture even though the tree hash is unchanged (A -> B -> A)', async () => {
+    await start();
+    const discarded: Array<{ requeued: boolean; before: string; after: string; events: number }> = [];
+    handle!.events.on('discarded', (e) => discarded.push(e));
+
+    let first = true;
+    capturer.onCapture = () => {
+      if (first) {
+        first = false;
+        eventCounter++; // saved B and then reverted to A while the page loaded: the hash alone cannot tell
+      }
+    };
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch(2);
+
+    expect(discarded).toEqual([expect.objectContaining({ requeued: true, before: tree, after: tree, events: 1 })]);
+    expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'captured']);
+    expect(timeline().list()).toHaveLength(1);
+    expect(capturer.urls).toHaveLength(2);
+    expect(logText()).toMatch(/discarded 1 frame\(s\): 1 file event\(s\) arrived during capture \(tree unchanged.*re-queued/);
+  });
+
+  it('does not discard for events that arrived before the batch started processing', async () => {
+    await start();
+    eventCounter += 5; // the events that formed this batch were counted when they happened
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    expect(batches[0]!.outcome).toBe('captured');
+  });
+
+  it('a requeued batch waits for a fresh HMR message: it does not reuse the old startedAt', async () => {
+    await start();
+    let first = true;
+    capturer.onCapture = () => {
+      if (first) {
+        first = false;
+        tree = 'b'.repeat(40);
+      }
+    };
+    const startedAt = Date.now() - 10_000; // an old save whose message (or the lack of one) is long gone
+    pushBatch({ screen: ['src/pages/Home.vue'], startedAt });
+    await nextBatch(2);
+
+    expect(barrier.calls).toHaveLength(2);
+    expect(barrier.calls[0]!.since).toBe(startedAt - 50);
+    expect(barrier.calls[1]!.since).toBeGreaterThan(startedAt + 5_000);
+    expect(barrier.calls[1]!.files).toEqual(['src/pages/Home.vue']);
   });
 
   it('computes the tree hash before and after each capturing batch', async () => {

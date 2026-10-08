@@ -38,6 +38,11 @@ export interface FsWatchOptions {
 }
 
 export interface FsWatchHandle {
+  /**
+   * Monotonically increasing count of relevant file events seen so far (every add/change/unlink of
+   * a screen or backend file, before debouncing). Two equal readings mean no event arrived between.
+   */
+  eventCount(): number;
   /** Stops watching and cancels any pending (unemitted) batch. Safe to call twice. */
   stop(): Promise<void>;
 }
@@ -89,6 +94,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
   let startedAt = 0;
+  let eventCount = 0;
 
   const flush = (): void => {
     timer = null;
@@ -110,6 +116,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
     const s = isScreen(rel);
     const b = isBackend(rel);
     if (!s && !b) return;
+    eventCount++;
     if (screen.size === 0 && backend.size === 0) startedAt = Date.now();
     if (s) screen.add(rel);
     if (b) backend.add(rel);
@@ -124,6 +131,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
   await new Promise<void>((resolve) => setTimeout(resolve, options.settleMs ?? 100));
 
   return {
+    eventCount: () => eventCount,
     async stop() {
       stopped = true;
       if (timer) clearTimeout(timer);

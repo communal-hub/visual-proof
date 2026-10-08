@@ -12,11 +12,11 @@ The plan's Tier 1 trigger is the browser console line `[vite] hot updated: <path
 The A1 design:
 
 - **Trigger:** a file watcher (chokidar) on `screenGlobs` and `backendGlobs`, debounced (150 ms). This is always on.
-- **Freshness barrier:** a **Vite HMR websocket client** in Node. After a screen-file event, wait for the next HMR message (`update` or `full-reload`) or 500 ms, whichever comes first. The message arrives after Vite has invalidated the module; the timeout covers modules not yet in Vite's graph, which have no cached transform.
+- **Freshness barrier:** a **Vite HMR websocket client** in Node. After a screen-file event, wait for an HMR message that covers the changed files, or 500 ms, whichever comes first. A message covers them when it is a `full-reload` (any), or an `update` whose `updates[].path` or `acceptedPath` is one of the changed screen modules (Vite URL path `/<repo-relative path>`, query and base ignored); an `update` for some other module does not count. The message arrives after Vite has invalidated the module; the timeout covers modules not yet in Vite's graph, which have no cached transform. A message that arrived up to 50 ms before the first file event counts (Vite can notice a save before the debounce ends); a re-queued batch never reuses the old batch's start time, so a message from before the discarded capture cannot satisfy its barrier.
   - Fetch `<viteUrl>/@vite/client`, read the token with `/const wsToken = "([^"]+)"/`.
   - Connect to `ws(s)://<vite host>/?token=<token>` with subprotocol `vite-hmr`. Reconnect with backoff, re-fetching the token (a restarted dev server has a new one).
 - **Capture:** every capture opens a **fresh page** in the warm context and navigates, so the still cannot show a pre-update render. No Vite plugin, no app config change.
-- **Tree stability:** compute the tree hash before and after a capture batch. If it changed mid-batch, discard the batch; the newer change has already queued another.
+- **Tree stability:** compute the tree hash before and after a capture batch, and keep a monotonically increasing counter of relevant file events in the trigger. If the hash changed, or any file event arrived between the two readings (an A -> B -> A save leaves the hash equal but the page may have rendered B), discard the batch and re-queue it (at most twice).
 - `doctor` reports the trigger as `fs-watch` and the barrier as `vite-hmr` or `timeout-only`.
 
 ## Stack
