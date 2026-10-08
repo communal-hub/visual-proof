@@ -251,10 +251,12 @@ export class Browser implements Capturer {
           this.log(`capture ${url}: page navigated while settling (attempt ${attempt + 1})`);
         }
       }
+      let screenshotError: string | undefined;
       const png = await page
         .screenshot({ fullPage: true, type: 'png', animations: 'disabled', caret: 'hide' })
         .catch((err: Error) => {
-          this.log(`capture ${url}: screenshot failed: ${err.message.split('\n')[0]}`);
+          screenshotError = err.message.split('\n')[0] || err.name;
+          this.log(`capture ${url}: screenshot failed: ${screenshotError}`);
           return Buffer.from(BLANK_PNG_BASE64, 'base64');
         });
 
@@ -262,7 +264,7 @@ export class Browser implements Capturer {
         png,
         finalUrl: page.url(),
         httpStatus,
-        signals: { navOk, httpStatus, consoleErrors, pageErrors, ...dom },
+        signals: { navOk, httpStatus, consoleErrors, pageErrors, ...dom, ...(screenshotError ? { screenshotError } : {}) },
       };
     } finally {
       this.pages.delete(page);

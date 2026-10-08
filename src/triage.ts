@@ -10,6 +10,8 @@ export interface TriageSignals {
   visibleSpinnerCount: number;
   /** Set when the page could not be loaded as the logged-in user (login failed, 401/403, login redirect). */
   authFailure?: string;
+  /** Set when `page.screenshot` threw: the PNG on disk is a placeholder, so the frame cannot be trusted. */
+  screenshotError?: string;
 }
 
 export interface TriageResult {
@@ -24,6 +26,7 @@ export function triage(signals: TriageSignals): TriageResult {
   const errors: string[] = [];
   if (!signals.navOk) errors.push('navigation failed');
   if (signals.authFailure) errors.push(signals.authFailure);
+  if (signals.screenshotError) errors.push(`screenshot failed: ${clip(signals.screenshotError)}`);
   if (signals.httpStatus !== null && signals.httpStatus >= 500) errors.push(`HTTP ${signals.httpStatus}`);
   for (const message of signals.consoleErrors) errors.push(`console error: ${clip(message)}`);
   for (const message of signals.pageErrors) errors.push(`page error: ${clip(message)}`);

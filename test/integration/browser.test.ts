@@ -96,6 +96,26 @@ describe('Browser.capture', () => {
     expect(openPages()).toBe(0);
   });
 
+  it('turns a screenshot that throws into an error frame instead of a clean one with a placeholder PNG', async () => {
+    const internals = browser as unknown as { context: { newPage(): Promise<{ screenshot: unknown }> } };
+    const realNewPage = internals.context.newPage.bind(internals.context);
+    internals.context.newPage = async () => {
+      const page = await realNewPage();
+      page.screenshot = () => Promise.reject(new Error('Protocol error (Page.captureScreenshot): Target closed\n  at ...'));
+      return page;
+    };
+    try {
+      const result = await browser.capture(url('/'));
+      expect(result.signals.screenshotError).toBe('Protocol error (Page.captureScreenshot): Target closed');
+      expect(triage(result.signals)).toEqual({
+        status: 'error',
+        reasons: ['screenshot failed: Protocol error (Page.captureScreenshot): Target closed'],
+      });
+    } finally {
+      internals.context.newPage = realNewPage;
+    }
+  });
+
   it('close is idempotent', async () => {
     const extra = await Browser.launch(h.config);
     await extra.close();

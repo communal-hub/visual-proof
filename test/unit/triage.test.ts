@@ -64,6 +64,13 @@ describe('triage', () => {
     expect(result.reasons[0]).toMatch(/\.\.\.$/);
   });
 
+  it('a failed screenshot is an error even when the DOM looks clean', () => {
+    expect(triage({ ...healthy, screenshotError: 'Target closed' })).toEqual({
+      status: 'error',
+      reasons: ['screenshot failed: Target closed'],
+    });
+  });
+
   it('rule 3: missing app root is blank', () => {
     const result = triage({ ...healthy, appRootPresent: false, appRootChildCount: 0 });
     expect(result).toEqual({ status: 'blank', reasons: ['app root not found'] });
