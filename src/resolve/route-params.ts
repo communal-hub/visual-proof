@@ -12,6 +12,8 @@ export interface RouteParams {
   missing: boolean;
   /** Valid entries read from the file. */
   fileEntries: number;
+  /** The route keys those entries are for. */
+  fileKeys: string[];
   /** The file exists but is unreadable, invalid JSON, or the wrong shape; config `routeParams` still apply. */
   error?: string;
   /** Entries ignored because the value is not a string starting with `/`. */
@@ -29,7 +31,7 @@ type ParamConfig = Pick<Config, 'repoDir' | 'routeParams' | 'routeParamsFile'>;
  * Entries from the file win over config for the same key; other keys merge.
  */
 export function loadRouteParams(config: ParamConfig): RouteParams {
-  const result: RouteParams = { params: { ...config.routeParams }, missing: false, fileEntries: 0, warnings: [] };
+  const result: RouteParams = { params: { ...config.routeParams }, missing: false, fileEntries: 0, fileKeys: [], warnings: [] };
   if (!config.routeParamsFile) return result;
 
   const file = path.resolve(config.repoDir, config.routeParamsFile);
@@ -64,6 +66,7 @@ export function loadRouteParams(config: ParamConfig): RouteParams {
     }
     result.params[key] = value;
     result.fileEntries++;
+    result.fileKeys.push(key);
   }
   return result;
 }

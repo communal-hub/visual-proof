@@ -21,6 +21,8 @@ export interface ParsedArgs {
   configPath?: string;
   hook: boolean;
   json: boolean;
+  /** `doctor --json --normalize`: strip machine-specific details from the report. */
+  normalize: boolean;
   /** `status --wait` (and the `ready` command): block until the watcher is ready. */
   wait: boolean;
   /** Seconds `--wait` may block; undefined means the default. */
@@ -41,12 +43,14 @@ Commands:
   ready      alias for "status --wait"
   watch      run the watcher in the foreground
   finish     assemble headline stills and the proof block for HEAD
-  doctor     check the browser, change trigger, barrier, login and routes
+  doctor     check the browser, change trigger, barrier, login, routes and route params
 
 Options:
   --config <path>   config file (default: ./visual-proof.config.json)
   --hook            finish only: quiet, time-capped, always exits 0
   --json            finish, doctor: print the result as JSON on stdout
+  --normalize       doctor --json: strip ports, absolute paths, hashes, timings and
+                    versions, so the report can be checked in as a golden file
   --wait            status: block until the watcher is ready with nothing pending
                     (exit 0), or fail fast on error / a dead watcher / stop (exit 1)
   --timeout <s>     status --wait, ready: give up after this many seconds
@@ -88,7 +92,7 @@ Examples:
 `;
 
 export function parseArgs(argv: string[]): ParsedArgs {
-  const parsed: ParsedArgs = { command: null, hook: false, json: false, wait: false, help: false };
+  const parsed: ParsedArgs = { command: null, hook: false, json: false, normalize: false, wait: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '-h' || arg === '--help') {
@@ -97,6 +101,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       parsed.hook = true;
     } else if (arg === '--json') {
       parsed.json = true;
+    } else if (arg === '--normalize') {
+      parsed.normalize = true;
     } else if (arg === '--wait') {
       parsed.wait = true;
     } else if (arg === '--timeout' || arg.startsWith('--timeout=')) {
@@ -123,6 +129,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
   if (parsed.json && parsed.command !== 'finish' && parsed.command !== 'doctor' && !parsed.help) {
     throw new UsageError('--json is only valid with the finish and doctor commands');
+  }
+  if (parsed.normalize && !parsed.help && (parsed.command !== 'doctor' || !parsed.json)) {
+    throw new UsageError('--normalize is only valid with doctor --json');
   }
   if (parsed.wait && parsed.command !== 'status' && parsed.command !== 'ready' && !parsed.help) {
     throw new UsageError('--wait is only valid with the status command');
@@ -163,7 +172,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     if (args.command === 'finish') {
       return await finishCommand({ configPath: args.configPath, hook: args.hook, json: args.json, env });
     }
-    return await doctorCommand({ configPath: args.configPath, json: args.json, env });
+    return await doctorCommand({ configPath: args.configPath, json: args.json, normalize: args.normalize, env });
   } catch (err) {
     process.stderr.write(`visual-proof ${args.command}: internal error: ${firstLine(err)}\n`);
     return EXIT.INTERNAL;

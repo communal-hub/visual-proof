@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runDoctor, type DoctorReport } from '../../src/doctor.js';
+import { normalizeDoctorReport } from '../../src/normalize.js';
 import { REPO_ROOT, createHarness, type Harness } from './harness.js';
 
 const GOLDEN = path.join(REPO_ROOT, 'test/golden/doctor-fixture.json');
@@ -22,22 +23,7 @@ afterAll(async () => {
   await h?.cleanup();
 });
 
-/**
- * Strip everything that varies between runs and machines: timestamp, temp paths, ports, hashes,
- * timings, and the Chromium version. What is left is the resolved tiers and details.
- */
-function normalize(report: DoctorReport): unknown {
-  const tmpRoot = path.dirname(h.dir);
-  const text = JSON.stringify({ ...report, at: '<timestamp>' }, null, 2)
-    .split(tmpRoot)
-    .join('<tmp>')
-    .split(`:${h.port}`)
-    .join(':<port>')
-    .replace(/\b[0-9a-f]{7,40}\b/g, '<hash>')
-    .replace(/\d+ ms\b/g, '<n> ms')
-    .replace(/Chromium \d+(\.\d+)+/g, 'Chromium <version>');
-  return JSON.parse(text);
-}
+const normalize = (report: DoctorReport) => normalizeDoctorReport(report, { roots: [{ path: h.dir, label: '<repo>' }] });
 
 describe('doctor against the vite-vue fixture', () => {
   it('all green with the dev server up: browser launches, barrier is vite-hmr, login works', () => {
@@ -53,6 +39,7 @@ describe('doctor against the vite-vue fixture', () => {
       freshness: { tier: 'marker', status: 'ok' },
       login: { tier: 'http-hook', status: 'ok' },
       routes: { tier: 'import-graph', status: 'ok' },
+      paramTiers: { tier: 'none', status: 'ok', detail: '1 route(s) with params: config 1, seed-file 0, list-endpoint 0, uncovered 0' },
     });
     expect(greenOnDisk).toEqual(green);
   });
@@ -63,12 +50,20 @@ describe('doctor against the vite-vue fixture', () => {
     expect(actual).toBe(fs.readFileSync(GOLDEN, 'utf8'));
   });
 
+  it('doctor --json --normalize prints the checked-in golden byte for byte, whatever the port, temp dir and timings', async () => {
+    const cli = await h.cli('doctor', '--json', '--normalize');
+    expect(cli.code).toBe(0);
+    expect(cli.stdout).toBe(fs.readFileSync(GOLDEN, 'utf8'));
+    expect(cli.stdout).not.toContain(String(h.port));
+    expect(cli.stdout).not.toContain(h.dir);
+  });
+
   it('the CLI prints a table and exits 0', async () => {
     const cli = await h.cli('doctor');
     expect(cli.code).toBe(0);
     expect(cli.stderr).toBe('');
     const lines = cli.stdout.trimEnd().split('\n');
-    expect(lines).toHaveLength(12);
+    expect(lines).toHaveLength(13);
     expect(lines.at(-1)).toBe(`details: ${path.join(h.dirs.statusDir, 'doctor.json')}`);
     expect(cli.stdout).toMatch(/^barrier\s+vite-hmr\s+ok\s/m);
     expect(cli.stdout).toMatch(/^login\s+http-hook\s+ok\s/m);

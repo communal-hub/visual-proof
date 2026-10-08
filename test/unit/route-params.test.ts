@@ -24,7 +24,7 @@ const seed = (content: unknown): void =>
 describe('loadRouteParams', () => {
   it('returns the config routeParams untouched when no file is configured', () => {
     const result = loadRouteParams(config({ routeParams: { '/a/:id': '/a/1' }, routeParamsFile: undefined }));
-    expect(result).toEqual({ params: { '/a/:id': '/a/1' }, missing: false, fileEntries: 0, warnings: [] });
+    expect(result).toEqual({ params: { '/a/:id': '/a/1' }, fileKeys: [], missing: false, fileEntries: 0, warnings: [] });
   });
 
   it('reads the { routes: {...} } shape', () => {

@@ -65,6 +65,8 @@ export interface Harness {
 }
 
 export interface HarnessOptions {
+  /** Fixture config file to start from (default `visual-proof.config.json`), e.g. `visual-proof.param-sources.config.json`. */
+  configFile?: string;
   /** Fixture config keys to override before the real port is applied. */
   config?: Record<string, unknown>;
   /** Give the dev server its own empty dependency cache, so its first page load really is a cold start. */
@@ -104,7 +106,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     vite = await startVite(dir, port, options.freshViteCache ? path.join(root, 'vite-cache') : undefined);
 
     const appUrl = `http://localhost:${port}`;
-    const fixtureConfig = JSON.parse(fs.readFileSync(path.join(FIXTURE_DIR, 'visual-proof.config.json'), 'utf8')) as Record<string, unknown>;
+    const fixtureConfig = JSON.parse(fs.readFileSync(path.join(FIXTURE_DIR, options.configFile ?? 'visual-proof.config.json'), 'utf8')) as Record<string, unknown>;
     const configPath = path.join(dir, 'visual-proof.config.json');
     fs.writeFileSync(
       configPath,

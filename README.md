@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core) plus the v0.3 capture-quality work. Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work and the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle). Vite apps only; Chromium only.
 
 ## Install
 
@@ -57,6 +57,7 @@ Only `appUrl` is required.
 | `staticRoutes` | `{}` | file to routes, for screens the graph cannot reach |
 | `routeParams` | `{}` | concrete URL for a parametrised route |
 | `routeParamsFile` | none | JSON file of route params the app writes at runtime (e.g. a seeder), relative to the config dir; see below |
+| `paramSources` | `{}` | route key to `{ url, pick }`: fill a route's params from a list endpoint when nothing above has them; see below |
 | `screenGlobs` | `src/**/*.vue` | files whose changes trigger a capture |
 | `ignoreScreenGlobs` | `[]` | files that match `screenGlobs` but are not screens |
 | `backendGlobs` | `[]` | backend files; a change re-captures routes already captured this session (as does a screen file with no route) |
@@ -70,6 +71,11 @@ Only `appUrl` is required.
 | `hideSelectors` | see below | extra selectors hidden (`visibility: hidden`) in stills; added to the defaults |
 | `hideSelectorsReplace` | `false` | `true`: `hideSelectors` replaces the defaults instead of extending them |
 | `renderCheck` | `"fail"` | `fail`, `warn` or `off`: whether a changed `.vue` file must have rendered; see below |
+| `settle` | `{ "networkIdleMs": 250, "maxWaitMs": 5000 }` | when a page counts as loaded: no request in flight for `networkIdleMs`, waiting at most `maxWaitMs`; see "Settle and latency" |
+| `fixedTime` | none (time is not frozen) | ISO timestamp the page clock is frozen at; see "Flake controls" |
+| `maskSelectors` | `[]` | Playwright selectors covered by a solid box in stills |
+| `blockHosts` | analytics and trackers, see below | hostname globs whose requests are aborted before navigation (replaces the default list; `[]` blocks nothing) |
+| `allowHosts` | `[]` | hostname globs exempt from `blockHosts` |
 | `maxFrames` | `200` | oldest frames are evicted beyond this |
 | `finishBudgetMs` | `25000` | how long `finish` waits for in-flight captures |
 | `baseRef` | `main` | branch that `finish` diffs against |
@@ -97,6 +103,41 @@ When the ids of a parametrised route only exist after the app seeds its data, po
 - Values must be strings starting with `/`; others are ignored with a warning.
 - `doctor` reports the `params` capability as `seed-file`, `config`, or `none`. It is
   never required.
+
+### Route params from list endpoints
+
+Third tier, after `routeParams` and `routeParamsFile`: for a parametrised route that neither of them
+fills, the watcher asks the app for a real id.
+
+```json
+{
+  "paramSources": {
+    "/manage/invoices/:id": { "url": "/api/invoices", "pick": "data.0.id" },
+    "/accounts/:id/:tab": { "url": "/api/accounts", "pick": { "id": "0.uuid", "tab": "'invoices'" } }
+  }
+}
+```
+
+- `url` is an app-relative API path (starts with `/`), fetched with the watcher's logged-in browser
+  context: the same cookies and `ignoreHTTPSErrors` as captures, re-logging in once on a 401/403.
+- `pick` is a dot path into the JSON: object keys and array indexes (`data.0.id`, `0.uuid`). A quoted
+  value (`'invoices'`, `"invoices"`) is a literal. A route with one param takes a string; any route
+  may take an object of param name to pick, and a route with several params must (all of them, no
+  extras). The picked value must be a non-empty string or a finite number, and is URL-encoded into the path.
+- Resolved lazily, when a route needs params and `routeParams` / the seed file have none (the
+  warm-up does the same for explicit `warmupRoutes` entries). A successful lookup is cached for the
+  session; a backend-triggered recapture drops the cache, so a re-seeded database gives the new id.
+  A failed lookup is not cached: the next batch tries again.
+- A failure (connection error, non-2xx status, body that is not JSON, path that is missing, value
+  that is not a string or number) skips that route. The reason is logged as
+  `warning: paramSources /api/invoices failed: HTTP 500 (route /manage/invoices/:id)` and kept in
+  `status.json` under `paramSources`. If the route then has no frame at HEAD, `finish` fails with the
+  usual `cannot capture <route key>: ... (add routeParams)` line carrying that reason; with a frame
+  at HEAD it proves that frame, whichever id it used.
+- `doctor` has a `paramTiers` row (never required): how many routes with params each tier covers
+  (`config`, `seed-file`, `list-endpoint`, `uncovered`), and one bounded probe of each source, as the
+  logged-in user, when the app answers (`probe /api/invoices -> /manage/invoices/1`). With the app
+  down it says the sources were not probed.
 
 ## Capture quality
 
@@ -156,6 +197,63 @@ A file that rendered on some routes but not others gets a note. Frames with `ren
 into a note, `"off"` disables the check and the capture-time walk. `doctor` reports the mode as
 the `renderCheck` capability.
 
+## Flake controls
+
+Everything here is opt-in or conservative by default, because each one changes what the still shows.
+
+**Fixed clock.** `fixedTime` (ISO, e.g. `"2026-01-15T09:00:00Z"`) freezes `Date.now()` and `new Date()` in
+every page, from before the first script runs, with Playwright's `clock.setFixedTime`; timers and
+animation frames keep running. It is off by default: relative dates ("3 days ago") are part of what
+you may want to see. A Playwright without the clock API (older than 1.45, below this package's
+peer floor) logs `fixedTime ignored` once and carries on.
+
+**Masks.** `maskSelectors` are Playwright selectors (CSS, `text=...`, ...); each match is covered by a
+solid magenta box in the still. The element keeps taking part in the layout, so nothing moves. A
+selector that matches nothing is ignored; one Playwright cannot parse is logged once and skipped.
+
+**Third-party blocking.** Requests to blocked hosts are aborted before the page navigates, so late
+trackers cannot change a still or add noise. Chromium's resulting `net::ERR_FAILED` "Failed to load
+resource" line is not counted as a console error. (A script that depends on the blocked one can
+still throw its own error, which does count.) The default `blockHosts` is analytics and trackers only:
+
+```
+*.google-analytics.com  *.googletagmanager.com  *.posthog.com  *.segment.io
+*.hotjar.com            *.intercom.io           *.sentry.io
+```
+
+Stripe, maps, fonts and CDNs are deliberately not blocked: they shape the layout. Globs match the
+hostname: `*` is any run of characters, and `*.example.com` also matches `example.com`. The app's own
+hosts (`appUrl`, `viteUrl`) are never blocked. To block more, list the defaults you want plus the new
+hosts (a configured `blockHosts` replaces the defaults):
+
+```json
+{
+  "blockHosts": ["*.google-analytics.com", "*.googletagmanager.com", "*.sentry.io", "js.stripe.com", "maps.googleapis.com"],
+  "allowHosts": ["browser.sentry.io"]
+}
+```
+
+`allowHosts` carves exceptions out of the list; `"blockHosts": ["*"]` with an `allowHosts` list blocks
+everything but the app and the listed hosts; `"blockHosts": []` blocks nothing.
+
+## Settle and latency
+
+A page counts as loaded when `load` has fired, no request has been in flight for `settle.networkIdleMs`
+(default 250), fonts are ready and two frames have painted. `settle.maxWaitMs` (default 5000) caps the
+wait for a page that never goes quiet (long polling, event streams). The same window is used again
+after the page was grown for a full-page still, capped at 1.5 s.
+
+The window dominates the save-to-still time. Measured on the fixture (`test/integration/settle-bench.test.ts`,
+5 warm samples each, median save-to-still): 500 ms, 955 ms; 250 ms, 708 ms; 150 ms, 598 ms, with no
+non-clean capture at any of them. The default is 250. An app that chains requests with a gap longer
+than that (a debounced search, a fetch started from a timer) can settle too early: raise
+`networkIdleMs` for it. A page caught mid-load shows a spinner or a blank root and fails `finish` as
+`loading` or `blank`; content that is simply not there yet cannot be told apart, so prefer the longer
+window when in doubt.
+
+Every frame record carries `timing: { settleMs, screenshotMs }` (see the brief) to show where a slow
+capture spent its time.
+
 Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `VISUAL_PROOF_SCRATCH_DIR`,
 `VISUAL_PROOF_APP_URL`, `VISUAL_PROOF_VITE_URL`.
@@ -163,7 +261,7 @@ Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 ## Commands
 
 ```sh
-npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes
+npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes, param tiers
 npx visual-proof start      # start the watcher (reattaches if running); prints status JSON
 npx visual-proof status     # status JSON; a dead watcher is reported as stale
 npx visual-proof status --wait [--timeout <s>]   # block until ready (alias: npx visual-proof ready)
@@ -172,9 +270,16 @@ npx visual-proof stop
 npx visual-proof watch      # run the watcher in the foreground
 ```
 
-Options: `--config <path>`, `--json` (finish, doctor), `--hook` (finish: quiet,
+Options: `--config <path>`, `--json` (finish, doctor), `--normalize` (doctor --json), `--hook` (finish: quiet,
 time-capped, always exits 0), `--wait` and `--timeout <s>` (status). Run
 `npx visual-proof --help` for details.
+
+`doctor --json --normalize` prints the report with everything that varies between runs and machines
+replaced: `at` becomes `<timestamp>`; the repo, status, scratch and artifact dirs, the temp dir and the home
+dir become `<repo>`, `<status-dir>`, `<scratch-dir>`, `<artifact-dir>`, `<tmp>`, `<home>`; ports after a host
+become `<port>`; 7 to 40 hex digits become `<hash>`; `123 ms` becomes `<n> ms`; `Chromium 130.0.1`
+becomes `Chromium <version>`. Check the output into your repo as a golden file and diff it in CI. (The
+`doctor.json` on disk keeps the real values.)
 
 `start` returns once the watcher is `ready`, or after 15 s if it is still warming up (status
 `starting`, `warmup.state: "running"`). To block until the first capture can be trusted, run
@@ -212,7 +317,7 @@ In the status dir:
 - `watcher.log` (one line per event)
 - `doctor.json` (last doctor report)
 - `proof-block.md` (written by `finish` on every outcome)
-- `scratch/index.jsonl` and `scratch/frames/<id>.png`
+- `scratch/index.jsonl` (one frame record per line, with `timing`) and `scratch/frames/<id>.png`
 
 Headline stills are copied to the artifact dir as `<route-slug>-<shortTree>.png`.
 

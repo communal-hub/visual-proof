@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { chromium, type Browser as PwBrowser, type BrowserContext, type Page } from 'playwright';
+import { chromium, type Browser as PwBrowser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import type { Config } from './config.js';
+import { hostBlocker } from './hosts.js';
 import { normalizeRenderedFiles, renderedFilesScript } from './rendered.js';
 import type { TriageSignals } from './triage.js';
 
@@ -25,6 +26,16 @@ export interface CaptureLayout {
   capped: boolean;
   /** Elements matched by the hide selectors (all set to `visibility: hidden`). */
   hidden: number;
+  /** Elements covered by a `maskSelectors` box in the still. */
+  masked: number;
+}
+
+/** Where a capture spent its time (ms), for tuning `settle`. */
+export interface CaptureTiming {
+  /** From `load` until the page counted as settled: network idle, fonts, two frames, reading the DOM (and any re-settle after a self-navigation). */
+  settleMs: number;
+  /** From the settled page to the PNG: rendered-component walk, preparing the page, the screenshot call. */
+  screenshotMs: number;
 }
 
 export interface CaptureResult {
@@ -36,6 +47,8 @@ export interface CaptureResult {
   layout?: CaptureLayout;
   /** Component files mounted in the page (see {@link Frame.renderedFiles}); absent from fakes. */
   renderedFiles?: string[] | null;
+  /** Absent from fakes. */
+  timing?: CaptureTiming;
 }
 
 /** Outcome of {@link Capturer.prime}. */
@@ -48,6 +61,14 @@ export interface PrimeResult {
   httpStatus: number | null;
 }
 
+/** What fetching an app-relative JSON path produced. `error` is set for a transport failure, a non-2xx status or a non-JSON body. */
+export interface JsonResponse {
+  /** HTTP status, or 0 when no response arrived. */
+  status: number;
+  json?: unknown;
+  error?: string;
+}
+
 /** What `watch` needs from a browser; lets tests inject a fake. */
 export interface Capturer {
   /** Best-effort early login so the first capture is not slower than the rest. */
@@ -58,6 +79,11 @@ export interface Capturer {
    * a screenshot, repeating once when Vite reloaded the page. Optional: capturers without it are not warmed up.
    */
   prime?(url: string): Promise<PrimeResult>;
+  /**
+   * GET an app-relative path with the logged-in context (same cookies as captures) and decode the JSON body.
+   * Optional: capturers without it cannot resolve `paramSources`.
+   */
+  getJson?(urlPath: string): Promise<JsonResponse>;
   close(): Promise<void>;
 }
 
@@ -72,6 +98,7 @@ export type BrowserConfig = Pick<
   Config,
   | 'repoDir'
   | 'appUrl'
+  | 'viteUrl'
   | 'ignoreHTTPSErrors'
   | 'viewport'
   | 'login'
@@ -81,14 +108,17 @@ export type BrowserConfig = Pick<
   | 'maxCaptureHeight'
   | 'hideSelectors'
   | 'renderCheck'
+  | 'fixedTime'
+  | 'maskSelectors'
+  | 'blockHosts'
+  | 'allowHosts'
+  | 'settle'
 >;
 
 export interface BrowserOptions {
   log?: (message: string) => void;
   /** Navigation timeout. Default 30 s. */
   navigationTimeoutMs?: number;
-  /** Cap on waiting for the network to go quiet. Default 5 s. */
-  networkIdleCapMs?: number;
   /** After a login failure, skip new login attempts for this long and reuse the failure. Default 30 s. */
   loginBackoffMs?: number;
   /** Clock for the login back-off; tests inject a fake. */
@@ -120,11 +150,22 @@ export class Browser implements Capturer {
   /** The last login failure and when it happened; reused (not retried) until the back-off passes. */
   private loginFailure: { error: LoginError; at: number } | null = null;
   private readonly pages = new Set<Page>();
+  /** True for request URLs the configured `blockHosts` / `allowHosts` abort. */
+  private readonly isBlocked: (url: string) => boolean;
+  private blockedCount = 0;
+  /** Mask selectors already reported as invalid, so the log says it once. */
+  private readonly badMasks = new Set<string>();
 
   constructor(
     private readonly config: BrowserConfig,
     private readonly options: BrowserOptions = {},
-  ) {}
+  ) {
+    this.isBlocked = hostBlocker({
+      blockHosts: config.blockHosts,
+      allowHosts: config.allowHosts,
+      ownUrls: [config.appUrl, config.viteUrl],
+    });
+  }
 
   static async launch(config: BrowserConfig, options: BrowserOptions = {}): Promise<Browser> {
     const browser = new Browser(config, options);
@@ -174,9 +215,43 @@ export class Browser implements Capturer {
       attempt = await this.captureOnce(context, url);
     }
 
-    const { png, signals, finalUrl, layout, renderedFiles } = attempt;
+    const { png, signals, finalUrl, layout, renderedFiles, timing } = attempt;
     if (authFailure) signals.authFailure = authFailure;
-    return { png, signals, finalUrl, ...(layout ? { layout } : {}), renderedFiles };
+    return { png, signals, finalUrl, ...(layout ? { layout } : {}), renderedFiles, timing };
+  }
+
+  async getJson(urlPath: string): Promise<JsonResponse> {
+    const context = await this.ensureContext();
+    try {
+      await this.ensureLoggedIn();
+    } catch (err) {
+      // Carry on: an open endpoint still works, and a closed one answers 401/403 below with the real reason.
+      this.log(`getJson ${urlPath}: ${(err as Error).message}`);
+    }
+    const target = new URL(urlPath, this.config.appUrl.endsWith('/') ? this.config.appUrl : `${this.config.appUrl}/`).href;
+    const get = () => context.request.get(target, { failOnStatusCode: false, timeout: 15_000, headers: { accept: 'application/json' } });
+    try {
+      let response = await get();
+      if ((response.status() === 401 || response.status() === 403) && this.config.login.type === 'http-hook') {
+        this.log(`getJson ${urlPath}: HTTP ${response.status()}; logging in again`);
+        this.loggedIn = false;
+        try {
+          await this.ensureLoggedIn();
+          response = await get();
+        } catch (err) {
+          return { status: response.status(), error: `HTTP ${response.status()} (${(err as Error).message})` };
+        }
+      }
+      const status = response.status();
+      if (status < 200 || status >= 300) return { status, error: `HTTP ${status}` };
+      try {
+        return { status, json: await response.json() };
+      } catch {
+        return { status, error: 'response is not JSON' };
+      }
+    } catch (err) {
+      return { status: 0, error: (err as Error).message.split('\n')[0] ?? 'request failed' };
+    }
   }
 
   async close(): Promise<void> {
@@ -206,7 +281,39 @@ export class Browser implements Capturer {
     });
     this.loggedIn = false;
     this.loginFailure = null;
+    try {
+      await this.installRoutes(this.context);
+      await this.installClock(this.context);
+    } catch (err) {
+      await this.close();
+      throw err;
+    }
     return this.context;
+  }
+
+  /** Abort requests to blocked hosts before any page navigates. */
+  private async installRoutes(context: BrowserContext): Promise<void> {
+    if (this.config.blockHosts.length === 0) return;
+    await context.route(
+      (url) => this.isBlocked(url.href),
+      (route) => {
+        this.blockedCount++;
+        return route.abort().catch(() => {});
+      },
+    );
+  }
+
+  /** Freeze `Date` at `fixedTime` for every page of the context (timers keep running). */
+  private async installClock(context: BrowserContext): Promise<void> {
+    const { fixedTime } = this.config;
+    if (!fixedTime) return;
+    const clock = (context as unknown as { clock?: { setFixedTime?: (time: Date) => Promise<void> } }).clock;
+    if (typeof clock?.setFixedTime !== 'function') {
+      this.log('fixedTime ignored: this Playwright version has no clock API (needs >= 1.45)');
+      return;
+    }
+    await clock.setFixedTime(new Date(fixedTime));
+    this.log(`clock fixed at ${fixedTime}`);
   }
 
   // ---- login ---------------------------------------------------------------
@@ -278,10 +385,14 @@ export class Browser implements Capturer {
   private async loadPage(context: BrowserContext, url: string): Promise<Loaded> {
     const page = await context.newPage();
     this.pages.add(page);
+    const network = new NetworkIdle(page);
     const consoleErrors: string[] = [];
     const pageErrors: string[] = [];
     page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
+      if (msg.type() !== 'error') return;
+      // Chromium reports a request we aborted ourselves as a failed resource load; that is not the app's error.
+      if (/net::ERR_(FAILED|BLOCKED_BY_CLIENT)/.test(msg.text()) && this.isBlocked(msg.location().url)) return;
+      consoleErrors.push(msg.text());
     });
     page.on('pageerror', (err) => pageErrors.push(err.message || String(err)));
     let navigations = 0;
@@ -304,15 +415,14 @@ export class Browser implements Capturer {
       }
 
       let dom = emptyDom();
+      const settleStart = Date.now();
       if (navOk) {
         // The page can navigate again on its own after `load` (Vite reloads when it re-optimizes
         // dependencies; apps redirect after a guard). Re-settle whenever that happens mid-stabilisation.
         for (let attempt = 0; attempt < 4; attempt++) {
           const seen = navigations;
-          // Playwright's "networkidle" is a 500 ms quiet window; cap how long we are willing to wait for it.
-          await page
-            .waitForLoadState('networkidle', { timeout: this.options.networkIdleCapMs ?? 5000 })
-            .catch(() => {});
+          // No request in flight for `settle.networkIdleMs`, but give up after `settle.maxWaitMs`.
+          await network.wait(this.config.settle.networkIdleMs, this.config.settle.maxWaitMs);
           const settled = await settle(page);
           const read = settled
             ? await readDom(page, this.config.appRoot, this.config.spinnerSelectors, (m) =>
@@ -336,6 +446,8 @@ export class Browser implements Capturer {
         pageErrors,
         // The initial navigation is the first one; anything after it is the page moving on its own.
         extraNavigations: Math.max(0, navigations - 1),
+        network,
+        settleMs: Date.now() - settleStart,
       };
     } catch (err) {
       this.pages.delete(page);
@@ -347,6 +459,7 @@ export class Browser implements Capturer {
   private async captureOnce(context: BrowserContext, url: string): Promise<CaptureResult & { httpStatus: number | null }> {
     const loaded = await this.loadPage(context, url);
     const { page, navOk, httpStatus, dom, consoleErrors, pageErrors } = loaded;
+    const screenshotStart = Date.now();
     try {
       let layout: CaptureLayout | undefined;
       let renderedFiles: string[] | null = null;
@@ -357,7 +470,7 @@ export class Browser implements Capturer {
       }
       if (navOk) {
         try {
-          layout = await this.preparePage(page, url);
+          layout = await this.preparePage(page, url, loaded.network);
         } catch (err) {
           this.log(`capture ${url}: preparing the page for the screenshot failed: ${(err as Error).message.split('\n')[0]}`);
         }
@@ -366,9 +479,12 @@ export class Browser implements Capturer {
 
       let screenshotError: string | undefined;
       const { width } = this.config.viewport;
+      const masks = await this.maskLocators(page, url);
+      if (layout) layout.masked = masks.count;
       const png = await page
         .screenshot({
           fullPage: true,
+          ...(masks.locators.length > 0 ? { mask: masks.locators } : {}),
           // Keep the viewport width and cut the height at the cap, whatever overflows horizontally or below.
           ...(layout ? { clip: { x: 0, y: 0, width, height: layout.height } } : {}),
           type: 'png',
@@ -387,6 +503,7 @@ export class Browser implements Capturer {
         httpStatus,
         ...(layout ? { layout } : {}),
         renderedFiles,
+        timing: { settleMs: loaded.settleMs, screenshotMs: Date.now() - screenshotStart },
         signals: { navOk, httpStatus, consoleErrors, pageErrors, ...dom, ...(screenshotError ? { screenshotError } : {}) },
       };
     } finally {
@@ -426,7 +543,7 @@ export class Browser implements Capturer {
    * document so a full-page screenshot sees all of its content, and work out how tall the still will be.
    * The page is closed after the capture, so nothing is undone.
    */
-  private async preparePage(page: Page, url: string): Promise<CaptureLayout> {
+  private async preparePage(page: Page, url: string, network: NetworkIdle): Promise<CaptureLayout> {
     const { hideSelectors, scrollContainer, maxCaptureHeight } = this.config;
     const prepared = (await page.evaluate(prepareScript(hideSelectors, scrollContainer ?? null))) as Prepared;
     if (scrollContainer && prepared.containerMissing) {
@@ -435,7 +552,7 @@ export class Browser implements Capturer {
     let fullHeight = prepared.fullHeight;
     if (prepared.grew || prepared.lazyImages > 0) {
       // More of the page is on screen now: lazy images start loading, virtual lists render more rows.
-      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
+      await network.wait(this.config.settle.networkIdleMs, Math.min(this.config.settle.maxWaitMs, 1500));
       await settle(page);
       fullHeight = await page.evaluate(MEASURE_SCRIPT).then(Number, () => fullHeight);
     }
@@ -445,7 +562,31 @@ export class Browser implements Capturer {
       this.log(`capture ${url}: expanded scroll container ${prepared.container} to ${fullHeight}px`);
     }
     if (capped) this.log(`capture ${url}: page is ${fullHeight}px tall; cut off at maxCaptureHeight ${maxCaptureHeight}px`);
-    return { scrollContainer: prepared.grew ? prepared.container : null, fullHeight, height, capped, hidden: prepared.hidden };
+    return { scrollContainer: prepared.grew ? prepared.container : null, fullHeight, height, capped, hidden: prepared.hidden, masked: 0 };
+  }
+
+  /**
+   * Locators for `maskSelectors` that match at least one element. A selector Playwright cannot parse is logged
+   * once and skipped, so a typo costs the mask, not the capture.
+   */
+  private async maskLocators(page: Page, url: string): Promise<{ locators: Locator[]; count: number }> {
+    const locators: Locator[] = [];
+    let count = 0;
+    for (const selector of this.config.maskSelectors) {
+      if (this.badMasks.has(selector)) continue;
+      const locator = page.locator(selector);
+      try {
+        const n = await locator.count();
+        if (n > 0) {
+          locators.push(locator);
+          count += n;
+        }
+      } catch (err) {
+        this.badMasks.add(selector);
+        this.log(`capture ${url}: maskSelectors entry ${JSON.stringify(selector)} is not a valid selector (${(err as Error).message.split('\n')[0]}); ignored`);
+      }
+    }
+    return { locators, count };
   }
 
   private log(message: string): void {
@@ -554,7 +695,52 @@ interface Loaded {
   pageErrors: string[];
   /** Main-frame navigations after the first (Vite reloads, client-side redirects do not count). */
   extraNavigations: number;
+  network: NetworkIdle;
+  settleMs: number;
 }
+
+/**
+ * In-flight request tracking for one page, started before it navigates. Playwright's own `networkidle` is a fixed
+ * 500 ms quiet window; this one takes the window as a parameter.
+ */
+class NetworkIdle {
+  private readonly inflight = new Set<Request>();
+  private lastActivity = Date.now();
+
+  constructor(page: Page) {
+    const touch = (): void => {
+      this.lastActivity = Date.now();
+    };
+    page.on('request', (request) => {
+      this.inflight.add(request);
+      touch();
+    });
+    const done = (request: Request): void => {
+      this.inflight.delete(request);
+      touch();
+    };
+    page.on('requestfinished', done);
+    page.on('requestfailed', done);
+  }
+
+  /** Resolves true once nothing has been in flight for `idleMs`, false when `maxMs` ran out first. */
+  async wait(idleMs: number, maxMs: number): Promise<boolean> {
+    const deadline = Date.now() + maxMs;
+    for (;;) {
+      const now = Date.now();
+      if (now >= deadline) return false;
+      let pause = IDLE_POLL_MS;
+      if (this.inflight.size === 0) {
+        const quiet = now - this.lastActivity;
+        if (quiet >= idleMs) return true;
+        pause = idleMs - quiet;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pause, deadline - now)));
+    }
+  }
+}
+
+const IDLE_POLL_MS = 10;
 
 interface Prepared {
   hidden: number;

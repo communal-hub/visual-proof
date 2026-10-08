@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, parseConfig, type Config } from '../../src/config.js';
-import { doctorCommand, formatReport, runDoctor, type DoctorOptions, type Probes } from '../../src/doctor.js';
+import { doctorCommand, formatReport, runDoctor, type DoctorOptions, type DoctorReport, type Probes } from '../../src/doctor.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
 import { commitAll, initRepo, tmpDir, write } from './helpers.js';
@@ -30,6 +30,7 @@ const greenProbes = (): Probes => ({
   connectHmr: async () => true,
   login: async () => ({ status: 204 }),
   buildGraph: async () => graph(3, 5, 1),
+  getJson: async (_config, paths) => paths.map(() => ({ status: 200, json: [] })),
 });
 
 function configure(extra: Record<string, unknown> = {}): Config {
@@ -69,7 +70,7 @@ describe('runDoctor', () => {
   it('reports every capability, writes doctor.json, and is ok when all probes pass', async () => {
     const report = await doctor(configure());
     expect(report.ok).toBe(true);
-    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'renderCheck']);
+    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'paramTiers', 'renderCheck']);
     expect(report.capabilities).toMatchObject({
       config: { tier: 'valid', status: 'ok' },
       git: { tier: 'repo', status: 'ok' },
@@ -314,11 +315,145 @@ describe('real probes against a down app', () => {
   });
 });
 
+describe('paramTiers', () => {
+  const keys = ['/a/:id', '/b/:id', '/c/:id', '/d/:id', '/plain'];
+  const withKeys = (): Probes['buildGraph'] => async () => ({
+    ...graph(0),
+    routes: keys.map((path) => ({ path, routeFile: 'src/router.js', component: null, layouts: [], dynamic: false })),
+  });
+  const seedFile = '.visual-proof/params.json';
+
+  it('counts the routes with params each tier covers: config, seed-file, list-endpoint, uncovered', async () => {
+    write(repo, seedFile, JSON.stringify({ '/b/:id': '/b/9' }));
+    const report = await doctor(
+      configure({
+        routeParams: { '/a/:id': '/a/1', '/b/:id': '/b/1' },
+        routeParamsFile: seedFile,
+        paramSources: { '/c/:id': { url: '/api/c', pick: '0.id' } },
+      }),
+      { probes: { buildGraph: withKeys(), getJson: async () => [{ status: 200, json: [{ id: 5 }] }] } },
+    );
+    expect(report.capabilities.paramTiers).toMatchObject({ tier: 'list-endpoint', status: 'warn', required: false });
+    expect(report.capabilities.paramTiers.detail).toContain('4 route(s) with params: config 1, seed-file 1, list-endpoint 1, uncovered 1');
+    expect(report.capabilities.paramTiers.detail).toContain('uncovered: /d/:id');
+    expect(report.capabilities.paramTiers.detail).toContain('probe /api/c -> /c/5');
+    expect(report.ok).toBe(true);
+  });
+
+  it('is ok and tier none when every param route is covered and no source is configured, without probing', async () => {
+    let probed = false;
+    const report = await doctor(
+      configure({ routeParams: { '/a/:id': '/a/1', '/b/:id': '/b/1', '/c/:id': '/c/1', '/d/:id': '/d/1' } }),
+      {
+        probes: {
+          buildGraph: withKeys(),
+          getJson: async () => {
+            probed = true;
+            return [];
+          },
+        },
+      },
+    );
+    expect(report.capabilities.paramTiers).toMatchObject({ tier: 'none', status: 'ok' });
+    expect(report.capabilities.paramTiers.detail).toBe('4 route(s) with params: config 4, seed-file 0, list-endpoint 0, uncovered 0');
+    expect(probed).toBe(false);
+  });
+
+  it('probes every source once, in one call, with the source urls', async () => {
+    const calls: string[][] = [];
+    await doctor(
+      configure({
+        paramSources: {
+          '/a/:id': { url: '/api/a', pick: '0.id' },
+          '/b/:id': { url: '/api/b', pick: 'data.0.id' },
+        },
+      }),
+      {
+        probes: {
+          buildGraph: withKeys(),
+          getJson: async (_config, paths) => {
+            calls.push(paths);
+            return [{ status: 200, json: [{ id: 1 }] }, { status: 200, json: { data: [{ id: 2 }] } }];
+          },
+        },
+      },
+    );
+    expect(calls).toEqual([['/api/a', '/api/b']]);
+  });
+
+  it('warns with the reason when a source answers with an error or the wrong shape', async () => {
+    const report = await doctor(
+      configure({
+        paramSources: {
+          '/a/:id': { url: '/api/a', pick: '0.id' },
+          '/b/:id': { url: '/api/b', pick: '0.id' },
+          '/c/:id': { url: '/api/c', pick: '0.id' },
+        },
+      }),
+      {
+        probes: {
+          buildGraph: withKeys(),
+          getJson: async () => [{ status: 500, error: 'HTTP 500' }, { status: 200, json: [] }, { status: 200, json: [{ id: 3 }] }],
+        },
+      },
+    );
+    const { status, detail } = report.capabilities.paramTiers;
+    expect(status).toBe('warn');
+    expect(detail).toContain('probe /api/a for /a/:id failed: HTTP 500');
+    expect(detail).toMatch(/probe \/api\/b for \/b\/:id: the response has no index 0|probe \/api\/b for \/b\/:id: the response has 0 item/);
+    expect(detail).toContain('probe /api/c -> /c/3');
+    expect(report.ok).toBe(true);
+  });
+
+  it('says the sources were not probed when the app does not answer', async () => {
+    const report = await doctor(configure({ paramSources: { '/a/:id': { url: '/api/a', pick: '0.id' } } }), {
+      probes: { buildGraph: withKeys(), getJson: async () => [{ status: 0, error: 'connect ECONNREFUSED' }] },
+    });
+    expect(report.capabilities.paramTiers.status).toBe('warn');
+    expect(report.capabilities.paramTiers.detail).toContain('paramSources not probed: app not reachable at http://localhost:1 (connect ECONNREFUSED)');
+  });
+
+  it('survives a probe that throws or never answers within the bound', async () => {
+    const thrown = await doctor(configure({ paramSources: { '/a/:id': { url: '/api/a', pick: '0.id' } } }), {
+      probes: { buildGraph: withKeys(), getJson: async () => Promise.reject(new Error('boom')) },
+    });
+    expect(thrown.capabilities.paramTiers.detail).toContain('paramSources not probed: boom');
+
+    const t0 = Date.now();
+    const hung = await doctor(configure({ paramSources: { '/a/:id': { url: '/api/a', pick: '0.id' } } }), {
+      timeouts: { paramsMs: 200 },
+      probes: { buildGraph: withKeys(), getJson: () => new Promise(() => {}) },
+    });
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(hung.capabilities.paramTiers.detail).toMatch(/not probed: paramSources probe timed out/);
+  });
+
+  it('flags a paramSources key that matches no route', async () => {
+    const report = await doctor(configure({ paramSources: { '/zzz/:id': { url: '/api/z', pick: '0.id' } } }), {
+      probes: { buildGraph: withKeys(), getJson: async () => [{ status: 200, json: [{ id: 1 }] }] },
+    });
+    expect(report.capabilities.paramTiers.detail).toContain('paramSources for no known route: /zzz/:id');
+  });
+
+  it('builds the import graph once for the routes and param tiers checks', async () => {
+    let builds = 0;
+    await doctor(configure(), {
+      probes: {
+        buildGraph: async () => {
+          builds++;
+          return graph(2);
+        },
+      },
+    });
+    expect(builds).toBe(1);
+  });
+});
+
 describe('formatReport and doctorCommand', () => {
   it('prints one aligned row per capability', async () => {
     const text = formatReport(await doctor(configure({ screenGlobs: ['nothing/**'] })));
     const lines = text.trimEnd().split('\n');
-    expect(lines).toHaveLength(11);
+    expect(lines).toHaveLength(12);
     expect(lines[0]).toMatch(/^capability\s+tier\s+status\s+detail$/);
     expect(lines.find((l) => l.startsWith('trigger'))).toMatch(/^trigger\s+fs-watch\s+MISSING\s+no files match/);
     // Columns line up: every row's tier column starts at the same offset.
@@ -349,6 +484,31 @@ describe('formatReport and doctorCommand', () => {
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('timeout-only');
     expect(r.stderr).toBe('');
+  });
+
+  it('--json --normalize prints the report without timestamps, ports, hashes, timings or absolute paths', async () => {
+    const file = writeConfig({ appUrl: 'http://localhost:4567', viteUrl: 'http://localhost:4567', routeParamsFile: '.vp/params.json' });
+    let stdout = '';
+    const code = await doctorCommand({
+      configPath: file,
+      env,
+      json: true,
+      normalize: true,
+      out: (t) => (stdout += t),
+      err: () => {},
+      options: { probes: greenProbes() },
+    });
+    expect(code).toBe(0);
+    const report = JSON.parse(stdout) as DoctorReport;
+    expect(report.at).toBe('<timestamp>');
+    expect(report.capabilities.barrier.detail).toBe('HMR websocket connected at http://localhost:<port>');
+    expect(report.capabilities.browser.detail).toBe('headless Chromium <version> launched and closed');
+    expect(report.capabilities.git.detail).toBe('HEAD tree <hash>');
+    expect(report.capabilities.params.detail).toBe('routeParamsFile not found: <repo>/.vp/params.json; using 0 entries from config');
+    expect(stdout).not.toContain(repo);
+    expect(stdout).not.toContain('4567');
+    // doctor.json on disk keeps the real values.
+    expect(JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'doctor.json'), 'utf8')).capabilities.barrier.detail).toContain('4567');
   });
 
   it('exits 1 when the trigger is missing', async () => {

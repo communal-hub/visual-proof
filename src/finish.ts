@@ -212,6 +212,11 @@ async function gather(
   }
   // A changed screen that cannot be tied to a capturable route is unproven, which is a failure, not a note.
   for (const skip of resolution.skipped) {
+    if (config.paramSources[skip.routeKey]) {
+      // The watcher fills this one from a list endpoint; its frame (or the source error) tells what happened.
+      expected.set(skip.routeKey, { route: skip.routeKey, routeKey: skip.routeKey, sourceFiles: skip.sourceFiles, via: 'screen', reasons: [] });
+      continue;
+    }
     state.failures.push(`cannot capture ${skip.routeKey}: ${skip.reason} (add routeParams)`);
   }
   for (const file of graphFailed ? [] : resolution.unmapped) {
@@ -237,12 +242,12 @@ async function gather(
         continue;
       }
       const concrete = concretePath(routeKey, seed.params);
-      if (!concrete.ok) {
+      if (!concrete.ok && !config.paramSources[routeKey]) {
         state.failures.push(`cannot capture ${routeKey}: ${concrete.reason} (add routeParams)`);
         continue;
       }
       expected.set(routeKey, {
-        route: concrete.path,
+        route: concrete.ok ? concrete.path : routeKey,
         routeKey,
         sourceFiles: backendFiles,
         via: 'backend',
@@ -279,9 +284,12 @@ async function gather(
     state.routes.push(route);
     const frame = timeline.latestAtTree(route.route, tree);
     if (!frame) {
-      state.failures.push(`no frame at HEAD for ${route.route}`);
+      const sourceError = route.route === route.routeKey ? status?.paramSources?.[route.routeKey]?.error : undefined;
+      if (sourceError) state.failures.push(`cannot capture ${route.routeKey}: ${sourceError} (add routeParams)`);
+      else state.failures.push(`no frame at HEAD for ${route.route}`);
       continue;
     }
+    if (route.route === route.routeKey) route.route = frame.route; // filled from a list endpoint: the frame knows the id
     route.status = frame.status;
     route.reasons = frame.reasons;
     route.frameId = frame.id;

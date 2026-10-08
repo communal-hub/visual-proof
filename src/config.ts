@@ -24,10 +24,39 @@ export const DEFAULT_HIDE_SELECTORS: readonly string[] = [
   '.vue-inspector-container',
 ];
 
+/**
+ * Analytics and tracker hosts that are aborted by default: they add network noise, console errors and flaky
+ * late requests, and none of them shape the layout. Deliberately absent: payment widgets (Stripe), maps, fonts and
+ * CDNs, which do. A config `blockHosts` replaces this list; `allowHosts` carves exceptions out of it.
+ * `*.example.com` matches `example.com` and every subdomain of it.
+ */
+export const DEFAULT_BLOCK_HOSTS: readonly string[] = [
+  '*.google-analytics.com',
+  '*.googletagmanager.com',
+  '*.posthog.com',
+  '*.segment.io',
+  '*.hotjar.com',
+  '*.intercom.io',
+  '*.sentry.io',
+];
+
 export type RenderCheckMode = 'fail' | 'warn' | 'off';
 
 export const DEFAULT_MAX_CAPTURE_HEIGHT = 6000;
 export const DEFAULT_WARMUP_BUDGET_MS = 60_000;
+export const DEFAULT_NETWORK_IDLE_MS = 250;
+export const DEFAULT_SETTLE_MAX_WAIT_MS = 5000;
+
+/** How a route key gets its params from a list endpoint (see `paramSources`). */
+export interface ParamSourceConfig {
+  /** App-relative API path (starts with `/`), fetched with the watcher's logged-in browser context. */
+  url: string;
+  /**
+   * Where in the JSON response the value comes from: a dot/index path (`data.0.id`, `0.uuid`) or a quoted literal
+   * (`'invoices'`). A string for a route with one param; an object of param name to pick for any number of params.
+   */
+  pick: string | Record<string, string>;
+}
 
 export interface LoginConfig {
   type: 'http-hook' | 'none';
@@ -52,6 +81,11 @@ export interface Config {
   routeParams: Record<string, string>;
   /** JSON file of route params written at runtime by the app (e.g. a seeder); relative to `repoDir`. Overrides `routeParams`. */
   routeParamsFile?: string;
+  /**
+   * Third tier of route params, used when neither `routeParams` nor the seed file has the route: fetch `url` and
+   * `pick` the param(s) out of the JSON. Resolved lazily, cached per session, refreshed on a backend recapture.
+   */
+  paramSources: Record<string, ParamSourceConfig>;
   screenGlobs: string[];
   /** Files matching these are never screens, even when they match `screenGlobs` (shared helpers, stories, tests). */
   ignoreScreenGlobs: string[];
@@ -78,6 +112,16 @@ export interface Config {
    * `fail` (default) makes "never rendered" a failure, `warn` a note, `off` skips the check (and the capture-time walk).
    */
   renderCheck: RenderCheckMode;
+  /** ISO timestamp the page clock is frozen at (`Date.now()`, `new Date()`); undefined leaves time alone. */
+  fixedTime?: string;
+  /** Playwright selectors covered by a solid box in stills (the area still takes part in the layout). */
+  maskSelectors: string[];
+  /** Hostname globs whose requests are aborted before navigation. Default {@link DEFAULT_BLOCK_HOSTS}. */
+  blockHosts: string[];
+  /** Hostname globs exempt from `blockHosts`. The app's own hosts are never blocked. */
+  allowHosts: string[];
+  /** When a page counts as settled: no network for `networkIdleMs`, waiting at most `maxWaitMs`. */
+  settle: { networkIdleMs: number; maxWaitMs: number };
   maxFrames: number;
   finishBudgetMs: number;
   baseRef: string;
@@ -145,6 +189,9 @@ export function parseConfig(
   const viewportRaw = v.object('viewport');
   const vp = viewportRaw ? new Validator(viewportRaw, errors, 'viewport.') : undefined;
 
+  const settleRaw = v.object('settle');
+  const settle = settleRaw ? new Validator(settleRaw, errors, 'settle.') : undefined;
+
   const loginRaw = v.object('login');
   const login = loginRaw ? parseLogin(loginRaw, errors) : defaultLogin();
 
@@ -161,6 +208,7 @@ export function parseConfig(
     staticRoutes: v.stringArrayMap('staticRoutes') ?? {},
     routeParams: v.stringMap('routeParams') ?? {},
     routeParamsFile: v.string('routeParamsFile'),
+    paramSources: parseParamSources(v.object('paramSources'), errors),
     screenGlobs: v.stringArray('screenGlobs') ?? ['src/**/*.vue'],
     ignoreScreenGlobs: v.stringArray('ignoreScreenGlobs') ?? [],
     backendGlobs: v.stringArray('backendGlobs') ?? [],
@@ -173,6 +221,14 @@ export function parseConfig(
     maxCaptureHeight: v.posInt('maxCaptureHeight') ?? DEFAULT_MAX_CAPTURE_HEIGHT,
     hideSelectors: hideSelectors(v.stringArray('hideSelectors'), v.boolean('hideSelectorsReplace') ?? false),
     renderCheck: parseRenderCheck(v.string('renderCheck'), errors),
+    fixedTime: parseFixedTime(v.string('fixedTime'), errors),
+    maskSelectors: v.stringArray('maskSelectors') ?? [],
+    blockHosts: hostGlobs('blockHosts', v.stringArray('blockHosts'), errors) ?? [...DEFAULT_BLOCK_HOSTS],
+    allowHosts: hostGlobs('allowHosts', v.stringArray('allowHosts'), errors) ?? [],
+    settle: {
+      networkIdleMs: settle?.posInt('networkIdleMs') ?? DEFAULT_NETWORK_IDLE_MS,
+      maxWaitMs: settle?.posInt('maxWaitMs') ?? DEFAULT_SETTLE_MAX_WAIT_MS,
+    },
     maxFrames: v.posInt('maxFrames') ?? 200,
     finishBudgetMs: v.posInt('finishBudgetMs') ?? 25_000,
     baseRef: v.string('baseRef') ?? 'main',
@@ -188,6 +244,83 @@ export function parseConfig(
 function hideSelectors(configured: string[] | undefined, replace: boolean): string[] {
   const extra = configured ?? [];
   return [...new Set(replace ? extra : [...DEFAULT_HIDE_SELECTORS, ...extra])];
+}
+
+function parseFixedTime(value: string | undefined, errors: string[]): string | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}/.test(value) || Number.isNaN(Date.parse(value))) {
+    errors.push(`"fixedTime" must be an ISO 8601 timestamp such as "2026-01-15T09:00:00Z", got ${JSON.stringify(value)}`);
+    return undefined;
+  }
+  return value;
+}
+
+/** Hostname globs: no scheme, port or path (`*.example.com`, `cdn.example.com`, `*`). */
+function hostGlobs(key: string, value: string[] | undefined, errors: string[]): string[] | undefined {
+  if (value === undefined) return undefined;
+  for (const glob of value) {
+    if (glob === '' || /[/:\s]/.test(glob)) {
+      errors.push(`"${key}" entries must be hostname globs without scheme, port or path (like "*.example.com"), got ${JSON.stringify(glob)}`);
+    }
+  }
+  return value;
+}
+
+const ROUTE_PARAM = /:([A-Za-z_]\w*)/g;
+
+/** Param names of a route key (`/a/:id/:tab` -> `['id', 'tab']`). */
+export function routeParamNames(routeKey: string): string[] {
+  return [...routeKey.matchAll(ROUTE_PARAM)].map((m) => m[1]!);
+}
+
+function parseParamSources(raw: Record<string, unknown> | undefined, errors: string[]): Record<string, ParamSourceConfig> {
+  const sources: Record<string, ParamSourceConfig> = {};
+  for (const [key, entry] of Object.entries(raw ?? {})) {
+    const where = `paramSources[${JSON.stringify(key)}]`;
+    const names = routeParamNames(key);
+    if (names.length === 0) {
+      errors.push(`"${where}" is not a route with params (nothing to fill in ${JSON.stringify(key)})`);
+      continue;
+    }
+    if (!isRecord(entry)) {
+      errors.push(`"${where}" must be an object { url, pick }, got ${JSON.stringify(entry)}`);
+      continue;
+    }
+    const { url, pick } = entry;
+    let ok = true;
+    if (typeof url !== 'string' || !url.startsWith('/') || url.startsWith('//')) {
+      errors.push(`"${where}.url" must be an app-relative path starting with "/", got ${JSON.stringify(url)}`);
+      ok = false;
+    }
+    if (typeof pick === 'string') {
+      if (pick === '') {
+        errors.push(`"${where}.pick" must not be empty`);
+        ok = false;
+      } else if (names.length > 1) {
+        errors.push(`"${where}.pick" must be an object of param to pick for ${names.join(', ')}, got a string`);
+        ok = false;
+      }
+    } else if (isRecord(pick)) {
+      const given = Object.keys(pick);
+      const bad = given.filter((k) => typeof pick[k] !== 'string' || pick[k] === '');
+      const missing = names.filter((n) => !given.includes(n));
+      const extra = given.filter((k) => !names.includes(k));
+      if (bad.length > 0 || missing.length > 0 || extra.length > 0) {
+        const problems = [
+          ...bad.map((k) => `${k} is not a non-empty string`),
+          ...missing.map((n) => `missing ${n}`),
+          ...extra.map((k) => `${k} is not a param of the route`),
+        ];
+        errors.push(`"${where}.pick" must map each of ${names.join(', ')} to a path: ${problems.join('; ')}`);
+        ok = false;
+      }
+    } else {
+      errors.push(`"${where}.pick" must be a string or an object of param to path, got ${JSON.stringify(pick)}`);
+      ok = false;
+    }
+    if (ok) sources[key] = { url: url as string, pick: pick as string | Record<string, string> };
+  }
+  return sources;
 }
 
 function parseRenderCheck(value: string | undefined, errors: string[]): RenderCheckMode {

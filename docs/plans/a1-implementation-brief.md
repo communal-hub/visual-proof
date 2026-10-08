@@ -39,6 +39,8 @@ src/
   exit.ts           exit codes
   text.ts           one-line error messages (config errors keep every field)
   globs.ts          screen/backend classification shared by watch, finish, doctor
+  hosts.ts          hostname globs and the block predicate behind blockHosts / allowHosts
+  normalize.ts      doctor --json --normalize: strip ports, paths, hashes, timings, versions
   git.ts            tree hash, HEAD tree, changed files (and the range they came from), toplevel/branch/ancestor helpers
   anchor.ts         persistent diff anchor (anchors.json in the status dir)
   ready.ts          `status --wait` / `ready`: block until the watcher is ready
@@ -49,6 +51,7 @@ src/
   resolve/
     import-graph.ts static import graph from route files -> file-to-routes map
     route-params.ts routeParams merged with the routeParamsFile seed file (re-read on every call)
+    param-sources.ts third tier: paramSources list endpoints -> route params (pick grammar, per-session cache)
     routes.ts       chain: import graph, then config static map, then skip+log
   browser.ts        warm Chromium, one context, login, capture(route) -> Frame
   triage.ts         DOM heuristics -> clean | loading | error | blank
@@ -82,6 +85,10 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "staticRoutes": { "src/pages/Reports.vue": ["/reports"] },
   "routeParams": { "/invoices/:id": "/invoices/1" },
   "routeParamsFile": ".visual-proof/route-params.json", // params written at runtime by the app (e.g. a seeder); relative to the config dir
+  "paramSources": {                             // third tier: fill a route's params from a list endpoint
+    "/manage/invoices/:id": { "url": "/api/invoices", "pick": "data.0.id" },
+    "/accounts/:id/:tab": { "url": "/api/accounts", "pick": { "id": "0.uuid", "tab": "'invoices'" } }
+  },
   "screenGlobs": ["src/**/*.vue"],
   "ignoreScreenGlobs": [],                      // files matching these are never screens (shared helpers, stories)
   "backendGlobs": ["server/**"],
@@ -101,6 +108,11 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "hideSelectors": [".cookie-banner"],          // hidden in stills, added to the defaults below
   "hideSelectorsReplace": false,                // true: hideSelectors replaces the defaults
   "renderCheck": "fail",                        // "fail" | "warn" | "off": changed .vue files must have rendered
+  "settle": { "networkIdleMs": 250, "maxWaitMs": 5000 }, // no request in flight for networkIdleMs, waiting at most maxWaitMs
+  "fixedTime": "2026-01-15T09:00:00Z",          // freeze Date in every page; omit to leave time alone (default)
+  "maskSelectors": [".clock", "text=Updated"],  // covered by a solid box in stills; default []
+  "blockHosts": ["*.google-analytics.com"],     // aborted before navigation; default: the tracker list below; [] blocks nothing
+  "allowHosts": ["browser.sentry.io"],          // exempt from blockHosts; default []
   "maxFrames": 200,
   "finishBudgetMs": 25000,
   "baseRef": "main"
@@ -114,6 +126,32 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
 - A missing file is empty, with no error. Invalid JSON or a wrong shape never crashes: `doctor` reports an error, `watcher.log` gets a one-line `warning: ...` (repeated only when the problem changes), and `finish` adds a note; all three fall back to config `routeParams`.
 - Values must be strings starting with `/`; others are ignored with a warning (same three places).
 - `doctor` gains a `params` capability, never required: tier `seed-file` (`N entries from <file>`) when the file is present, else `config` (`N entries`), else `none`. A missing file is a `warn` (`routeParamsFile not found: <path>`); an unreadable or invalid file is tier `invalid`.
+
+### Route params from list endpoints (v0.4)
+
+Third tier after `routeParams` and `routeParamsFile`, in `src/resolve/param-sources.ts`.
+
+- **Config** (`paramSources`, validated at load): key = route key with at least one `:param`; `url` = app-relative path (starts with `/`, not `//`); `pick` = string (a route with exactly one param) or object `{ <param>: <pick> }` covering every param of the route and nothing else (an object is allowed for one param too). Anything else is a config error naming the key.
+- **Pick grammar:** a quoted value (`'x'` or `"x"`, non-empty) is a literal. Otherwise a `.`-separated path whose segments are object keys (own properties only) or array indexes (digits); a segment on an array that is not an index, an index past the end, a missing key, or descending into a scalar is an error that names the path walked so far. The final value must be a non-empty string or a finite number, else `pick "<p>" is <what>, expected a string or number`. The value is `encodeURIComponent`'d into the route key's `:param` slots.
+- **Fetch:** `Capturer.getJson(urlPath)` (optional) = `context.request.get(appUrl + urlPath)` on the watcher's own context: its cookies, `ignoreHTTPSErrors`, `Accept: application/json`, 15 s timeout, one re-login and retry on 401/403 when `login` is `http-hook`. It returns `{ status, json? , error? }`; `error` is `HTTP <status>`, `response is not JSON`, or the transport message (`status: 0`). A capturer without `getJson` cannot resolve sources (`this capturer cannot fetch JSON`).
+- **When:** lazily, only for a route key that `routeParams` and the seed file do not fill: in a screen batch for skipped routes, in a recapture (backend, or an unmapped screen) for captured routes that no longer resolve through the earlier tiers, and for explicit `warmupRoutes` entries. Concurrent requests for a key share one fetch.
+- **Cache:** successes are kept per session (`ParamSourceResolver`); a batch with backend files invalidates all of them before resolving (a fetch that started before the invalidation cannot repopulate the cache). Failures are never cached.
+- **Failure:** the route is skipped (also on a recapture: the previously captured id is not reused). The reason is `paramSources <url> failed: <error>` (fetch) or `paramSources <url>: <why the pick failed>` (shape), logged once per distinct message as `warning: <reason> (route <key>)` and stored in `status.json` `paramSources[<key>] = { path?, error?, at }` (`path` = the last id that worked; success clears `error`).
+- **finish:** a changed route key that the earlier tiers cannot fill but `paramSources` covers is expected by key (the frame's `route` supplies the concrete path in the result). No frame at HEAD and `status.json` has an `error` for the key: failure `cannot capture <key>: <error> (add routeParams)`; no frame and no error: the ordinary `no frame at HEAD for <key>`; a frame at HEAD wins over an error. A captured source route re-added by a backend change is likewise expected by key.
+- **doctor:** capability `paramTiers` (after `params`; never required), tier `list-endpoint` when any source is configured, else `none`. Detail `N route(s) with params: config a, seed-file b, list-endpoint c, uncovered d` (routes with params from the import graph and `staticRoutes`; precedence seed-file, config, list-endpoint), then `uncovered: <keys>`, `paramSources for no known route: <keys>`, and for each source one `probe <url> -> <path>` or `probe <url> for <key> failed: <reason>`. Sources are probed in one bounded call (`timeouts.paramsMs`, default 4 s) through a Playwright `APIRequestContext` that logs in first; with the app down: `paramSources not probed: app not reachable at <appUrl> (<error>)`. Status `warn` for uncovered routes, stray keys, failed or skipped probes.
+- `RouteParams.fileKeys` lists the route keys the seed file filled (doctor counts tiers with it).
+
+### Flake controls (v0.4)
+
+- **Fixed clock:** `fixedTime` must be an ISO 8601 date (`YYYY-MM-DD...`, parseable). At context creation, before any page navigates, `context.clock.setFixedTime(new Date(fixedTime))` (Playwright >= 1.45, so inside the 1.57 peer floor; still feature-detected: a context without `clock.setFixedTime` logs `fixedTime ignored: ...` once). `Date.now()`, `new Date()`, `Intl` and `performance` follow the clock; timers and animation frames keep running. Unset by default.
+- **Masks:** `maskSelectors` become Playwright `mask` locators on the screenshot (default magenta box; the layout is untouched). A selector with no match is skipped; one whose `locator.count()` throws is logged once (`maskSelectors entry "<sel>" is not a valid selector (...); ignored`) and skipped. `CaptureLayout.masked` counts masked elements.
+- **Blocking:** `context.route` on the whole context at creation: a request whose URL host is blocked is aborted (`net::ERR_FAILED`). Host globs (`src/hosts.ts`): case-insensitive, `*` = any characters including dots, a leading `*.` also matches the bare domain; entries must not contain a scheme, port, path or whitespace. A host is blocked when it matches `blockHosts`, does not match `allowHosts`, and is not the host of `appUrl` or `viteUrl`; only http(s)/ws(s) URLs are considered. Default `blockHosts` (replaced, not extended, by a configured list; `[]` disables): `*.google-analytics.com`, `*.googletagmanager.com`, `*.posthog.com`, `*.segment.io`, `*.hotjar.com`, `*.intercom.io`, `*.sentry.io`. A console error `net::ERR_FAILED` / `net::ERR_BLOCKED_BY_CLIENT` whose resource URL is a blocked host is dropped from `consoleErrors` (triage never sees it); a page error thrown by app code reacting to the missing script is not filtered.
+
+### Settle and timing (v0.4)
+
+- `settle.networkIdleMs` (default 250, was a fixed 500 from Playwright's `networkidle`) and `settle.maxWaitMs` (default 5000, positive integers). The browser tracks in-flight requests per page from before navigation (`request` / `requestfinished` / `requestfailed`) and settles when none was in flight for `networkIdleMs`, or after `maxWaitMs`. The same window, capped at 1.5 s, is used after the page grew for a full-page still.
+- Default choice (fixture, warm, 5 samples each, `test/integration/settle-bench.test.ts`): median save-to-still 955 ms at 500, 708 ms at 250, 598 ms at 150; zero non-clean captures at any of them in the save-to-still runs and in 54 sweep captures each (every fixture route, alone and four at a time). 250 became the default after three full test runs with no non-clean frame; 150 was not adopted (largest saving, thinnest margin for apps with request gaps). Apps whose requests chain with gaps above the window should raise it.
+- `CaptureResult.timing` / frame record `timing: { settleMs, screenshotMs }`: `settleMs` = from `load` to a settled, read page (network idle, fonts, two frames, DOM read, including any re-settle after the page navigated itself); `screenshotMs` = from the settled page to the PNG (rendered-component walk, page preparation, masks, the screenshot). Absent on frames from earlier versions and from capturers that do not report it.
 
 ### Warm-up
 
@@ -146,7 +184,7 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 ## Files the daemon writes (status dir)
 
 - `daemon.pid`: pid as text.
-- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastEventAt, pending, pendingSince, lastError, frames, warmup }`. `pid` is the watcher process; `anchor` is the diff anchor (see `anchors.json`; null outside a repo or with no commits); `warmup` is absent until the warm-up step and then `{ state: "running"|"done"|"failed"|"timeout"|"skipped", ms?, routes: [{ route, ms, ok, reloads?, error? }] }`. `state` stays `starting` until the warm-up is over. `pending` is true from the first relevant file event of a change (before the debounce ends) until its batch, including re-queues, is fully handled; `pendingSince` and `lastEventAt` are ISO timestamps (or null). `lastError` is the latest unresolved problem (a refused capture, a failed capture) and is cleared by the next fully captured batch. `finish` adds `lastFinish: { at, ok, failures, proofBlockPath, summary }` to the same file on every outcome. `status` reports a stored `starting`/`ready`/`capturing` whose watcher process is gone as `state: "stopped"`, `stale: true`, `lastError: "watcher exited without stopping"`.
+- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastEventAt, pending, pendingSince, lastError, frames, warmup }`. `pid` is the watcher process; `anchor` is the diff anchor (see `anchors.json`; null outside a repo or with no commits); `paramSources` (absent until a `paramSources` route is looked up) maps route key to `{ path?, error?, at }`; `warmup` is absent until the warm-up step and then `{ state: "running"|"done"|"failed"|"timeout"|"skipped", ms?, routes: [{ route, ms, ok, reloads?, error? }] }`. `state` stays `starting` until the warm-up is over. `pending` is true from the first relevant file event of a change (before the debounce ends) until its batch, including re-queues, is fully handled; `pendingSince` and `lastEventAt` are ISO timestamps (or null). `lastError` is the latest unresolved problem (a refused capture, a failed capture) and is cleared by the next fully captured batch. `finish` adds `lastFinish: { at, ok, failures, proofBlockPath, summary }` to the same file on every outcome. `status` reports a stored `starting`/`ready`/`capturing` whose watcher process is gone as `state: "stopped"`, `stale: true`, `lastError: "watcher exited without stopping"`.
 - `anchors.json`: `{ "<git toplevel>\n<branch>": { anchor, at } }`. At start the watcher looks up the key (`(detached)` for a detached HEAD): a stored anchor is reused (the earliest anchor of the branch survives daemon restarts) while it is an ancestor of HEAD and less than 24 h old (so a leftover from an earlier task on the same branch name cannot widen today's diff); otherwise HEAD is stored and used. Outside a repo or without commits nothing is persisted. The log says `anchor <sha8> (HEAD|reused from an earlier session of this branch|HEAD, not persisted)`.
 - `watcher.log`: one line per event, ISO timestamp first.
 - `doctor.json`: resolved tier per capability.
@@ -160,10 +198,13 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
   "at": "2026-10-08T12:00:00.000Z", "treeHash": "<40 hex>", "trigger": "screen|backend",
   "sourceFile": "src/pages/Invoice.vue", "status": "clean|loading|error|blank",
   "reasons": ["console error: ..."], "renderedFiles": ["src/App.vue", "src/pages/Invoice.vue"],
+  "timing": { "settleMs": 362, "screenshotMs": 44 },
   "png": "frames/f-000042.png" }
 ```
 
 `renderedFiles`: repo-relative component files mounted in the page (see Rendered components; at most 2000), or `null` when unknown (production build, non-Vue app, `renderCheck: "off"`); absent on frames written by versions before 0.3.
+
+`timing`: where the capture spent its time in ms (see Settle and timing); absent on frames written before 0.4 and from capturers that do not report it.
 
 Cap: when frames exceed `maxFrames`, delete the oldest records and PNGs first.
 
@@ -182,7 +223,7 @@ In order:
 
 A changed screen file that maps to no route (unmapped) re-captures every route captured this session, like a backend change (frames keep `trigger: "screen"` and `sourceFile` = the unmapped file), so frames stay at HEAD. `finish` still fails it (`no route for <file>`), unless it is ignored: an unproven file must never pass silently, and re-capturing only keeps the other routes' frames current.
 
-Capture waits: `load`, then network idle (500 ms, capped at 5 s), `document.fonts.ready`, two `requestAnimationFrame`s. Reduced motion on. Fixed clock is A2+.
+Capture waits: `load`, then network idle (`settle.networkIdleMs`, default 250 ms, capped at `settle.maxWaitMs`, default 5 s), `document.fonts.ready`, two `requestAnimationFrame`s. Reduced motion on. The clock is only frozen when `fixedTime` is set. Requests to blocked hosts are aborted and their failed-resource console line is not an error (see Flake controls).
 
 ## finish semantics
 
@@ -214,8 +255,12 @@ stdout of `finish` is the proof block path on every branch, including `no screen
 | `stop` | status JSON | 0; 4 if the daemon cannot be signalled |
 | `watch` | log lines when a TTY | 0 after SIGINT/SIGTERM; 3 config/setup |
 | `finish` | proof block path (`--json`: the result; `--hook`: one summary line) | 0, 1, 3, 4 (`--hook`: always 0) |
-| `doctor` | table (one row per capability, including `renderCheck`: the mode) ending `details: <doctor.json path>` (`--json`: the report) | 0; 1 when the browser or the trigger is missing; 4 internal |
+| `doctor` | table (one row per capability, including `paramTiers` and `renderCheck`: the mode) ending `details: <doctor.json path>` (`--json`: the report; `--json --normalize`: the report with timestamp, dirs, ports, hashes, timings and versions replaced, see below) | 0; 1 when the browser or the trigger is missing; 4 internal |
 | usage error | | 2 |
+
+### `doctor --json --normalize`
+
+`normalizeDoctorReport` / `normalizeText` in `src/normalize.ts` (the same code the golden-file test uses). `at` becomes `<timestamp>`. Directories (repo = config dir, status, scratch and artifact dirs, the cwd, the OS temp dir, the home dir; each also by realpath, longest first) become `<repo>`, `<status-dir>`, `<scratch-dir>`, `<artifact-dir>`, `<cwd>`, `<tmp>`, `<home>`. A host (`localhost`, an IPv4 address, a dotted name) followed by `:<2-5 digits>` keeps the host and becomes `:<port>`. `[0-9a-f]{7,40}` becomes `<hash>`. `<digits> ms` becomes `<n> ms`. `Chromium|Chrome|Firefox|WebKit|Playwright|Vite|Node|visual-proof <version>` becomes `<name> <version>`. Route paths such as `/__playwright__/login` are left alone. `--normalize` is only valid with `doctor --json` (usage error otherwise) and only changes what is printed; `doctor.json` keeps the real values. The golden `test/golden/doctor-fixture.json` is exactly the normalized output for the fixture.
 
 ## Known-bad corpus (A1 Done gate)
 
@@ -239,6 +284,7 @@ Plus one happy path: edit → clean frame → commit → `finish` exits 0 with a
 - A shared component used by two pages (for fan-out).
 - `/long`: `src/pages/Long.vue` in `src/layouts/ScrollLayout.vue`, whose `html, body` never scroll while `main.content` (flex child, `overflow-y: auto`) holds 60 rows plus a solid green bottom marker, under a sticky header. `/flagged`: `src/pages/Flagged.vue` mounts `src/components/FlaggedDetails.vue` only when `GET /api/flags` (from `server/data.json` `flags.showDetails`, off by default) says so.
 - `index.html` carries a stand-in for the devtools overlay (`#__vue-devtools-container__` holding a magenta `.vue-devtools__anchor` pill fixed at bottom-centre), so tests can check it is hidden.
+- `visual-proof.param-sources.config.json`: the fixture config without `routeParams` and with `paramSources: { "/manage/invoices/:id": { "url": "/api/invoices", "pick": "0.id" } }`; the integration harness starts from it with `createHarness({ configFile })`.
 - `VP_FIXTURE_CACHE_DIR` makes the fixture's Vite use its own dependency cache (cold-start tests).
 - `#app` root. A `.spinner` element shown while data loads.
 - Dev-only Vite middleware (in the fixture's own `vite.config.js`) that serves:
