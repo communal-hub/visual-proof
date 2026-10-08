@@ -17,7 +17,7 @@ function frame(overrides: Partial<NewFrame> = {}): NewFrame {
     routeKey: '/invoices/:id',
     at: '2026-10-08T12:00:00.000Z',
     treeHash: 'a'.repeat(40),
-    trigger: 'vite-hmr',
+    trigger: 'screen',
     status: 'clean',
     reasons: [],
     ...overrides,

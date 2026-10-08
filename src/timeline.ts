@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FrameStatus } from './triage.js';
 
-export type Trigger = 'vite-hmr' | 'fs-watch' | 'initial';
+/** Which glob set caused the capture: a screen file changed, or a backend file did. */
+export type Trigger = 'screen' | 'backend';
 
 export interface Frame {
   id: string;

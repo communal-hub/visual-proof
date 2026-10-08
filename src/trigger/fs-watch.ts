@@ -25,6 +25,12 @@ export interface FsWatchOptions {
    * plus `stabilityThreshold` (100 ms) of extra latency per save.
    */
   awaitWriteFinish?: boolean;
+  /**
+   * Pause after chokidar reports `ready` before resolving. On macOS the OS-level watch is armed
+   * slightly after `ready` (observed: ~1 in 20 saves made in the first few ms were silently
+   * missed, more under CPU load; 25 ms was enough in 120 trials). Default 100 ms.
+   */
+  settleMs?: number;
   onBatch: (batch: WatchBatch) => void;
   onError?: (error: Error) => void;
 }
@@ -37,8 +43,8 @@ export interface FsWatchHandle {
 const ALWAYS_IGNORED = new Set(['node_modules', '.git']);
 
 /**
- * Chokidar watcher over `screenGlobs` and `backendGlobs`. Resolves once the initial scan is done,
- * so edits made after the promise resolves are guaranteed to be seen.
+ * Chokidar watcher over `screenGlobs` and `backendGlobs`. Resolves once the initial scan is done
+ * and the OS watches have had a moment to arm, so edits made after the promise resolves are seen.
  *
  * Chokidar 4+ has no glob support, so this watches the literal directory prefix of each glob and
  * filters events with picomatch.
@@ -110,6 +116,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
   watcher.on('error', (err) => options.onError?.(err instanceof Error ? err : new Error(String(err))));
 
   await new Promise<void>((resolve) => watcher.once('ready', () => resolve()));
+  await new Promise<void>((resolve) => setTimeout(resolve, options.settleMs ?? 100));
 
   return {
     async stop() {
