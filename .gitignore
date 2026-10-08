@@ -4,3 +4,6 @@ dist/
 *.log
 .visual-proof/
 coverage/
+.env
+.env.*
+!.env.example
