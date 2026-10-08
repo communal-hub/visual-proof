@@ -56,6 +56,12 @@
       "required": false,
       "detail": "1 entry"
     },
+    "paramTiers": {
+      "tier": "none",
+      "status": "ok",
+      "required": false,
+      "detail": "1 route(s) with params: config 1, seed-file 0, list-endpoint 0, uncovered 0"
+    },
     "renderCheck": {
       "tier": "fail",
       "status": "ok",

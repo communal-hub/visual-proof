@@ -2,19 +2,21 @@ import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
-import { chromium } from 'playwright';
-import { CONFIG_FILE_NAME, ConfigError, loadConfig, type Config } from './config.js';
+import { chromium, request as playwrightRequest } from 'playwright';
+import { CONFIG_FILE_NAME, ConfigError, loadConfig, routeParamNames, type Config } from './config.js';
 import { headTree, isGitRepo } from './git.js';
 import { EXIT } from './exit.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
+import { normalizeDoctorReport } from './normalize.js';
+import { fillRoute, type JsonResponse } from './resolve/param-sources.js';
 import { loadRouteParams } from './resolve/route-params.js';
 import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
 
-export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'renderCheck';
+export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'paramTiers' | 'renderCheck';
 /** `ok`: working at its best tier. `warn`: working at a fallback tier. `missing`: not working. `skipped`: not probed. */
 export type CapabilityStatus = 'ok' | 'warn' | 'missing' | 'skipped';
 
@@ -47,6 +49,11 @@ export interface Probes {
   /** Send the login request exactly as `watch` would. */
   login(config: Config, timeoutMs: number): Promise<LoginProbeResult>;
   buildGraph(config: Config): Promise<ImportGraph>;
+  /**
+   * GET each app-relative path as the logged-in user and decode the JSON (what the watcher does for
+   * `paramSources`). One entry per path; a transport failure is `status: 0` with an `error`.
+   */
+  getJson(config: Config, paths: string[], timeoutMs: number): Promise<JsonResponse[]>;
 }
 
 export interface DoctorOptions {
@@ -54,7 +61,7 @@ export interface DoctorOptions {
   dirs?: Dirs;
   probes?: Partial<Probes>;
   /** Per-probe timeouts; the slowest one bounds the whole run. */
-  timeouts?: { browserMs?: number; barrierMs?: number; loginMs?: number; routesMs?: number };
+  timeouts?: { browserMs?: number; barrierMs?: number; loginMs?: number; routesMs?: number; paramsMs?: number };
 }
 
 export const CAPABILITY_ORDER: CapabilityName[] = [
@@ -67,6 +74,7 @@ export const CAPABILITY_ORDER: CapabilityName[] = [
   'login',
   'routes',
   'params',
+  'paramTiers',
   'renderCheck',
 ];
 
@@ -74,10 +82,18 @@ const BROWSER_MS = 8000;
 const BARRIER_MS = 3000;
 const LOGIN_MS = 3000;
 const ROUTES_MS = 5000;
+const PARAMS_MS = 4000;
 
 export async function runDoctor(config: Config | ConfigError, opts: DoctorOptions = {}): Promise<DoctorReport> {
   const dirs = opts.dirs ?? resolveDirs(opts.env);
   const probes: Probes = { ...defaultProbes, ...opts.probes };
+  // Both the routes check and the param tiers need the import graph; build it once.
+  const buildGraph = probes.buildGraph;
+  const graphs = new Map<Config, Promise<ImportGraph>>();
+  probes.buildGraph = (c) => {
+    if (!graphs.has(c)) graphs.set(c, buildGraph(c));
+    return graphs.get(c)!;
+  };
   const t = opts.timeouts ?? {};
   const invalid = config instanceof ConfigError ? config : null;
 
@@ -89,13 +105,14 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   const skipped = (reason: string): Capability => ({ tier: 'unknown', status: 'skipped', required: false, detail: reason });
   const cfg = invalid ? null : (config as Config);
 
-  const [git, browser, trigger, barrier, login, routes] = await Promise.all([
+  const [git, browser, trigger, barrier, login, routes, paramTiers] = await Promise.all([
     checkGit(cfg),
     checkBrowser(probes, t.browserMs ?? BROWSER_MS),
     cfg ? checkTrigger(cfg, dirs) : { tier: 'none', status: 'missing' as const, required: true, detail: 'config is invalid, so the trigger globs are unknown' },
     cfg ? checkBarrier(cfg, probes, t.barrierMs ?? BARRIER_MS) : skipped('config is invalid'),
     cfg ? checkLogin(cfg, probes, t.loginMs ?? LOGIN_MS) : skipped('config is invalid'),
     cfg ? checkRoutes(cfg, probes, t.routesMs ?? ROUTES_MS) : skipped('config is invalid'),
+    cfg ? checkParamTiers(cfg, probes, t.routesMs ?? ROUTES_MS, t.paramsMs ?? PARAMS_MS) : skipped('config is invalid'),
   ]);
   caps.git = git;
   caps.browser = browser;
@@ -105,6 +122,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   caps.login = login;
   caps.routes = routes;
   caps.params = cfg ? checkParams(cfg) : skipped('config is invalid');
+  caps.paramTiers = paramTiers;
   caps.renderCheck = cfg ? checkRenderCheck(cfg) : skipped('config is invalid');
 
   const ordered = {} as Record<CapabilityName, Capability>;
@@ -252,6 +270,88 @@ function checkParams(config: Config): Capability {
   return { tier: 'seed-file', status: 'ok', required: false, detail };
 }
 
+/**
+ * How many routes with params each tier covers: `routeParams`, the seed file, or a `paramSources` list endpoint
+ * (earlier tiers win). Each configured source is probed once, as the logged-in user, when the app answers.
+ * Informational, never required.
+ */
+async function checkParamTiers(config: Config, probes: Probes, graphMs: number, probeMs: number): Promise<Capability> {
+  const seed = loadRouteParams(config);
+  const sourceKeys = Object.keys(config.paramSources);
+
+  const routeKeys = new Set<string>();
+  try {
+    const graph = await withTimeout(probes.buildGraph(config), graphMs, 'route graph');
+    for (const route of graph.routes) routeKeys.add(route.path);
+  } catch {
+    // Without a graph, only the keys the tiers name can be counted.
+    for (const key of [...Object.keys(config.routeParams), ...seed.fileKeys, ...sourceKeys]) routeKeys.add(key);
+  }
+  for (const key of Object.values(config.staticRoutes).flat()) routeKeys.add(key);
+  const paramRoutes = [...routeKeys].filter((key) => routeParamNames(key).length > 0).sort();
+
+  const fileKeys = new Set(seed.fileKeys);
+  const counts = { config: 0, 'seed-file': 0, 'list-endpoint': 0, uncovered: 0 };
+  const uncovered: string[] = [];
+  for (const key of paramRoutes) {
+    if (fileKeys.has(key)) counts['seed-file']++;
+    else if (Object.hasOwn(config.routeParams, key)) counts.config++;
+    else if (Object.hasOwn(config.paramSources, key)) counts['list-endpoint']++;
+    else {
+      counts.uncovered++;
+      uncovered.push(key);
+    }
+  }
+  const parts = [
+    `${paramRoutes.length} route(s) with params: config ${counts.config}, seed-file ${counts['seed-file']}, list-endpoint ${counts['list-endpoint']}, uncovered ${counts.uncovered}`,
+  ];
+  let warn = counts.uncovered > 0;
+  if (uncovered.length > 0) parts.push(`uncovered: ${uncovered.join(', ')}`);
+  const stray = sourceKeys.filter((key) => !paramRoutes.includes(key));
+  if (stray.length > 0 && paramRoutes.length > 0) {
+    warn = true;
+    parts.push(`paramSources for no known route: ${stray.join(', ')}`);
+  }
+
+  if (sourceKeys.length > 0) {
+    const sources = sourceKeys.map((key) => config.paramSources[key]!);
+    let responses: JsonResponse[] | null = null;
+    try {
+      responses = await withTimeout(probes.getJson(config, sources.map((s) => s.url), probeMs), probeMs + 500, 'paramSources probe');
+    } catch (err) {
+      parts.push(`paramSources not probed: ${firstLine(err)}`);
+      warn = true;
+    }
+    if (responses && responses.length > 0 && responses.every((r) => r.status === 0)) {
+      parts.push(`paramSources not probed: app not reachable at ${config.appUrl} (${responses[0]!.error ?? 'no answer'})`);
+      warn = true;
+    } else if (responses) {
+      sourceKeys.forEach((key, i) => {
+        const source = sources[i]!;
+        const response = responses![i];
+        if (!response || response.error !== undefined) {
+          warn = true;
+          parts.push(`probe ${source.url} for ${key} failed: ${response?.error ?? 'no answer'}`);
+          return;
+        }
+        const filled = fillRoute(key, source, response.json);
+        if (filled.ok) parts.push(`probe ${source.url} -> ${filled.path}`);
+        else {
+          warn = true;
+          parts.push(`probe ${source.url} for ${key}: ${filled.reason}`);
+        }
+      });
+    }
+  }
+
+  return {
+    tier: sourceKeys.length > 0 ? 'list-endpoint' : 'none',
+    status: warn ? 'warn' : 'ok',
+    required: false,
+    detail: parts.join('; '),
+  };
+}
+
 /** The mode of the rendered-component check in `finish`. Informational, never required. */
 function checkRenderCheck(config: Config): Capability {
   if (config.renderCheck === 'fail') {
@@ -308,6 +408,47 @@ const defaultProbes: Probes = {
   },
 
   buildGraph: (config) => buildImportGraph(config),
+
+  async getJson(config, paths, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    const left = () => Math.max(250, deadline - Date.now());
+    const base = config.appUrl.endsWith('/') ? config.appUrl : `${config.appUrl}/`;
+    const api = await playwrightRequest.newContext({ ignoreHTTPSErrors: config.ignoreHTTPSErrors });
+    try {
+      const { login } = config;
+      if (login.type === 'http-hook' && login.url) {
+        const headers: Record<string, string> = {};
+        if (login.tokenFile) {
+          try {
+            headers[login.tokenHeader] = fs.readFileSync(path.resolve(config.repoDir, login.tokenFile), 'utf8').trim();
+          } catch {
+            // The login check reports the unreadable token; the probes below then show what an anonymous GET gets.
+          }
+        }
+        await api
+          .post(new URL(login.url, base).href, { data: { email: login.email }, headers, failOnStatusCode: false, maxRedirects: 0, timeout: left() })
+          .catch(() => {});
+      }
+      return await Promise.all(
+        paths.map(async (urlPath): Promise<JsonResponse> => {
+          try {
+            const response = await api.get(new URL(urlPath, base).href, { failOnStatusCode: false, timeout: left(), headers: { accept: 'application/json' } });
+            const status = response.status();
+            if (status < 200 || status >= 300) return { status, error: `HTTP ${status}` };
+            try {
+              return { status, json: await response.json() };
+            } catch {
+              return { status, error: 'response is not JSON' };
+            }
+          } catch (err) {
+            return { status: 0, error: firstLine(err) };
+          }
+        }),
+      );
+    } finally {
+      await api.dispose().catch(() => {});
+    }
+  },
 };
 
 function post(url: URL, headers: Record<string, string>, body: string, ignoreHTTPSErrors: boolean, timeoutMs: number): Promise<number> {
@@ -400,6 +541,8 @@ export interface DoctorCommandContext {
   configPath?: string;
   /** Print the report as JSON instead of the table. */
   json?: boolean;
+  /** With `json`: strip ports, absolute paths, hashes, timings and versions, so the output can be checked in as a golden. */
+  normalize?: boolean;
   env: NodeJS.ProcessEnv;
   cwd?: string;
   out?: (text: string) => void;
@@ -424,7 +567,21 @@ export async function doctorCommand(ctx: DoctorCommandContext): Promise<number> 
   }
   try {
     const report = await runDoctor(config, { env: ctx.env, ...ctx.options });
-    if (ctx.json) out(`${JSON.stringify(report, null, 2)}\n`);
+    if (ctx.json) {
+      const dirs = ctx.options?.dirs ?? resolveDirs(ctx.env);
+      const shown = ctx.normalize
+        ? normalizeDoctorReport(report, {
+            roots: [
+              ...(config instanceof ConfigError ? [] : [{ path: config.repoDir, label: '<repo>' }]),
+              { path: dirs.statusDir, label: '<status-dir>' },
+              { path: dirs.scratchDir, label: '<scratch-dir>' },
+              { path: dirs.artifactDir, label: '<artifact-dir>' },
+              { path: cwd, label: '<cwd>' },
+            ],
+          })
+        : report;
+      out(`${JSON.stringify(shown, null, 2)}\n`);
+    }
     else out(`${formatReport(report)}details: ${statusFiles(ctx.options?.dirs ?? resolveDirs(ctx.env)).doctor}\n`);
     if (!report.ok) err('visual-proof doctor: a required capability is missing (browser or trigger)\n');
     return report.ok ? EXIT.OK : EXIT.FAILURES;

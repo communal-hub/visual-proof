@@ -21,6 +21,13 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish and doctor/);
   });
 
+  it('parses --normalize for doctor --json only', () => {
+    expect(parseArgs(['doctor', '--json', '--normalize'])).toMatchObject({ command: 'doctor', json: true, normalize: true });
+    expect(parseArgs(['doctor', '--json'])).toMatchObject({ normalize: false });
+    expect(() => parseArgs(['doctor', '--normalize'])).toThrow(/--normalize is only valid with doctor --json/);
+    expect(() => parseArgs(['finish', '--json', '--normalize'])).toThrow(/--normalize is only valid with doctor --json/);
+  });
+
   it('parses status --wait and --timeout, and the ready alias', () => {
     expect(parseArgs(['status', '--wait'])).toMatchObject({ command: 'status', wait: true });
     expect(parseArgs(['status', '--wait']).timeoutSec).toBeUndefined();
