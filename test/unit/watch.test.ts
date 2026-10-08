@@ -352,6 +352,42 @@ describe('screen batches', () => {
     expect(logText()).toContain('skipped route /invoices/:id');
   });
 
+  it('re-reads routeParamsFile for every batch, so a file written after start is picked up', async () => {
+    config = { ...config, routeParams: { '/invoices/:id': '/invoices/1' }, routeParamsFile: '.visual-proof/params.json' };
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(1);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/1']);
+
+    fs.mkdirSync(path.join(repo, '.visual-proof'));
+    fs.writeFileSync(path.join(repo, '.visual-proof/params.json'), JSON.stringify({ routes: { '/invoices/:id': '/invoices/42' } }));
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/1', 'http://app.test/invoices/42']);
+    expect(logText()).not.toContain('warning:');
+
+    // a backend change re-captures the session's routes at their current params
+    fs.writeFileSync(path.join(repo, '.visual-proof/params.json'), JSON.stringify({ '/invoices/:id': '/invoices/43' }));
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(3);
+    expect(capturer.urls.at(-1)).toBe('http://app.test/invoices/43');
+  });
+
+  it('logs one warning line for an invalid routeParamsFile, falls back to config, and does not repeat it', async () => {
+    config = { ...config, routeParamsFile: '.visual-proof/params.json' };
+    fs.mkdirSync(path.join(repo, '.visual-proof'));
+    fs.writeFileSync(path.join(repo, '.visual-proof/params.json'), '{ nope');
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(1);
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/1', 'http://app.test/invoices/1']);
+    const warnings = logText().split('\n').filter((l) => l.includes('warning: routeParamsFile'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('is not valid JSON');
+  });
+
   it('rebuilds the import graph when a route file or an unknown file changes, not otherwise', async () => {
     let builds = 0;
     await start({

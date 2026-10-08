@@ -252,6 +252,46 @@ describe('runFinish', () => {
     expect(result.routes.map((r) => r.route)).toEqual(['/a']);
   });
 
+  it('resolves a param route from routeParamsFile, which overrides config routeParams', async () => {
+    configure({ routeParams: { '/b/:id': '/b/1' }, routeParamsFile: '.visual-proof/params.json' });
+    write(repo, '.visual-proof/params.json', JSON.stringify({ routes: { '/b/:id': '/b/42' } }));
+    editAndCommit('src/pages/B.vue');
+    await frame('/b/42');
+    const result = await finish();
+    expect(result).toMatchObject({ ok: true, failures: [] });
+    expect(result.routes.map((r) => [r.routeKey, r.route, r.status])).toEqual([['/b/:id', '/b/42', 'clean']]);
+  });
+
+  it('fills a param route that config routeParams leaves unfilled from a file written later', async () => {
+    configure({ routeParams: {}, routeParamsFile: '.visual-proof/params.json' });
+    editAndCommit('src/pages/B.vue');
+    await frame('/b/7');
+    expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: no routeParams entry/);
+
+    write(repo, '.visual-proof/params.json', JSON.stringify({ '/b/:id': '/b/7' }));
+    expect(await finish()).toMatchObject({ ok: true, failures: [] });
+  });
+
+  it('notes an invalid routeParamsFile and falls back to config routeParams', async () => {
+    configure({ routeParams: { '/b/:id': '/b/1' }, routeParamsFile: '.visual-proof/params.json' });
+    write(repo, '.visual-proof/params.json', '{ nope');
+    editAndCommit('src/pages/B.vue');
+    await frame('/b/1');
+    const result = await finish();
+    expect(result.ok).toBe(true);
+    expect(result.routes.map((r) => r.route)).toEqual(['/b/1']);
+    expect(result.notes.some((n) => n.includes('is not valid JSON') && n.includes('using routeParams from the config only'))).toBe(true);
+  });
+
+  it('treats a missing routeParamsFile as empty without a note', async () => {
+    configure({ routeParams: { '/b/:id': '/b/1' }, routeParamsFile: '.visual-proof/missing.json' });
+    editAndCommit('src/pages/B.vue');
+    await frame('/b/1');
+    const result = await finish();
+    expect(result).toMatchObject({ ok: true, failures: [] });
+    expect(result.notes.filter((n) => n.includes('routeParamsFile'))).toEqual([]);
+  });
+
   it('ignoreScreenGlobs removes files from the screen set entirely', async () => {
     configure({ ignoreScreenGlobs: ['src/orphan/**', 'src/pages/B.vue'] });
     write(repo, 'src/orphan/Lonely.vue', '<template>x</template>\n');
