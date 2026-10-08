@@ -47,6 +47,13 @@ export interface BrowserOptions {
   networkIdleCapMs?: number;
 }
 
+const STALE_DEP_RETRIES = 2;
+const STALE_DEP_PAUSE_MS = 300;
+
+function hasStaleDepError(consoleErrors: string[]): boolean {
+  return consoleErrors.some((message) => message.includes('Outdated Optimize Dep'));
+}
+
 const LOGIN_PATH = /(^|\/)(login|log-in|signin|sign-in)(\/|$)/i;
 
 /**
@@ -103,6 +110,14 @@ export class Browser implements Capturer {
           authFailure = (err as Error).message;
         }
       }
+    }
+
+    // A cold Vite dev server answers module requests with 504 "Outdated Optimize Dep" while it
+    // re-bundles dependencies discovered on first load. That is transient, not a broken page.
+    for (let retry = 0; retry < STALE_DEP_RETRIES && hasStaleDepError(attempt.signals.consoleErrors); retry++) {
+      this.log(`capture ${url}: Vite is re-optimizing dependencies (504 Outdated Optimize Dep); capturing again`);
+      await new Promise((resolve) => setTimeout(resolve, STALE_DEP_PAUSE_MS));
+      attempt = await this.captureOnce(context, url);
     }
 
     const { png, signals, finalUrl } = attempt;

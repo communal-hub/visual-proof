@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Browser } from '../../src/browser.js';
@@ -98,5 +100,33 @@ describe('Browser.capture', () => {
     const extra = await Browser.launch(h.config);
     await extra.close();
     await expect(extra.close()).resolves.toBeUndefined();
+  });
+
+  it('captures again when a cold Vite answers 504 "Outdated Optimize Dep", instead of reporting an error frame', async () => {
+    let scriptRequests = 0;
+    const server = http.createServer((req, res) => {
+      if (req.url === '/dep.js') {
+        scriptRequests++;
+        if (scriptRequests === 1) {
+          res.writeHead(504, 'Outdated Optimize Dep').end();
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/javascript' }).end("document.getElementById('app').innerHTML = '<p>ready</p>'");
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html' }).end('<div id="app"></div><script src="/dep.js"></script>');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const target = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+      const result = await browser.capture(target);
+      expect(scriptRequests).toBe(2);
+      expect(result.signals.consoleErrors).toEqual([]);
+      expect(result.signals.text).toBe('ready');
+      expect(triage(result.signals).status).toBe('clean');
+      expect(logs.some((l) => l.includes('Outdated Optimize Dep'))).toBe(true);
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
   });
 });
