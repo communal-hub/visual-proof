@@ -7,8 +7,16 @@ import { REPO_ROOT, createHarness, type Harness } from './harness.js';
 const GOLDEN = path.join(REPO_ROOT, 'test/golden/doctor-fixture.json');
 
 let h: Harness;
+let green: DoctorReport;
+let greenMs: number;
+let greenOnDisk: unknown;
 beforeAll(async () => {
   h = await createHarness();
+  // Computed here (not in an `it`) so every test below stands alone, in any order or on its own.
+  const t0 = Date.now();
+  green = await runDoctor(h.config, { dirs: h.dirs });
+  greenMs = Date.now() - t0;
+  greenOnDisk = JSON.parse(fs.readFileSync(path.join(h.dirs.statusDir, 'doctor.json'), 'utf8'));
 });
 afterAll(async () => {
   await h?.cleanup();
@@ -32,12 +40,8 @@ function normalize(report: DoctorReport): unknown {
 }
 
 describe('doctor against the vite-vue fixture', () => {
-  let green: DoctorReport;
-
-  it('all green with the dev server up: browser launches, barrier is vite-hmr, login works', async () => {
-    const t0 = Date.now();
-    green = await runDoctor(h.config, { dirs: h.dirs });
-    expect(Date.now() - t0).toBeLessThan(10_000);
+  it('all green with the dev server up: browser launches, barrier is vite-hmr, login works', () => {
+    expect(greenMs).toBeLessThan(10_000);
 
     expect(green.ok).toBe(true);
     expect(green.capabilities).toMatchObject({
@@ -50,7 +54,7 @@ describe('doctor against the vite-vue fixture', () => {
       login: { tier: 'http-hook', status: 'ok' },
       routes: { tier: 'import-graph', status: 'ok' },
     });
-    expect(JSON.parse(fs.readFileSync(path.join(h.dirs.statusDir, 'doctor.json'), 'utf8'))).toEqual(green);
+    expect(greenOnDisk).toEqual(green);
   });
 
   it('matches the checked-in golden file', () => {
