@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { runWatch, startDaemon, stopDaemon } from './daemon.js';
 import { resolveDirs, statusFiles } from './paths.js';
 
 export type Command = 'start' | 'stop' | 'status' | 'watch' | 'finish' | 'doctor';
@@ -62,7 +63,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return parsed;
 }
 
-export function main(argv: string[], env: NodeJS.ProcessEnv = process.env): number {
+export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   let args: ParsedArgs;
   try {
     args = parseArgs(argv);
@@ -81,6 +82,9 @@ export function main(argv: string[], env: NodeJS.ProcessEnv = process.env): numb
     return 2;
   }
   if (args.command === 'status') return printStatus(env);
+  if (args.command === 'start') return startDaemon({ configPath: args.configPath, env });
+  if (args.command === 'stop') return stopDaemon({ configPath: args.configPath, env });
+  if (args.command === 'watch') return runWatch({ configPath: args.configPath, env });
 
   process.stderr.write(`visual-proof ${args.command}: not implemented\n`);
   return 2;
@@ -99,5 +103,9 @@ function printStatus(env: NodeJS.ProcessEnv): number {
 
 const entry = process.argv[1] ? fs.realpathSync(process.argv[1]) : null;
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  process.exitCode = main(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const code = await main(argv);
+  process.exitCode = code;
+  // The foreground watcher owns a browser and sockets; do not let a stray handle keep it alive after shutdown.
+  if (argv.includes('watch')) process.exit(code);
 }
