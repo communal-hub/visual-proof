@@ -4,12 +4,20 @@ Companion to `visual-proof-plan.md`. This file pins down the contracts that mile
 
 ## Deviation from the plan
 
-The plan's Tier 1 trigger is the browser console line `[vite] hot updated: <path>`. Vite 8's client only logs that line for modules already loaded by the open page (`hotModulesMap.get(path)` in `vite/dist/client/client.mjs`), so a single listener page misses changes to other routes. Tier 1 is instead a **Vite HMR websocket client** in Node:
+The plan's Tier 1 trigger is the browser console line `[vite] hot updated: <path>`. Two Vite facts rule that out as the sole trigger:
 
-- Fetch `<viteUrl>/@vite/client`, read the `wsToken` constant from the served JS (`const wsToken = "...";`).
-- Connect to `ws(s)://<vite host>/?token=<token>` with subprotocol `vite-hmr`.
-- `update` payloads carry `updates[].path`/`acceptedPath`; `full-reload` carries an optional `path`. Both arrive after Vite has invalidated the module.
-- Every capture opens a **fresh page** and navigates, so the still cannot show a pre-update render. No Vite plugin, no app config change.
+- Vite 8's client only logs that line for modules already loaded by the open page (`hotModulesMap.get(path)` in `vite/dist/client/client.mjs`), so a listener page misses other routes.
+- The Vite server only sends HMR messages for modules already in its module graph, so a page nobody has loaded since the server started produces no message at all. In that case nothing is cached either, so a fresh navigation cannot be stale.
+
+The A1 design:
+
+- **Trigger:** a file watcher (chokidar) on `screenGlobs` and `backendGlobs`, debounced (150 ms). This is always on.
+- **Freshness barrier:** a **Vite HMR websocket client** in Node. After a screen-file event, wait for the next HMR message (`update` or `full-reload`) or 500 ms, whichever comes first. The message arrives after Vite has invalidated the module; the timeout covers modules not yet in Vite's graph, which have no cached transform.
+  - Fetch `<viteUrl>/@vite/client`, read the token with `/const wsToken = "([^"]+)"/`.
+  - Connect to `ws(s)://<vite host>/?token=<token>` with subprotocol `vite-hmr`. Reconnect with backoff, re-fetching the token (a restarted dev server has a new one).
+- **Capture:** every capture opens a **fresh page** in the warm context and navigates, so the still cannot show a pre-update render. No Vite plugin, no app config change.
+- **Tree stability:** compute the tree hash before and after a capture batch. If it changed mid-batch, discard the batch; the newer change has already queued another.
+- `doctor` reports the trigger as `fs-watch` and the barrier as `vite-hmr` or `timeout-only`.
 
 ## Stack
 
@@ -28,8 +36,8 @@ src/
   paths.ts          status/artifact/scratch dirs
   git.ts            tree hash, HEAD tree, changed files
   trigger/
-    vite-hmr.ts     Tier 1: HMR websocket client
-    fs-watch.ts     Tier 2 + always-on backend globs
+    vite-hmr.ts     freshness barrier: HMR websocket client
+    fs-watch.ts     trigger: screen + backend globs
   resolve/
     import-graph.ts static import graph from route files -> file-to-routes map
     routes.ts       chain: import graph, then config static map, then skip+log
@@ -86,7 +94,7 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 ## Files the daemon writes (status dir)
 
 - `daemon.pid`: pid as text.
-- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, startedAt, trigger: "vite-hmr"|"fs-watch", lastCaptureAt, lastError, frames }`.
+- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", lastCaptureAt, lastError, frames }`.
 - `watcher.log`: one line per event, ISO timestamp first.
 - `doctor.json`: resolved tier per capability.
 - `proof-block.md`: written by `finish`.
