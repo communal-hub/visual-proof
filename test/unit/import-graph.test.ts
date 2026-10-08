@@ -285,3 +285,128 @@ export default routes
     expect(graph.routes.map((r) => r.path)).toEqual(['/']);
   });
 });
+
+describe('buildImportGraph: TypeScript ESM specifiers', () => {
+  it('resolves a missing .js/.mjs specifier to its .ts/.tsx/.mts source', async () => {
+    write(
+      root,
+      'src/router/index.js',
+      `import P from '@/P.vue'\nexport default [{ path: '/p', component: P }]`,
+    );
+    write(
+      root,
+      'src/P.vue',
+      `<script setup lang="ts">
+import { Form } from '@/models/Form.js'
+import Widget from './Widget.js'
+import { m } from './m.mjs'
+import real from './real.js'
+</script>`,
+    );
+    write(root, 'src/models/Form.ts', 'export class Form {}');
+    write(root, 'src/Widget.tsx', 'export default 1');
+    write(root, 'src/m.mts', 'export const m = 1');
+    write(root, 'src/real.js', 'export default 1');
+    write(root, 'src/real.ts', 'export default 2');
+    const graph = await build();
+    expect(graph.unresolved).toEqual([]);
+    expect(routesOf(graph, 'src/models/Form.ts')).toEqual(['/p']);
+    expect(routesOf(graph, 'src/Widget.tsx')).toEqual(['/p']);
+    expect(routesOf(graph, 'src/m.mts')).toEqual(['/p']);
+    // An existing .js file wins over a same-named .ts file.
+    expect(routesOf(graph, 'src/real.js')).toEqual(['/p']);
+    expect(graph.fileToRoutes.has('src/real.ts')).toBe(false);
+  });
+
+  it('still reports a .js specifier with no TypeScript counterpart', async () => {
+    write(root, 'src/router/index.js', `import P from '@/P.vue'\nexport default [{ path: '/p', component: P }]`);
+    write(root, 'src/P.vue', `<script setup>\nimport x from './nope.js'\n</script>`);
+    const graph = await build();
+    expect(graph.unresolved).toEqual(["src/P.vue: cannot resolve import './nope.js'"]);
+  });
+});
+
+describe('buildImportGraph: SFC script extraction', () => {
+  async function importsOf(sfc: string): Promise<string[]> {
+    write(root, 'src/router/index.js', `import P from '@/P.vue'\nexport default [{ path: '/p', component: P }]`);
+    write(root, 'src/P.vue', sfc);
+    write(root, 'src/dep-a.ts', 'export const a = 1');
+    write(root, 'src/dep-b.ts', 'export const b = 1');
+    write(root, 'src/dep-c.ts', 'export const c = 1');
+    const graph = await build();
+    expect(graph.unresolved).toEqual([]);
+    return [...graph.fileToRoutes.keys()].filter((f) => f.startsWith('src/dep-'));
+  }
+
+  it('handles <script setup lang="ts" generic="..."> with ">" inside the attribute', async () => {
+    const deps = await importsOf(`<template>
+  <div>{{ item }}</div>
+</template>
+
+<script setup lang="ts" generic="T extends Model<T>, U = Array<string>">
+import { a } from '@/dep-a'
+defineProps<{ item: T; other?: U }>()
+</script>
+`);
+    expect(deps).toEqual(['src/dep-a.ts']);
+  });
+
+  it('handles template before script, and both a plain and a setup block', async () => {
+    const deps = await importsOf(`<template>
+  <div v-if="a > b">text</div>
+</template>
+<script lang="ts">
+import { a } from '@/dep-a'
+export default { name: 'P' }
+</script>
+<script setup lang="ts">
+import { b } from '@/dep-b'
+</script>
+<style scoped>.x { color: red }</style>`);
+    expect(deps).toEqual(['src/dep-a.ts', 'src/dep-b.ts']);
+  });
+
+  it('handles attributes in any order, with either quote style', async () => {
+    const deps = await importsOf(`<script   lang='ts'
+  setup
+  generic='T extends { id: number }'
+>
+import { a } from '@/dep-a'
+</script>
+<script setup generic="X extends Y<Z>" lang="ts">
+import { b } from '@/dep-b'
+</script>`);
+    expect(deps).toEqual(['src/dep-a.ts', 'src/dep-b.ts']);
+  });
+
+  it('ignores a <script> inside an HTML comment', async () => {
+    const deps = await importsOf(`<!-- <script setup>import { a } from '@/dep-a'</script> -->
+<script setup>
+import { b } from '@/dep-b'
+</script>`);
+    expect(deps).toEqual(['src/dep-b.ts']);
+  });
+
+  it('parses TypeScript syntax in script bodies', async () => {
+    const deps = await importsOf(`<script setup lang="ts">
+import { a } from '@/dep-a'
+import type { B } from '@/dep-b'
+import { c } from '@/dep-c'
+enum Kind { One, Two }
+interface Props<T> { items: T[]; cb?: (x: T) => void }
+const id = <T,>(x: T): T => x
+const n = (document.body as unknown as HTMLElement).id!
+function f<T extends object = {}>(this: Window, x?: T): asserts x is T {}
+const props = defineProps<Props<string>>()
+</script>`);
+    expect(deps).toEqual(['src/dep-a.ts', 'src/dep-c.ts']);
+  });
+
+  it('follows <script src> with unquoted or single-quoted values', async () => {
+    write(root, 'src/router/index.js', `import P from '@/P.vue'\nexport default [{ path: '/p', component: P }]`);
+    write(root, 'src/P.vue', `<script lang=ts src=./logic.ts></script>`);
+    write(root, 'src/logic.ts', 'export {}');
+    const graph = await build();
+    expect(graph.fileToRoutes.get('src/logic.ts')).toEqual(['/p']);
+  });
+});

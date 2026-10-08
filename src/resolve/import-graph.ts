@@ -34,6 +34,14 @@ export interface ImportGraphOptions {
 const PARSEABLE = new Set(['.vue', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.tsx']);
 const RESOLVE_EXTENSIONS = ['.vue', '.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx'];
 
+/** A specifier ending in the key may really point at a source file with one of the values. */
+const TS_EXTENSION_SWAPS: Record<string, string[]> = {
+  '.js': ['.ts', '.tsx'],
+  '.mjs': ['.mts'],
+  '.cjs': ['.cts'],
+  '.jsx': ['.tsx'],
+};
+
 interface ModuleImport {
   specifier: string;
   dynamic: boolean;
@@ -276,6 +284,13 @@ class GraphBuilder {
   private probe(rel: string): string | null {
     const normalized = path.posix.normalize(rel);
     if (this.isFile(normalized)) return normalized;
+    // TypeScript ESM convention: `./Form.js` names the compiled output of `./Form.ts`.
+    const originalExt = path.posix.extname(normalized);
+    const swap = TS_EXTENSION_SWAPS[originalExt];
+    if (swap) {
+      const stem = normalized.slice(0, -originalExt.length);
+      for (const ext of swap) if (this.isFile(stem + ext)) return stem + ext;
+    }
     for (const ext of RESOLVE_EXTENSIONS) {
       if (this.isFile(normalized + ext)) return normalized + ext;
     }
@@ -361,12 +376,43 @@ function lazyBindings(code: string): Map<string, string> {
   return result;
 }
 
-/** Contents of every `<script>` block; `<script src>` becomes a synthetic import. */
+/**
+ * Contents of every top-level `<script>` / `<script setup>` block; `<script src>` becomes a
+ * synthetic import. Scanned sequentially rather than with one regex so that:
+ *  - attribute values may contain `>` (`generic="T extends Model<T>"`),
+ *  - attributes can come in any order and use either quote style,
+ *  - HTML comments (and any `<script` text inside them) are skipped,
+ *  - a `<script>` that follows a large `<template>` is still found.
+ */
 function vueScripts(code: string): string[] {
   const blocks: string[] = [];
-  for (const m of code.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
-    const src = /\bsrc\s*=\s*(['"])(.*?)\1/.exec(m[1]!);
-    blocks.push(src ? `import ${JSON.stringify(src[2])};` : m[2]!);
+  const open = /<!--|<script(?=[\s>/])/g;
+  const tagEnd = /(?:"[^"]*"|'[^']*'|[^>"'])*>/y;
+  let pos = 0;
+  while (pos < code.length) {
+    open.lastIndex = pos;
+    const m = open.exec(code);
+    if (!m) break;
+    if (m[0] === '<!--') {
+      const end = code.indexOf('-->', m.index + 4);
+      pos = end === -1 ? code.length : end + 3;
+      continue;
+    }
+    tagEnd.lastIndex = m.index + m[0].length;
+    const tag = tagEnd.exec(code);
+    if (!tag) break;
+    const attrs = tag[0].slice(0, -1);
+    const bodyStart = tagEnd.lastIndex;
+    const close = /<\/script\s*>/gi;
+    close.lastIndex = bodyStart;
+    const closing = close.exec(code);
+    const bodyEnd = closing ? closing.index : code.length;
+    pos = closing ? closing.index + closing[0].length : code.length;
+
+    if (attrs.endsWith('/')) continue; // self-closing: no body
+    const src = /(?:^|\s)src\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/.exec(attrs);
+    const srcValue = src ? (src[1] ?? src[2] ?? src[3]) : undefined;
+    blocks.push(srcValue ? `import ${JSON.stringify(srcValue)};` : code.slice(bodyStart, bodyEnd));
   }
   return blocks;
 }
