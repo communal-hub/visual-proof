@@ -870,6 +870,25 @@ describe('unmapped screen changes', () => {
     expect(logText()).toContain('no route for src/helpers/orphan.vue: no routes captured this session yet');
   });
 
+  it('finishes computing the tree hash before it reports a batch with nothing to capture (git must not outlive the batch)', async () => {
+    let started = 0;
+    let finished = 0;
+    await start({
+      treeHash: async () => {
+        started++;
+        await new Promise((r) => setTimeout(r, 40));
+        finished++;
+        return tree;
+      },
+    });
+    const before = started;
+    pushBatch({ screen: ['src/helpers/orphan.vue'] });
+    await nextBatch();
+    expect(batches[0]!.outcome).toBe('no-routes');
+    expect(started).toBeGreaterThan(before);
+    expect(finished).toBe(started);
+  });
+
   it('a mapped change in the same batch keeps its own trigger and source file', async () => {
     await start();
     pushBatch({ screen: ['src/pages/Home.vue'] });

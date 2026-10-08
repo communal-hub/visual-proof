@@ -536,6 +536,7 @@ class Watcher {
 
       if (targets.size === 0) {
         this.log('no routes to capture');
+        await beforeP.catch(() => {}); // the tree hash writes into the scratch dir; do not leave git running behind a finished batch
         done('no-routes');
         return;
       }
