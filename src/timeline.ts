@@ -23,6 +23,8 @@ export interface Frame {
    * could not be read (production build, non-Vue app, render check off). Absent on frames from older versions.
    */
   renderedFiles?: string[] | null;
+  /** Where the capture spent its time (ms), to tune `settle`; absent on frames from older versions. */
+  timing?: { settleMs: number; screenshotMs: number };
   /** Path of the PNG relative to the scratch dir. */
   png: string;
 }

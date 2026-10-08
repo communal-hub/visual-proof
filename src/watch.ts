@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import picomatch from 'picomatch';
-import { Browser, type Capturer, type CaptureSignals } from './browser.js';
+import { Browser, type Capturer, type CaptureSignals, type CaptureTiming } from './browser.js';
 import type { Config } from './config.js';
 import { resolveAnchor } from './anchor.js';
 import { headCommit, workingTreeHash } from './git.js';
@@ -517,13 +517,20 @@ class Watcher {
 
       const before = await beforeP;
       mark('resolve');
-      const captured: Array<{ target: Target; at: string; png: Buffer; signals: CaptureSignals; renderedFiles: string[] | null }> = [];
+      const captured: Array<{
+        target: Target;
+        at: string;
+        png: Buffer;
+        signals: CaptureSignals;
+        renderedFiles: string[] | null;
+        timing?: CaptureTiming;
+      }> = [];
       let captureFailed = false;
       for (const target of targets.values()) {
         if (this.stopping) return;
         try {
           const result = await this.capturer!.capture(target.url);
-          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null });
+          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null, timing: result.timing });
         } catch (err) {
           captureFailed = true;
           this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
@@ -551,7 +558,7 @@ class Watcher {
         return;
       }
 
-      for (const { target, at, png, signals, renderedFiles } of captured) {
+      for (const { target, at, png, signals, renderedFiles, timing } of captured) {
         const verdict = triage(signals);
         const frame = this.timeline.append(
           {
@@ -590,6 +597,7 @@ class Watcher {
   }
 
   private async waitBarrier(startedAt: number, files: string[]): Promise<BarrierResult> {
+            ...(timing ? { timing } : {}),
     const timeout = this.opts.barrierTimeoutMs ?? 500;
     if (!this.barrier) {
       await new Promise((r) => setTimeout(r, timeout));
