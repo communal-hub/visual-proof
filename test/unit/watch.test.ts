@@ -84,6 +84,7 @@ let config: Config;
 let capturer: FakeCapturer;
 let barrier: FakeBarrier;
 let pushBatch: (batch: Partial<WatchBatch>) => void;
+let fireEvent: () => void;
 let triggerStopped: boolean;
 let eventCounter: number;
 let handle: WatchHandle | null;
@@ -137,6 +138,7 @@ async function start(overrides: Parameters<typeof startWatch>[1] = {}): Promise<
     startTrigger: async (options: FsWatchOptions) => {
       pushBatch = (batch) =>
         options.onBatch({ screen: [], backend: [], startedAt: Date.now(), ...batch });
+      fireEvent = () => options.onEvent?.();
       return {
         eventCount: () => eventCounter,
         stop: async () => {
@@ -222,6 +224,75 @@ describe('status.json shared with finish', () => {
 
     await handle!.stop();
     expect(statusJson()).toMatchObject({ state: 'stopped', lastFinish });
+  });
+});
+
+async function until(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for condition');
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+describe('pending flag in status.json (what finish waits on)', () => {
+  it('is set at the first file event, before the debounce ends, and cleared only when the batch is fully handled', async () => {
+    await start();
+    expect(statusJson()).toMatchObject({ pending: false, pendingSince: null, lastEventAt: null });
+
+    fireEvent(); // a save: the batch has not even been emitted yet
+    expect(statusJson()).toMatchObject({ pending: true, state: 'ready' });
+    expect(Date.parse(statusJson().pendingSince)).not.toBeNaN();
+    expect(Date.parse(statusJson().lastEventAt)).not.toBeNaN();
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    capturer.onCapture = () => gate;
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await until(() => statusJson().state === 'capturing');
+    expect(statusJson().pending).toBe(true);
+
+    release();
+    await until(() => statusJson().pending === false);
+    expect(statusJson()).toMatchObject({ state: 'ready', pendingSince: null, frames: 1 });
+  });
+
+  it('stays pending across a re-queue and clears after the re-capture', async () => {
+    await start();
+    let captures = 0;
+    const pendingDuring: boolean[] = [];
+    capturer.onCapture = () => {
+      pendingDuring.push(statusJson().pending);
+      if (++captures === 1) tree = 'b'.repeat(40);
+    };
+    fireEvent();
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch(2);
+    await until(() => statusJson().pending === false);
+    expect(pendingDuring).toEqual([true, true]);
+    expect(timeline().list()).toHaveLength(1);
+  });
+
+  it('is cleared when the watcher stops', async () => {
+    await start();
+    fireEvent();
+    await handle!.stop();
+    expect(statusJson()).toMatchObject({ state: 'stopped', pending: false });
+  });
+});
+
+describe('lastError as the reason there is no frame', () => {
+  it('records a refused capture in lastError and clears it after a clean batch', async () => {
+    await start();
+    fs.rmSync(path.join(repo, '.hot'));
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    expect(statusJson().lastError).toBe('stale: freshness marker missing, capture refused');
+
+    fs.writeFileSync(path.join(repo, '.hot'), 'x');
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch(2);
+    expect(statusJson().lastError).toBeNull();
   });
 });
 

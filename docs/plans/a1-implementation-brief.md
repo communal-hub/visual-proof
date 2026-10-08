@@ -95,7 +95,7 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 ## Files the daemon writes (status dir)
 
 - `daemon.pid`: pid as text.
-- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastError, frames }`. `pid` is the watcher process; `anchor` is the `HEAD` commit sha when the watcher started (null outside a repo or with no commits). `finish` adds `lastFinish` to the same file.
+- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastEventAt, pending, pendingSince, lastError, frames }`. `pid` is the watcher process; `anchor` is the `HEAD` commit sha when the watcher started (null outside a repo or with no commits). `pending` is true from the first relevant file event of a change (before the debounce ends) until its batch, including re-queues, is fully handled; `pendingSince` and `lastEventAt` are ISO timestamps (or null). `lastError` is the latest unresolved problem (a refused capture, a failed capture) and is cleared by the next fully captured batch. `finish` adds `lastFinish` to the same file.
 - `watcher.log`: one line per event, ISO timestamp first.
 - `doctor.json`: resolved tier per capability.
 - `proof-block.md`: written by `finish`.
@@ -134,12 +134,13 @@ Capture waits: `load`, then network idle (500 ms, capped at 5 s), `document.font
    - a changed screen file with no route → `no route for <file> (not reachable from routeFiles; add staticRoutes or ignoreScreenGlobs)`
    - a route with unfilled params → `cannot capture <routeKey>: <reason> (add routeParams)`
    - a backend change with no captured route → `backend change (<files>) has no captured route to prove; open a page so the watcher captures it, or add staticRoutes`
-3. For each expected route: the headline is the latest frame with `treeHash == HEAD^{tree}`.
+3. Wait for the daemon. `finish` often runs right after the last save and commit. While a live daemon (pid alive, state not `stopped`/`error`) is `capturing`, has `pending` set, or a change newer than its `lastEventAt` is on disk (changed-file mtime under 2 s) and the working-tree hash differs from the newest frame's tree, poll every 200 ms until every expected route has a frame at `HEAD^{tree}` or the daemon is idle, bounded by the remaining `finishBudgetMs`. If the budget runs out first: failure `capture still in progress after <n> s`. No daemon, or an idle one, means the timeline is final.
+4. For each expected route: the headline is the latest frame with `treeHash == HEAD^{tree}`.
    - No such frame → failure `no frame at HEAD for <route>`.
    - Headline status not `clean` → failure `<route> final frame is <status>`. Never fall back to an earlier clean frame.
-4. Copy headlines to the artifact dir as `<slug>-<shortTree>.png`. Write `proof-block.md` with one `<img>` per route, plus the route, status, and tree hash.
-5. Exit 1 on any failure (proof block still written, failures listed in it). Exit 0 otherwise.
-6. `--hook`: same work, capped at `finishBudgetMs`, never prints to stdout except one summary line, always exits 0, writes failures to `watcher.log` and `status.json`.
+5. Copy headlines to the artifact dir as `<slug>-<shortTree>.png`. Write `proof-block.md` with one `<img>` per route, plus the route, status, and tree hash.
+6. Exit 1 on any failure (proof block still written, failures listed in it). Exit 0 otherwise.
+7. `--hook`: same work, capped at `finishBudgetMs`, never prints to stdout except one summary line, always exits 0, writes failures to `watcher.log` and `status.json`.
 
 ## Known-bad corpus (A1 Done gate)
 

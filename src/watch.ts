@@ -109,6 +109,8 @@ class Watcher {
   private trigger: FsWatchHandle | null = null;
 
   private pending: Pending | null = null;
+  /** True from the first file event of a change until its batch is handed to {@link enqueue}. */
+  private debouncing = false;
   private running: Promise<void> | null = null;
   private stopping = false;
   private stopped: Promise<void> | null = null;
@@ -176,6 +178,7 @@ class Watcher {
         backendGlobs: this.config.backendGlobs,
         ignorePaths: [this.dirs.statusDir, this.dirs.scratchDir, this.dirs.artifactDir],
         debounceMs: this.opts.debounceMs,
+        onEvent: () => this.onFileEvent(),
         onBatch: (batch) => this.enqueue(batch),
         onError: (err) => this.fail(err),
       });
@@ -201,10 +204,12 @@ class Watcher {
   private async doStop(): Promise<void> {
     this.stopping = true;
     this.pending = null;
+    this.debouncing = false;
     await this.trigger?.stop().catch(() => {});
     if (this.running) await Promise.race([this.running, new Promise((r) => setTimeout(r, 3000))]);
     await this.teardown();
     this.status.state = 'stopped';
+    this.refreshPending();
     this.writeStatus();
     this.log('stopped');
   }
@@ -240,10 +245,33 @@ class Watcher {
 
   // ---- batches -------------------------------------------------------------
 
-  private enqueue(batch: WatchBatch): void {
+  /** A relevant file changed: from now until its batch is fully handled, `finish` must not trust the timeline. */
+  private onFileEvent(): void {
     if (this.stopping) return;
+    this.status.lastEventAt = new Date().toISOString();
+    this.debouncing = true;
+    if (this.refreshPending()) this.writeStatus();
+  }
+
+  /** Recompute `pending` / `pendingSince` from the queue; true when `pending` flipped. */
+  private refreshPending(): boolean {
+    const pending = this.debouncing || this.pending !== null || this.running !== null;
+    const flipped = pending !== this.status.pending;
+    if (flipped) this.status.pendingSince = pending ? new Date().toISOString() : null;
+    this.status.pending = pending;
+    return flipped;
+  }
+
+  private enqueue(batch: WatchBatch): void {
+    this.debouncing = false;
+    if (this.stopping) {
+      this.refreshPending();
+      return;
+    }
     this.merge({ screen: batch.screen, backend: batch.backend, startedAt: batch.startedAt, attempts: 0 });
     this.running ??= this.drain();
+    this.refreshPending();
+    this.writeStatus(); // carries the final lastEventAt of this change
   }
 
   private merge(part: { screen: Iterable<string>; backend: Iterable<string>; startedAt: number; attempts: number }): void {
@@ -269,6 +297,8 @@ class Watcher {
       }
     } finally {
       this.running = null;
+      this.refreshPending();
+      this.writeStatus();
     }
   }
 
@@ -282,6 +312,8 @@ class Watcher {
     const marker = this.config.freshnessMarker;
     if (marker && !fs.existsSync(path.resolve(this.config.repoDir, marker))) {
       this.log(STALE_MESSAGE);
+      this.status.lastError = STALE_MESSAGE; // so `finish` can say why there is no frame
+      this.writeStatus();
       this.events.emit('refused', { reason: STALE_MESSAGE, marker, screen, backend });
       done('refused');
       return;
@@ -330,12 +362,14 @@ class Watcher {
       const before = await beforeP;
       mark('resolve');
       const captured: Array<{ target: Target; at: string; png: Buffer; signals: CaptureSignals }> = [];
+      let captureFailed = false;
       for (const target of targets.values()) {
         if (this.stopping) return;
         try {
           const result = await this.capturer!.capture(target.url);
           captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals });
         } catch (err) {
+          captureFailed = true;
           this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
         }
       }
@@ -386,6 +420,7 @@ class Watcher {
         this.events.emit('frame', { frame, signals, pngPath: this.timeline.pngPath(frame) } satisfies FrameEvent);
       }
       mark('write');
+      if (!captureFailed && captured.length > 0) this.status.lastError = null; // the last problem is resolved
       this.log(`timing ${JSON.stringify(lap)} (ms since batch start; the debounce before it is not included)`);
       done('captured', [...targets.keys()]);
     } catch (err) {

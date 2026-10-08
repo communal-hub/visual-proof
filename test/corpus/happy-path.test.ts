@@ -47,3 +47,16 @@ it('happy path: edit, clean frame, commit, finish exits 0 with a valid proof blo
   expect(result).toMatchObject({ ok: true, failures: [], treeHash: tree });
   expect(result.routes.map((r) => r.route)).toEqual([DETAIL_ROUTE]);
 });
+
+it('save, commit and finish back to back: finish waits for the in-flight capture instead of failing with "no frame at HEAD"', async () => {
+  h.edit(DETAIL, setHeading('Invoice (race)'));
+  const tree = h.commitAll('race'); // no waitForFrame: the watcher is still debouncing / capturing
+
+  const t0 = Date.now();
+  const result = await h.finish();
+  expect(result.failures).toEqual([]);
+  expect(result.ok).toBe(true);
+  expect(result.routes.map((r) => [r.route, r.status])).toEqual([[DETAIL_ROUTE, 'clean']]);
+  expect(h.timeline().latestAtTree(DETAIL_ROUTE, tree)).toBeDefined();
+  expect(Date.now() - t0).toBeLessThan(20_000);
+});

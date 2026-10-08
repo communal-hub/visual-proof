@@ -1,12 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
-import { changeSet, headTree } from './git.js';
+import { changeSet, headTree, workingTreeHash } from './git.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
-import { readStatusFile } from './status.js';
+import { readStatusFile, watcherPid, type Status } from './status.js';
 import { Timeline } from './timeline.js';
 import type { FrameStatus } from './triage.js';
 
@@ -18,6 +18,8 @@ export interface FinishOptions {
   budgetMs?: number;
   now?: () => number;
   buildGraph?: (config: Config) => Promise<ImportGraph>;
+  /** How often to re-check a daemon that is still capturing. Default 200 ms. */
+  pollMs?: number;
 }
 
 /** One expected route and what `finish` found for it. */
@@ -219,6 +221,20 @@ async function collect(
 
   const list = [...expected.values()];
   state.expectedCount = list.length;
+  await waitForDaemon({
+    config,
+    dirs,
+    tree,
+    list,
+    timeline,
+    changed,
+    state,
+    deadline,
+    budgetMs: opts.budgetMs ?? config.finishBudgetMs,
+    now,
+    pollMs: opts.pollMs ?? 200,
+  });
+  if (state.closed) return;
   const shortTree = tree.slice(0, SHORT_TREE);
   const used = new Set<string>();
   for (const route of list) {
@@ -254,6 +270,84 @@ async function collect(
       const why = frame.reasons.length > 0 ? `: ${frame.reasons.join('; ')}` : '';
       state.failures.push(`${route.route} final frame is ${frame.status}${why}`);
     }
+  }
+}
+
+interface WaitContext {
+  config: Config;
+  dirs: Dirs;
+  tree: string;
+  list: RouteProof[];
+  timeline: Timeline;
+  /** Changed files (config-relative), whose mtimes show edits the daemon may not have heard about yet. */
+  changed: string[];
+  state: State;
+  deadline: number;
+  budgetMs: number;
+  now: () => number;
+  pollMs: number;
+}
+
+/** A save this recent may still be on its way through the watcher's debounce, barrier and capture. */
+const RECENT_EVENT_MS = 2000;
+
+/**
+ * `finish` can run right after the last save and commit, while the watcher is still debouncing,
+ * waiting on the HMR barrier or capturing. Reading the timeline then would report "no frame at HEAD"
+ * for a frame that is a second away. So while a live daemon is busy (capturing, a batch pending, or
+ * a change newer than the last frame it heard about), poll until every expected route has a frame at
+ * HEAD's tree or the daemon goes idle, within the finish budget. An idle daemon, or none, means the
+ * timeline is final.
+ */
+async function waitForDaemon(ctx: WaitContext): Promise<void> {
+  const { config, dirs, tree, list, timeline, state } = ctx;
+  const statusFile = statusFiles(dirs).status;
+  // Stop a little before the overall budget so the specific failure below wins over "truncated".
+  const waitUntil = ctx.deadline - Math.min(500, ctx.budgetMs * 0.2);
+  const startedAt = ctx.now();
+
+  for (;;) {
+    if (state.closed) return;
+    if (list.every((route) => timeline.latestAtTree(route.route, tree))) return;
+    const status = readStatusFile(statusFile);
+    if (!status || status.state === 'stopped' || status.state === 'error' || watcherPid(dirs, status) === null) return;
+    if (!(await daemonBusy(config, dirs, ctx.changed, status, timeline))) return;
+    if (ctx.now() >= waitUntil) {
+      const seconds = ((ctx.now() - startedAt) / 1000).toFixed(1);
+      state.failures.push(`capture still in progress after ${seconds} s`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, ctx.pollMs));
+  }
+}
+
+async function daemonBusy(
+  config: Config,
+  dirs: Dirs,
+  changed: string[],
+  status: Partial<Status>,
+  timeline: Timeline,
+): Promise<boolean> {
+  if (status.state === 'capturing' || status.pending === true) return true;
+
+  const lastEventAt = status.lastEventAt ? Date.parse(status.lastEventAt) : NaN;
+  const recentEvent = Number.isFinite(lastEventAt) && Date.now() - lastEventAt < RECENT_EVENT_MS;
+  const unheard = changed.some((file) => {
+    try {
+      const mtime = fs.statSync(path.join(config.repoDir, file)).mtimeMs;
+      return Date.now() - mtime < RECENT_EVENT_MS && !(mtime <= lastEventAt);
+    } catch {
+      return false; // deleted or unreadable: nothing to hear about
+    }
+  });
+  if (!recentEvent && !unheard) return false;
+
+  // Recent activity only matters while the working tree has moved past what was last captured.
+  const newest = timeline.list().at(-1);
+  try {
+    return (await workingTreeHash(config.repoDir, dirs.scratchDir)) !== newest?.treeHash;
+  } catch {
+    return false;
   }
 }
 

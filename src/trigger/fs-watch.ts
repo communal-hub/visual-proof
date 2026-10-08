@@ -33,6 +33,8 @@ export interface FsWatchOptions {
    * missed, more under CPU load; 25 ms was enough in 120 trials). Default 100 ms.
    */
   settleMs?: number;
+  /** Called for every relevant file event, before debouncing; lets the owner mark work as pending right away. */
+  onEvent?: () => void;
   onBatch: (batch: WatchBatch) => void;
   onError?: (error: Error) => void;
 }
@@ -117,6 +119,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
     const b = isBackend(rel);
     if (!s && !b) return;
     eventCount++;
+    options.onEvent?.();
     if (screen.size === 0 && backend.size === 0) startedAt = Date.now();
     if (s) screen.add(rel);
     if (b) backend.add(rel);

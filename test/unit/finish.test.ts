@@ -369,6 +369,81 @@ describe('runFinish', () => {
   });
 });
 
+describe('runFinish while the daemon is still working', () => {
+  const writeStatus = (extra: Record<string, unknown>): void => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dirs.statusDir, 'status.json'),
+      JSON.stringify({ state: 'ready', sessionId: 's-test', pid: process.pid, pending: false, lastEventAt: null, ...extra }),
+    );
+  };
+  const quick = (opts: Parameters<typeof runFinish>[1] = {}) => finish({ pollMs: 15, ...opts });
+
+  const age = (): void => {
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(path.join(repo, 'src/pages/A.vue'), old, old);
+  };
+
+  beforeEach(() => {
+    editAndCommit('src/pages/A.vue');
+  });
+
+  it('waits for a capturing daemon and passes once the frame at HEAD appears', async () => {
+    writeStatus({ state: 'capturing', pending: true });
+    setTimeout(() => void frame('/a'), 300);
+    const t0 = Date.now();
+    const result = await quick({ budgetMs: 5000 });
+    expect(result).toMatchObject({ ok: true, failures: [] });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+  });
+
+  it('waits on a pending batch even when the state is ready, and stops waiting once the daemon is idle', async () => {
+    age();
+    writeStatus({ pending: true });
+    setTimeout(() => writeStatus({ pending: false }), 300); // idle, and still no frame for /a
+    const t0 = Date.now();
+    const result = await quick({ budgetMs: 5000 });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(result.failures).toEqual(['no frame at HEAD for /a']);
+  });
+
+  it('gives up with "capture still in progress" inside the budget instead of a bare truncation', async () => {
+    writeStatus({ state: 'capturing', pending: true });
+    const result = await quick({ budgetMs: 700 });
+    expect(result.truncated).toBe(false);
+    expect(result.failures).toHaveLength(2);
+    expect(result.failures[0]).toMatch(/^capture still in progress after \d+\.\d s$/);
+    expect(result.failures[1]).toBe('no frame at HEAD for /a');
+  });
+
+  it('does not wait for an idle daemon, a stopped one, or a pid that no longer exists', async () => {
+    age();
+    for (const status of [{}, { state: 'stopped', pending: true }, { state: 'capturing', pending: true, pid: 2_000_000_000 }]) {
+      writeStatus(status);
+      const t0 = Date.now();
+      expect((await quick({ budgetMs: 5000 })).failures).toEqual(['no frame at HEAD for /a']);
+      expect(Date.now() - t0).toBeLessThan(1500);
+    }
+  });
+
+  it('waits for a save the daemon has not heard about yet (file newer than its last event) while the tree is ahead of the last frame', async () => {
+    writeStatus({ lastEventAt: new Date(Date.now() - 60_000).toISOString() });
+    setTimeout(() => void frame('/a'), 300);
+    const t0 = Date.now();
+    expect((await quick({ budgetMs: 5000 })).ok).toBe(true);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+  });
+
+  it('does not wait on a recent event when HEAD is already what the daemon last captured', async () => {
+    writeStatus({ lastEventAt: new Date(Date.now() - 500).toISOString() });
+    await frame('/c'); // newest frame is at HEAD's tree, so there is nothing in flight for the working tree
+    const t0 = Date.now();
+    expect((await quick({ budgetMs: 5000 })).failures).toEqual(['no frame at HEAD for /a']);
+    expect(Date.now() - t0).toBeLessThan(1500);
+  });
+});
+
 describe('runFinish when working directly on the base branch', () => {
   beforeEach(() => {
     git(repo, 'checkout', '-q', 'main'); // base...HEAD is empty here whatever gets committed
