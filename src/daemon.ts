@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CONFIG_FILE_NAME, ConfigError, loadConfig, type Config } from './config.js';
+import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { startWatch, type Status } from './watch.js';
 
@@ -78,7 +78,6 @@ function loadContextConfig(ctx: DaemonContext): { config: Config; configPath: st
   try {
     return { config: loadConfig({ configPath, cwd, env: ctx.env }), configPath };
   } catch (err) {
-    if (err instanceof ConfigError) return { error: oneLine(err) };
     return { error: oneLine(err) };
   }
 }
