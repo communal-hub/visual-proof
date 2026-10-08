@@ -56,6 +56,7 @@ Only `appUrl` is required.
 | `srcRoots`, `aliases` | `["src"]`, `{ "@": "src" }` | how imports resolve |
 | `staticRoutes` | `{}` | file to routes, for screens the graph cannot reach |
 | `routeParams` | `{}` | concrete URL for a parametrised route |
+| `routeParamsFile` | none | JSON file of route params the app writes at runtime (e.g. a seeder), relative to the config dir; see below |
 | `screenGlobs` | `src/**/*.vue` | files whose changes trigger a capture |
 | `ignoreScreenGlobs` | `[]` | files that match `screenGlobs` but are not screens |
 | `backendGlobs` | `[]` | backend files; a change re-captures routes already captured this session |
@@ -65,6 +66,30 @@ Only `appUrl` is required.
 | `maxFrames` | `200` | oldest frames are evicted beyond this |
 | `finishBudgetMs` | `25000` | how long `finish` waits for in-flight captures |
 | `baseRef` | `main` | branch that `finish` diffs against |
+
+### Route params from a seed file
+
+When the ids of a parametrised route only exist after the app seeds its data, point
+`routeParamsFile` at a JSON file the seeder writes. Either shape works:
+
+```json
+{ "routes": { "/manage/invoices/:id": "/manage/invoices/42" } }
+```
+
+```json
+{ "/manage/invoices/:id": "/manage/invoices/42" }
+```
+
+- Entries from the file override `routeParams` for the same key; other keys merge.
+- The file is re-read whenever params are needed (watch batches, `finish`, `doctor`), so a
+  file written after the watcher started is picked up without a restart.
+- A missing file counts as empty (`doctor` warns `routeParamsFile not found: <path>`).
+  Invalid JSON or a wrong shape is an error in `doctor`, a one-line warning in
+  `watcher.log`, and a note in the `finish` proof block; `routeParams` from the config
+  still apply.
+- Values must be strings starting with `/`; others are ignored with a warning.
+- `doctor` reports the `params` capability as `seed-file`, `config`, or `none`. It is
+  never required.
 
 Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `VISUAL_PROOF_SCRATCH_DIR`,
