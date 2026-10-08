@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ConfigError, DEFAULT_HIDE_SELECTORS, loadConfig, parseConfig } from '../../src/config.js';
+import { ConfigError, DEFAULT_BLOCK_HOSTS, DEFAULT_HIDE_SELECTORS, loadConfig, parseConfig } from '../../src/config.js';
 import { tmpDir, write } from './helpers.js';
 
 const dirs: string[] = [];
@@ -225,6 +225,65 @@ describe('capture-quality fields (v0.3)', () => {
   it('reads renderCheck and rejects anything else', () => {
     for (const mode of ['fail', 'warn', 'off']) expect(parse({ renderCheck: mode }).renderCheck).toBe(mode);
     expect(() => parse({ renderCheck: 'maybe' })).toThrow('"renderCheck" must be "fail", "warn" or "off", got "maybe"');
+  });
+
+  describe('flake controls and settle (v0.4)', () => {
+    it('defaults: no fixed time, no masks, the tracker block list, 250 ms idle (capped at 5 s)', () => {
+      const config = parse({});
+      expect(config.fixedTime).toBeUndefined();
+      expect(config.maskSelectors).toEqual([]);
+      expect(config.blockHosts).toEqual([...DEFAULT_BLOCK_HOSTS]);
+      expect(config.allowHosts).toEqual([]);
+      expect(config.settle).toEqual({ networkIdleMs: 250, maxWaitMs: 5000 });
+    });
+
+    it('keeps the default block list to analytics and trackers: no payments, maps or fonts', () => {
+      expect([...DEFAULT_BLOCK_HOSTS]).toEqual([
+        '*.google-analytics.com',
+        '*.googletagmanager.com',
+        '*.posthog.com',
+        '*.segment.io',
+        '*.hotjar.com',
+        '*.intercom.io',
+        '*.sentry.io',
+      ]);
+    });
+
+    it('reads fixedTime, maskSelectors, blockHosts, allowHosts and settle', () => {
+      const config = parse({
+        fixedTime: '2026-01-15T09:00:00Z',
+        maskSelectors: ['[data-test=clock]', 'text=Updated'],
+        blockHosts: ['*.ads.example'],
+        allowHosts: ['js.ads.example'],
+        settle: { networkIdleMs: 300 },
+      });
+      expect(config).toMatchObject({
+        fixedTime: '2026-01-15T09:00:00Z',
+        maskSelectors: ['[data-test=clock]', 'text=Updated'],
+        blockHosts: ['*.ads.example'],
+        allowHosts: ['js.ads.example'],
+        settle: { networkIdleMs: 300, maxWaitMs: 5000 },
+      });
+    });
+
+    it('a configured blockHosts replaces the defaults, and [] turns blocking off', () => {
+      expect(parse({ blockHosts: [] }).blockHosts).toEqual([]);
+      expect(parse({ blockHosts: ['x.test'] }).blockHosts).toEqual(['x.test']);
+    });
+
+    it.each([
+      [{ fixedTime: 'yesterday' }, /"fixedTime" must be an ISO 8601 timestamp/],
+      [{ fixedTime: '2026-13-45' }, /"fixedTime" must be an ISO 8601 timestamp/],
+      [{ blockHosts: ['https://x.test'] }, /"blockHosts" entries must be hostname globs/],
+      [{ allowHosts: ['x.test/path'] }, /"allowHosts" entries must be hostname globs/],
+      [{ blockHosts: ['x.test:8080'] }, /"blockHosts" entries must be hostname globs/],
+      [{ settle: { networkIdleMs: 0 } }, /"settle.networkIdleMs" must be a positive integer/],
+      [{ settle: { maxWaitMs: 'long' } }, /"settle.maxWaitMs" must be a positive integer/],
+      [{ settle: 5 }, /"settle" must be an object/],
+      [{ maskSelectors: 'h1' }, /"maskSelectors" must be an array of strings/],
+    ])('rejects %j', (value, message) => {
+      expect(() => parse(value)).toThrow(message);
+    });
   });
 
   it('rejects wrong types', () => {
