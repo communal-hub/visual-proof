@@ -66,7 +66,7 @@ describe('main', () => {
     expect(err).toContain('Usage:');
   });
 
-  it.each(['finish', 'doctor'])('%s is not implemented yet and exits 2', async (command) => {
+  it.each(['doctor'])('%s is not implemented yet and exits 2', async (command) => {
     expect(await main([command], {})).toBe(2);
     expect(err).toContain(`${command}: not implemented`);
   });
