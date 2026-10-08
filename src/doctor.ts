@@ -9,11 +9,12 @@ import { EXIT } from './exit.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
+import { loadRouteParams } from './resolve/route-params.js';
 import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
 
-export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes';
+export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params';
 /** `ok`: working at its best tier. `warn`: working at a fallback tier. `missing`: not working. `skipped`: not probed. */
 export type CapabilityStatus = 'ok' | 'warn' | 'missing' | 'skipped';
 
@@ -65,6 +66,7 @@ export const CAPABILITY_ORDER: CapabilityName[] = [
   'freshness',
   'login',
   'routes',
+  'params',
 ];
 
 const BROWSER_MS = 8000;
@@ -101,6 +103,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   caps.freshness = cfg ? checkFreshness(cfg) : skipped('config is invalid');
   caps.login = login;
   caps.routes = routes;
+  caps.params = cfg ? checkParams(cfg) : skipped('config is invalid');
 
   const ordered = {} as Record<CapabilityName, Capability>;
   for (const name of CAPABILITY_ORDER) ordered[name] = caps[name];
@@ -220,6 +223,35 @@ async function checkRoutes(config: Config, probes: Probes, timeoutMs: number): P
     return { tier: 'static-map', status: 'warn', required: false, detail: `${staticFiles} file(s) mapped in staticRoutes (${failure})` };
   }
   return { tier: 'none', status: 'warn', required: false, detail: `${failure}; no staticRoutes either, so no file maps to a route` };
+}
+
+/** Where route params come from: the seed file, else the config, else nowhere. Informational, never required. */
+function checkParams(config: Config): Capability {
+  const seed = loadRouteParams(config);
+  const configCount = Object.keys(config.routeParams).length;
+  const fallback = (): Capability =>
+    configCount > 0
+      ? { tier: 'config', status: 'ok', required: false, detail: `${configCount} ${entries(configCount)}` }
+      : { tier: 'none', status: 'ok', required: false, detail: 'no routeParams; param routes cannot be captured' };
+
+  if (!seed.file) return fallback();
+  if (seed.missing) {
+    const base = fallback();
+    return { ...base, status: 'warn', detail: `routeParamsFile not found: ${seed.file}; using ${configCount} ${entries(configCount)} from config` };
+  }
+  if (seed.error) {
+    return { tier: 'invalid', status: 'missing', required: false, detail: `${seed.error}; using ${configCount} ${entries(configCount)} from config` };
+  }
+  const detail = `${seed.fileEntries} ${entries(seed.fileEntries)} from ${config.routeParamsFile}`;
+  if (seed.warnings.length > 0) {
+    const more = seed.warnings.length > 1 ? ` (+${seed.warnings.length - 1} more)` : '';
+    return { tier: 'seed-file', status: 'warn', required: false, detail: `${detail}; ${seed.warnings[0]}${more}` };
+  }
+  return { tier: 'seed-file', status: 'ok', required: false, detail };
+}
+
+function entries(n: number): string {
+  return n === 1 ? 'entry' : 'entries';
 }
 
 // ---- probes -----------------------------------------------------------------

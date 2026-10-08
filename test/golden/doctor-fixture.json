@@ -49,6 +49,12 @@
       "status": "ok",
       "required": false,
       "detail": "7 route(s), 9 file(s) mapped, 0 unresolved"
+    },
+    "params": {
+      "tier": "config",
+      "status": "ok",
+      "required": false,
+      "detail": "1 entry"
     }
   }
 }
