@@ -9,6 +9,7 @@ import { resolveAnchor } from './anchor.js';
 import { headCommit, workingTreeHash } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
+import { ParamSourceResolver, type SourceOutcome } from './resolve/param-sources.js';
 import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
 import { Timeline, type Frame, type Trigger } from './timeline.js';
@@ -105,6 +106,8 @@ class Watcher {
   private readonly timeline: Timeline;
   private readonly status: Status;
   private readonly isRouteFile: (file: string) => boolean;
+  /** Route params from list endpoints (the third tier); fetches through the capturer's logged-in context. */
+  private readonly paramSources: ParamSourceResolver;
 
   private capturer: Capturer | null = null;
   private barrier: BarrierSource | null = null;
@@ -135,6 +138,10 @@ class Watcher {
     this.sessionId = opts.sessionId ?? `s-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
     this.timeline = new Timeline(this.dirs.scratchDir, config.maxFrames);
     this.isRouteFile = picomatch(config.routeFiles, { dot: true });
+    this.paramSources = new ParamSourceResolver(config.paramSources, async (urlPath) => {
+      if (!this.capturer?.getJson) throw new Error('this capturer cannot fetch JSON');
+      return this.capturer.getJson(urlPath);
+    });
     this.status = {
       state: 'starting',
       sessionId: this.sessionId,
@@ -307,24 +314,31 @@ class Watcher {
   private async warmupTargets(): Promise<Array<{ path: string; url: string }>> {
     const params = this.readRouteParams();
     const paths: string[] = [];
-    const add = (key: string): void => {
+    const add = async (key: string): Promise<void> => {
       const concrete = concretePath(key, params);
-      if (!concrete.ok) {
-        this.log(`warmup: skipped ${key}: ${concrete.reason}`);
-      } else if (!paths.includes(concrete.path)) {
-        paths.push(concrete.path);
+      let path: string | null = concrete.ok ? concrete.path : null;
+      let reason = concrete.ok ? '' : concrete.reason;
+      if (!concrete.ok && this.paramSources.has(key)) {
+        const outcome = await this.fromSource(key);
+        if (outcome.ok) path = outcome.path;
+        else reason = outcome.reason;
+      }
+      if (path === null) {
+        this.log(`warmup: skipped ${key}: ${reason}`);
+      } else if (!paths.includes(path)) {
+        paths.push(path);
       }
     };
 
     const configured = this.config.warmupRoutes;
     if (configured !== undefined) {
-      for (const key of configured) add(key);
+      for (const key of configured) await add(key);
     } else {
       try {
         const graph = await this.getGraph();
         for (const route of graph.routes) {
           if (concretePath(route.path, params).ok) {
-            add(route.path);
+            await add(route.path);
             break;
           }
         }
@@ -477,6 +491,8 @@ class Watcher {
       const targets = new Map<string, Target>();
       // Routes captured earlier this session are re-captured when the change cannot be traced to a route.
       let recapture: { trigger: Trigger; why: string; sourceFile: string } | null = null;
+      // The data behind the list endpoints may have changed (a re-seed): look the ids up again.
+      if (backend.length > 0) this.paramSources.invalidate();
       if (screen.length > 0) {
         const [barrier, resolution] = await Promise.all([
           this.waitBarrier(batch.startedAt, screen),
@@ -499,8 +515,17 @@ class Watcher {
         for (const [capturedPath, route] of this.sessionRoutes) {
           // Re-resolve: a re-run seeder may have moved a param route to a new id since it was captured.
           const concrete = concretePath(route.routeKey, params);
-          const routePath = concrete.ok ? concrete.path : capturedPath;
-          const url = concrete.ok ? joinUrl(this.config.appUrl, routePath) : route.url;
+          let routePath = concrete.ok ? concrete.path : capturedPath;
+          let url = concrete.ok ? joinUrl(this.config.appUrl, routePath) : route.url;
+          if (!concrete.ok && this.paramSources.has(route.routeKey)) {
+            const outcome = await this.fromSource(route.routeKey);
+            if (!outcome.ok) {
+              this.log(`skipped route ${route.routeKey}: ${outcome.reason}`);
+              continue;
+            }
+            routePath = outcome.path;
+            url = joinUrl(this.config.appUrl, routePath);
+          }
           if (!targets.has(routePath)) {
             targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: recapture.trigger, sourceFile: recapture.sourceFile });
           }
@@ -572,6 +597,7 @@ class Watcher {
             status: verdict.status,
             reasons: verdict.reasons,
             renderedFiles,
+            ...(timing ? { timing } : {}),
           },
           png,
         );
@@ -597,7 +623,6 @@ class Watcher {
   }
 
   private async waitBarrier(startedAt: number, files: string[]): Promise<BarrierResult> {
-            ...(timing ? { timing } : {}),
     const timeout = this.opts.barrierTimeoutMs ?? 500;
     if (!this.barrier) {
       await new Promise((r) => setTimeout(r, timeout));
@@ -643,14 +668,51 @@ class Watcher {
     const resolution = resolveRoutes(files, graph, { ...this.config, routeParams: params });
     for (const file of resolution.unmapped) this.log(`no route for ${file}`);
     for (const skip of resolution.skipped) this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
-    const targets = resolution.routes.map((r) => ({
+    const targets: Target[] = resolution.routes.map((r) => ({
       path: r.path,
       routeKey: r.routeKey,
       url: r.url,
       trigger: 'screen' as const,
       sourceFile: r.sourceFiles[0],
     }));
+    for (const skip of resolution.skipped) {
+      if (!this.paramSources.has(skip.routeKey)) {
+        this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
+        continue;
+      }
+      // Neither routeParams nor the seed file has it: ask the list endpoint.
+      const outcome = await this.fromSource(skip.routeKey);
+      if (!outcome.ok) {
+        this.log(`skipped route ${skip.routeKey}: ${outcome.reason}`);
+        continue;
+      }
+      targets.push({
+        path: outcome.path,
+        routeKey: skip.routeKey,
+        url: joinUrl(this.config.appUrl, outcome.path),
+        trigger: 'screen',
+        sourceFile: skip.sourceFiles[0],
+      });
+    }
     return { targets, unmapped: resolution.unmapped };
+  }
+
+  /** Fill a route key from its `paramSources` entry and record the outcome in `status.json` for `finish`. */
+  private async fromSource(routeKey: string): Promise<SourceOutcome> {
+    const outcome = await this.paramSources.resolve(routeKey);
+    const sources = (this.status.paramSources ??= {});
+    const before = sources[routeKey];
+    if (outcome.ok) {
+      if (before?.path !== outcome.path || before.error !== undefined) {
+        this.log(`param source ${this.config.paramSources[routeKey]!.url}: ${routeKey} -> ${outcome.path}`);
+      }
+      sources[routeKey] = { path: outcome.path, at: new Date().toISOString() };
+    } else {
+      if (before?.error !== outcome.reason) this.log(`warning: ${outcome.reason} (route ${routeKey})`);
+      sources[routeKey] = { ...(before?.path !== undefined ? { path: before.path } : {}), error: outcome.reason, at: new Date().toISOString() };
+    }
+    this.writeStatus();
+    return outcome;
   }
 
   private getGraph(): Promise<ImportGraph> {

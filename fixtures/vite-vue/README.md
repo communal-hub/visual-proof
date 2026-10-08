@@ -10,3 +10,4 @@ Tiny Vite + Vue 3 + vue-router app used as the target for visual-proof integrati
 - `src/pages/Long.vue` + `src/layouts/ScrollLayout.vue` (`/long`): the document never scrolls, an inner container does (full-page capture tests; a green bottom marker, a sticky header). `index.html` holds a fake `#__vue-devtools-container__` pill (hide-selector tests).
 - `src/pages/Flagged.vue` (`/flagged`) mounts `src/components/FlaggedDetails.vue` only when `server/data.json` `flags.showDetails` is true, served by `/api/flags` (render-check tests).
 - `VP_FIXTURE_CACHE_DIR` gives the dev server its own dependency cache (cold-start tests).
+- `visual-proof.param-sources.config.json`: variant of the config with no `routeParams` and a `paramSources` entry that fills `/manage/invoices/:id` from `GET /api/invoices` (`0.id`); tests start from it with `createHarness({ configFile })`.

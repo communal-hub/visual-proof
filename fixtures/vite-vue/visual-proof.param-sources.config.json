@@ -1,0 +1,38 @@
+{
+  "appUrl": "http://localhost:5173",
+  "viteUrl": "http://localhost:5173",
+  "freshnessMarker": ".visual-proof/hot",
+  "routeFiles": [
+    "src/router/**/*.js"
+  ],
+  "srcRoots": [
+    "src"
+  ],
+  "aliases": {
+    "@": "src"
+  },
+  "screenGlobs": [
+    "src/**"
+  ],
+  "backendGlobs": [
+    "server/**"
+  ],
+  "login": {
+    "type": "http-hook",
+    "url": "/__playwright__/login",
+    "email": "admin@example.test",
+    "tokenHeader": "X-Visual-Proof-Token",
+    "tokenFile": ".visual-proof/token"
+  },
+  "appRoot": "#app",
+  "spinnerSelectors": [
+    ".spinner"
+  ],
+  "baseRef": "main",
+  "paramSources": {
+    "/manage/invoices/:id": {
+      "url": "/api/invoices",
+      "pick": "0.id"
+    }
+  }
+}

@@ -252,6 +252,73 @@ describe('runFinish', () => {
     expect(result.routes.map((r) => r.route)).toEqual(['/a']);
   });
 
+  describe('routes filled from a paramSources list endpoint', () => {
+    const sources = { '/b/:id': { url: '/api/b', pick: '0.id' } };
+    const writeStatus = (extra: Record<string, unknown>): void => {
+      fs.mkdirSync(dirs.statusDir, { recursive: true });
+      fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'stopped', sessionId: 's-test', ...extra }));
+    };
+
+    it('expects the frame the watcher took, whatever id the endpoint gave, and reports its concrete route', async () => {
+      configure({ routeParams: {}, paramSources: sources });
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/77', 'clean', { routeKey: '/b/:id' });
+      const result = await finish();
+      expect(result).toMatchObject({ ok: true, failures: [] });
+      expect(result.routes.map((r) => [r.routeKey, r.route, r.status])).toEqual([['/b/:id', '/b/77', 'clean']]);
+      expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain('/b/77');
+    });
+
+    it('fails with "cannot capture" plus the source error when the watcher could not resolve it', async () => {
+      configure({ routeParams: {}, paramSources: sources });
+      writeStatus({ paramSources: { '/b/:id': { error: 'paramSources /api/b failed: HTTP 500', at: new Date().toISOString() } } });
+      editAndCommit('src/pages/B.vue');
+      const result = await finish();
+      expect(result.ok).toBe(false);
+      expect(result.failures).toEqual(['cannot capture /b/:id: paramSources /api/b failed: HTTP 500 (add routeParams)']);
+    });
+
+    it('with no recorded error and no frame it is the ordinary "no frame at HEAD"', async () => {
+      configure({ routeParams: {}, paramSources: sources });
+      editAndCommit('src/pages/B.vue');
+      expect((await finish()).failures).toEqual(['no frame at HEAD for /b/:id']);
+    });
+
+    it('a frame at HEAD wins over an error recorded by a later failed lookup', async () => {
+      configure({ routeParams: {}, paramSources: sources });
+      writeStatus({ paramSources: { '/b/:id': { path: '/b/4', error: 'paramSources /api/b failed: HTTP 503', at: new Date().toISOString() } } });
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/4', 'clean', { routeKey: '/b/:id' });
+      expect(await finish()).toMatchObject({ ok: true, failures: [] });
+    });
+
+    it('does not use a source for a route that has routeParams: those win', async () => {
+      configure({ routeParams: { '/b/:id': '/b/1' }, paramSources: sources });
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/1', 'clean', { routeKey: '/b/:id' });
+      const result = await finish();
+      expect(result.routes.map((r) => r.route)).toEqual(['/b/1']);
+      expect(result.ok).toBe(true);
+    });
+
+    it('a backend change re-adds a captured source route by its key, so a moved id still counts', async () => {
+      configure({ routeParams: {}, paramSources: sources });
+      await frame('/b/1', 'clean', { routeKey: '/b/:id', tree: 'a'.repeat(40) });
+      editAndCommit('server/data.json', '{"v":2}\n');
+      await frame('/b/2', 'clean', { routeKey: '/b/:id', trigger: 'backend' });
+      const result = await finish();
+      expect(result).toMatchObject({ ok: true, failures: [] });
+      expect(result.routes.map((r) => [r.route, r.via])).toEqual([['/b/2', 'backend']]);
+    });
+
+    it('still fails a captured param route that has no source when a backend file changed', async () => {
+      configure({ routeParams: {}, paramSources: {} });
+      await frame('/b/1', 'clean', { routeKey: '/b/:id', tree: 'a'.repeat(40) });
+      editAndCommit('server/data.json', '{"v":2}\n');
+      expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: no routeParams entry/);
+    });
+  });
+
   it('resolves a param route from routeParamsFile, which overrides config routeParams', async () => {
     configure({ routeParams: { '/b/:id': '/b/1' }, routeParamsFile: '.visual-proof/params.json' });
     write(repo, '.visual-proof/params.json', JSON.stringify({ routes: { '/b/:id': '/b/42' } }));

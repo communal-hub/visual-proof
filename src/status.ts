@@ -25,6 +25,15 @@ export interface WarmupStatus {
   routes: WarmupRouteStatus[];
 }
 
+/** What the last attempt to fill a route key from `paramSources` produced. */
+export interface ParamSourceStatus {
+  /** The concrete path it resolved to (kept after a later failure, which sets `error` too). */
+  path?: string;
+  /** Why the latest attempt failed; absent after a success. */
+  error?: string;
+  at: string;
+}
+
 /** What the watcher keeps in `status.json`. `finish` adds `lastFinish` to the same file. */
 export interface Status {
   state: DaemonState;
@@ -46,6 +55,8 @@ export interface Status {
   frames: number;
   /** Absent until the watcher reaches the warm-up step; `state` stays `starting` until it is finished. */
   warmup?: WarmupStatus;
+  /** Per route key with a `paramSources` entry: the latest outcome. `finish` quotes the error when the route has no frame. */
+  paramSources?: Record<string, ParamSourceStatus>;
   /** Written by `finish`, not by the watcher; carried over on every status write so it is never lost. */
   lastFinish?: unknown;
 }

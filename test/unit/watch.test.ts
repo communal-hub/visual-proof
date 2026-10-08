@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CaptureResult, CaptureSignals, Capturer, PrimeResult } from '../../src/browser.js';
+import type { JsonResponse } from '../../src/resolve/param-sources.js';
 import { parseConfig, type Config } from '../../src/config.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
@@ -30,6 +31,10 @@ class FakeCapturer implements Capturer {
   onCapture: (url: string) => Promise<void> | void = () => {};
   signalsFor: (url: string) => Partial<CaptureSignals> = () => ({});
   failFor: (url: string) => boolean = () => false;
+  /** Set to make the fake able to fetch JSON (paramSources); like `prime`, a fake without it cannot. */
+  getJson?: (urlPath: string) => Promise<JsonResponse>;
+  /** Set to report a timing breakdown on each capture. */
+  timing?: { settleMs: number; screenshotMs: number };
   /** Set to make the fake warm-up capable; the default fake cannot prime, like a capturer without the method. */
   prime?: (url: string) => Promise<PrimeResult>;
   async warm() {
@@ -39,7 +44,12 @@ class FakeCapturer implements Capturer {
     this.urls.push(url);
     await this.onCapture(url);
     if (this.failFor(url)) throw new Error(`boom ${url}`);
-    return { png: Buffer.from(`png:${url}`), signals: { ...cleanSignals, ...this.signalsFor(url) }, finalUrl: url };
+    return {
+      png: Buffer.from(`png:${url}`),
+      signals: { ...cleanSignals, ...this.signalsFor(url) },
+      finalUrl: url,
+      ...(this.timing ? { timing: this.timing } : {}),
+    };
   }
   async close() {
     this.closed = true;
@@ -874,5 +884,186 @@ describe('unmapped screen changes', () => {
       '/': ['screen', 'src/pages/Home.vue'],
       '/invoices/1': ['screen', 'src/helpers/orphan.vue'],
     });
+  });
+});
+
+describe('frame timing', () => {
+  it('stores the capturer timing breakdown on the frame record', async () => {
+    capturer.timing = { settleMs: 612, screenshotMs: 48 };
+    await start();
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    expect(timeline().list()[0]).toMatchObject({ route: '/', timing: { settleMs: 612, screenshotMs: 48 } });
+  });
+
+  it('leaves the field out when the capturer reports none', async () => {
+    await start();
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    expect(timeline().list()[0]).not.toHaveProperty('timing');
+  });
+});
+
+describe('paramSources (route params from list endpoints)', () => {
+  let json: JsonResponse;
+  let fetched: string[];
+
+  beforeEach(() => {
+    config = parseConfig(
+      {
+        appUrl: 'http://app.test',
+        freshnessMarker: '.hot',
+        routeFiles: ['src/router/**/*.js'],
+        screenGlobs: ['src/**'],
+        backendGlobs: ['server/**'],
+        paramSources: { '/invoices/:id': { url: '/api/invoices', pick: 'data.0.id' } },
+      },
+      repo,
+      {},
+    );
+    json = { status: 200, json: { data: [{ id: 7 }] } };
+    fetched = [];
+    capturer.getJson = async (urlPath) => {
+      fetched.push(urlPath);
+      return json;
+    };
+  });
+
+  it('fills a param route nobody configured, lazily, and records the outcome in status.json', async () => {
+    await start();
+    expect(fetched).toEqual([]);
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    expect(fetched).toEqual(['/api/invoices']);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/7']);
+    expect(timeline().list()[0]).toMatchObject({ route: '/invoices/7', routeKey: '/invoices/:id', status: 'clean' });
+    expect(statusJson().paramSources['/invoices/:id']).toMatchObject({ path: '/invoices/7' });
+    expect(statusJson().paramSources['/invoices/:id'].error).toBeUndefined();
+    expect(logText()).toContain('param source /api/invoices: /invoices/:id -> /invoices/7');
+  });
+
+  it('prefers routeParams, then the seed file, over the list endpoint', async () => {
+    config = parseConfig(
+      {
+        appUrl: 'http://app.test',
+        freshnessMarker: '.hot',
+        routeFiles: ['src/router/**/*.js'],
+        screenGlobs: ['src/**'],
+        routeParams: { '/invoices/:id': '/invoices/1' },
+        paramSources: { '/invoices/:id': { url: '/api/invoices', pick: 'data.0.id' } },
+      },
+      repo,
+      {},
+    );
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    expect(capturer.urls).toEqual(['http://app.test/invoices/1']);
+    expect(fetched).toEqual([]);
+  });
+
+  it('caches the lookup for the session', async () => {
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    expect(fetched).toEqual(['/api/invoices']);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/7', 'http://app.test/invoices/7']);
+  });
+
+  it('looks the ids up again on a backend recapture, and captures the new id', async () => {
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    json = { status: 200, json: { data: [{ id: 99 }] } }; // a re-seed moved the first row
+    capturer.urls = [];
+    tree = 'b'.repeat(40);
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(fetched).toEqual(['/api/invoices', '/api/invoices']);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/99']);
+    expect(timeline().list().at(-1)).toMatchObject({ route: '/invoices/99', routeKey: '/invoices/:id', trigger: 'backend' });
+  });
+
+  it('skips the route with the source error in the log and in status.json when the endpoint fails', async () => {
+    json = { status: 500, error: 'HTTP 500' };
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue', 'src/pages/Home.vue'] });
+    await nextBatch();
+    expect(capturer.urls).toEqual(['http://app.test/']); // the other route still captures
+    expect(timeline().list().map((f) => f.route)).toEqual(['/']);
+    expect(statusJson().paramSources['/invoices/:id']).toMatchObject({ error: 'paramSources /api/invoices failed: HTTP 500' });
+    expect(logText()).toContain('warning: paramSources /api/invoices failed: HTTP 500 (route /invoices/:id)');
+  });
+
+  it('retries after a failure, and clears the error once the source answers', async () => {
+    json = { status: 500, error: 'HTTP 500' };
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    expect(capturer.urls).toEqual([]);
+
+    json = { status: 200, json: { data: [{ id: 3 }] } };
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/3']);
+    expect(statusJson().paramSources['/invoices/:id']).toMatchObject({ path: '/invoices/3' });
+    expect(statusJson().paramSources['/invoices/:id'].error).toBeUndefined();
+  });
+
+  it('reports a missing path or a non-scalar value as the reason', async () => {
+    json = { status: 200, json: { data: [] } };
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    expect(statusJson().paramSources['/invoices/:id'].error).toMatch(/^paramSources \/api\/invoices: data has 0 item\(s\), no index 0/);
+
+    json = { status: 200, json: { data: [{ id: { nested: true } }] } };
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    expect(statusJson().paramSources['/invoices/:id'].error).toMatch(/is an object, expected a string or number/);
+  });
+
+  it('a capturer that cannot fetch JSON leaves the route skipped with that reason', async () => {
+    delete capturer.getJson;
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch();
+    expect(capturer.urls).toEqual([]);
+    expect(statusJson().paramSources['/invoices/:id'].error).toContain('this capturer cannot fetch JSON');
+  });
+
+  it('on a backend recapture, skips a source route whose lookup now fails rather than capturing the old id', async () => {
+    await start();
+    pushBatch({ screen: ['src/pages/Detail.vue', 'src/pages/Home.vue'] });
+    await nextBatch();
+    json = { status: 503, error: 'HTTP 503' };
+    capturer.urls = [];
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/']);
+    expect(statusJson().paramSources['/invoices/:id']).toMatchObject({ path: '/invoices/7', error: 'paramSources /api/invoices failed: HTTP 503' });
+  });
+
+  it('resolves explicit warmupRoutes entries through the list endpoint', async () => {
+    config = parseConfig(
+      {
+        appUrl: 'http://app.test',
+        routeFiles: ['src/router/**/*.js'],
+        screenGlobs: ['src/**'],
+        warmupRoutes: ['/invoices/:id'],
+        paramSources: { '/invoices/:id': { url: '/api/invoices', pick: 'data.0.id' } },
+      },
+      repo,
+      {},
+    );
+    const primed: string[] = [];
+    capturer.prime = async (url) => {
+      primed.push(url);
+      return { passes: 1, reloads: 0, navOk: true, httpStatus: 200 };
+    };
+    await start();
+    expect(primed).toEqual(['http://app.test/invoices/7']);
   });
 });
