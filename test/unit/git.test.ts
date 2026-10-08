@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { changedFiles, headTree, workingTreeHash } from '../../src/git.js';
+import { changedFiles, changeSet, headCommit, headTree, workingTreeHash } from '../../src/git.js';
 import { commitAll, git, initRepo, tmpDir, write } from './helpers.js';
 
 let repo: string;
@@ -169,6 +169,57 @@ describe('changedFiles', () => {
     commitAll(repo, 'second');
     write(repo, 'dirty.txt', 'd');
     expect(await changedFiles(repo, 'no-such-branch')).toEqual(['dirty.txt', 'second.txt']);
+  });
+
+  describe('working directly on the base branch (base...HEAD is empty)', () => {
+    it('does not report an empty set for a commit made on the base branch: HEAD~1..HEAD without an anchor', async () => {
+      write(repo, 'src/b.vue', '<template>edited</template>\n');
+      commitAll(repo, 'commit on main');
+      expect(await changeSet(repo, 'main')).toEqual({ files: ['src/b.vue'], range: 'HEAD~1..HEAD' });
+    });
+
+    it('prefers the watcher anchor: every commit since the daemon started, not just the last', async () => {
+      const anchor = (await headCommit(repo))!;
+      write(repo, 'src/one.vue', '1');
+      commitAll(repo, 'one');
+      write(repo, 'src/two.vue', '2');
+      commitAll(repo, 'two');
+      expect(await changeSet(repo, 'main', { anchor })).toEqual({
+        files: ['src/one.vue', 'src/two.vue'],
+        range: `${anchor.slice(0, 8)}..HEAD`,
+      });
+    });
+
+    it('an anchor equal to HEAD means nothing was committed since the daemon started', async () => {
+      write(repo, 'src/old.vue', 'old');
+      commitAll(repo, 'before the daemon');
+      const anchor = (await headCommit(repo))!;
+      write(repo, 'dirty.txt', 'd');
+      expect(await changeSet(repo, 'main', { anchor })).toEqual({ files: ['dirty.txt'], range: `${anchor.slice(0, 8)}..HEAD` });
+    });
+
+    it('ignores an anchor that no longer resolves', async () => {
+      write(repo, 'src/one.vue', '1');
+      commitAll(repo, 'one');
+      expect((await changeSet(repo, 'main', { anchor: 'f'.repeat(40) })).range).toBe('HEAD~1..HEAD');
+    });
+
+    it('keeps the base range when it has changes', async () => {
+      git(repo, 'checkout', '-q', '-b', 'feature');
+      write(repo, 'src/one.vue', '1');
+      commitAll(repo, 'one');
+      expect(await changeSet(repo, 'main', { anchor: (await headCommit(repo))! })).toEqual({
+        files: ['src/one.vue'],
+        range: 'main...HEAD',
+      });
+    });
+  });
+
+  it('is null-ranged when only uncommitted changes can be considered', async () => {
+    const fresh = initRepo();
+    write(fresh, 'x.vue', 'x');
+    expect(await changeSet(fresh, 'main')).toEqual({ files: ['x.vue'], range: null });
+    expect(await headCommit(fresh)).toBeNull();
   });
 
   it('falls back to uncommitted only when there is no base ref and no HEAD~1', async () => {

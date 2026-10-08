@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import picomatch from 'picomatch';
 import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
-import { changedFiles, headTree } from './git.js';
+import { changeSet, headTree } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
+import { readStatusFile } from './status.js';
 import { Timeline } from './timeline.js';
 import type { FrameStatus } from './triage.js';
 
@@ -45,6 +46,8 @@ export interface FinishResult {
   truncated: boolean;
   /** `HEAD^{tree}`, or null when HEAD has no commits. */
   treeHash: string | null;
+  /** The committed range diffed to find the changed files (`main...HEAD`, `a1b2c3d4..HEAD`, `HEAD~1..HEAD`), or null for uncommitted changes only. */
+  range: string | null;
   proofBlockPath: string;
   proofBlock: string;
   /** Exactly the line `--hook` prints. */
@@ -66,6 +69,7 @@ const EMPTY_GRAPH: ImportGraph = { fileToRoutes: new Map(), routes: [], unresolv
 
 interface State {
   tree: string | null;
+  range: string | null;
   failures: string[];
   notes: string[];
   routes: RouteProof[];
@@ -89,6 +93,7 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
 
   const state: State = {
     tree: null,
+    range: null,
     failures: [],
     notes: [],
     routes: [],
@@ -135,8 +140,11 @@ async function collect(
   }
   state.tree = tree;
 
-  const changed = await changedFiles(config.repoDir, config.baseRef);
+  const status = readStatusFile(statusFiles(dirs).status);
+  const { files: changed, range } = await changeSet(config.repoDir, config.baseRef, { anchor: status?.anchor });
   if (state.closed) return;
+  state.range = range;
+  state.notes.push(`diffed ${describeRange(range)}`);
   const isScreen = picomatch(config.screenGlobs, { dot: true });
   const isBackend = picomatch(config.backendGlobs, { dot: true });
   const screenFiles = changed.filter((f) => isScreen(f));
@@ -242,7 +250,9 @@ async function collect(
 
 function finalize(config: Config, dirs: Dirs, state: State): FinishResult {
   const proofBlockPath = statusFiles(dirs).proofBlock;
-  const proofBlock = state.noScreenChanges ? '<!-- visual-proof: no screen changes -->\n' : renderProofBlock(state);
+  const proofBlock = state.noScreenChanges
+    ? `<!-- visual-proof: no screen changes (diffed ${describeRange(state.range)}) -->\n`
+    : renderProofBlock(state);
   fs.writeFileSync(proofBlockPath, proofBlock);
 
   const ok = state.failures.length === 0;
@@ -259,10 +269,15 @@ function finalize(config: Config, dirs: Dirs, state: State): FinishResult {
     noScreenChanges: state.noScreenChanges && ok,
     truncated: state.truncated,
     treeHash: state.tree,
+    range: state.range,
     proofBlockPath,
     proofBlock,
     summary,
   };
+}
+
+function describeRange(range: string | null): string {
+  return range ?? 'uncommitted changes only (no base ref, watcher anchor or parent commit)';
 }
 
 function plural(n: number, noun: string): string {

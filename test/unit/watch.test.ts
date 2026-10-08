@@ -177,6 +177,16 @@ describe('startWatch', () => {
     });
   });
 
+  it('records the pid and the HEAD commit it started from (the anchor) in status.json', async () => {
+    await start({ headCommit: async () => 'c'.repeat(40) });
+    expect(statusJson()).toMatchObject({ pid: process.pid, anchor: 'c'.repeat(40) });
+  });
+
+  it('has a null anchor outside a git repo or with no commits', async () => {
+    await start({ headCommit: async () => null });
+    expect(statusJson().anchor).toBeNull();
+  });
+
   it('reports a timeout-only barrier when the HMR client is disabled', async () => {
     await start({ barrier: null, barrierTimeoutMs: 10 });
     expect(statusJson().barrier).toBe('timeout-only');

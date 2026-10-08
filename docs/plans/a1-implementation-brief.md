@@ -94,7 +94,7 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 ## Files the daemon writes (status dir)
 
 - `daemon.pid`: pid as text.
-- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", lastCaptureAt, lastError, frames }`.
+- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastError, frames }`. `pid` is the watcher process; `anchor` is the `HEAD` commit sha when the watcher started (null outside a repo or with no commits). `finish` adds `lastFinish` to the same file.
 - `watcher.log`: one line per event, ISO timestamp first.
 - `doctor.json`: resolved tier per capability.
 - `proof-block.md`: written by `finish`.
@@ -128,7 +128,7 @@ Capture waits: `load`, then network idle (500 ms, capped at 5 s), `document.font
 
 ## finish semantics
 
-1. Changed files = `git diff --name-only <baseRef>...HEAD` plus uncommitted changes. If none match `screenGlobs` or `backendGlobs`, write an empty proof block, print `no screen changes`, exit 0.
+1. Changed files = the committed diff plus uncommitted changes, with paths relative to the config directory (git reports toplevel-relative paths; `git rev-parse --show-prefix` is stripped and anything outside the config directory dropped). The committed diff is the first of these that yields files: `<baseRef>...HEAD` (or `origin/<baseRef>...HEAD`), then `<anchor>..HEAD` (the `anchor` in `status.json`), then `HEAD~1..HEAD`. An empty `<baseRef>...HEAD` is not trusted: working directly on the base branch makes it empty even after commits. The range used is printed in the proof block notes (`diffed <range>`). If no changed file matches `screenGlobs` or `backendGlobs`, write an empty proof block (an HTML comment naming the range), print `no screen changes`, exit 0.
 2. Expected routes = routes resolved from the changed screen files, plus every route captured this session when a backend file changed.
 3. For each expected route: the headline is the latest frame with `treeHash == HEAD^{tree}`.
    - No such frame → failure `no frame at HEAD for <route>`.

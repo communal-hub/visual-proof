@@ -73,24 +73,57 @@ export async function headTree(repoDir: string): Promise<string | null> {
   return ok ? stdout.trim() : null;
 }
 
+/** What changed on this branch and how it was found. */
+export interface ChangeSet {
+  /** Paths relative to `repoDir` (POSIX), sorted. */
+  files: string[];
+  /**
+   * The committed range that was diffed, e.g. `main...HEAD`, `a1b2c3d..HEAD` or `HEAD~1..HEAD`;
+   * null when only uncommitted changes could be considered.
+   */
+  range: string | null;
+}
+
+export interface ChangeOptions {
+  /** HEAD sha the watcher started from; the fallback range when the base ref gives nothing. */
+  anchor?: string | null;
+}
+
+/** HEAD's commit sha, or null when the repo has no commits. */
+export async function headCommit(repoDir: string): Promise<string | null> {
+  const { stdout, ok } = await git(repoDir, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], {}, true);
+  return ok ? stdout.trim() : null;
+}
+
 /**
- * Repo-relative POSIX paths changed on this branch: committed changes since `baseRef`
- * plus anything uncommitted (staged, unstaged, untracked-and-not-ignored).
+ * Repo-relative POSIX paths changed on this branch: committed changes plus anything uncommitted
+ * (staged, unstaged, untracked-and-not-ignored).
  *
- * Committed side: `git diff base...HEAD` against `baseRef` (or `origin/<baseRef>` when
- * there is no local branch of that name, as in shallow cloud checkouts). When neither
- * resolves, fall back to `HEAD~1..HEAD` if HEAD has a parent, otherwise to uncommitted
- * changes only. A single-commit window is a guess, but it is the only commit we can
- * assume belongs to this task.
+ * Committed side, first that applies:
+ *  1. `git diff base...HEAD` against `baseRef` (or `origin/<baseRef>` when there is no local branch of
+ *     that name, as in shallow cloud checkouts), when it is not empty.
+ *  2. `anchor..HEAD`, when the watcher recorded the commit it started from.
+ *  3. `HEAD~1..HEAD`, when HEAD has a parent.
+ *  4. Nothing: uncommitted changes only.
+ *
+ * An empty `base...HEAD` is not trusted (working directly on the base branch makes it empty even
+ * though commits were made), hence 2 and 3. A single-commit window is a guess, but it is the only
+ * commit we can assume belongs to this task.
  */
-export async function changedFiles(repoDir: string, baseRef: string): Promise<string[]> {
+export async function changeSet(repoDir: string, baseRef: string, options: ChangeOptions = {}): Promise<ChangeSet> {
   const prefix = await showPrefix(repoDir);
   const files = new Set<string>();
 
-  for (const file of await committedChanges(repoDir, baseRef)) files.add(file);
+  const committed = await committedChanges(repoDir, baseRef, options.anchor ?? null);
+  for (const file of committed.files) files.add(file);
   for (const file of await uncommittedChanges(repoDir)) files.add(file);
 
-  return [...files].flatMap((file) => relativeTo(prefix, file)).sort();
+  return { files: [...files].flatMap((file) => relativeTo(prefix, file)).sort(), range: committed.range };
+}
+
+/** {@link changeSet} without the range. */
+export async function changedFiles(repoDir: string, baseRef: string, options: ChangeOptions = {}): Promise<string[]> {
+  return (await changeSet(repoDir, baseRef, options)).files;
 }
 
 /**
@@ -108,18 +141,32 @@ function relativeTo(prefix: string, file: string): string[] {
   return file.startsWith(prefix) ? [file.slice(prefix.length)] : [];
 }
 
-async function committedChanges(repoDir: string, baseRef: string): Promise<string[]> {
+async function committedChanges(
+  repoDir: string,
+  baseRef: string,
+  anchor: string | null,
+): Promise<{ files: string[]; range: string | null }> {
   for (const ref of [baseRef, `origin/${baseRef}`]) {
     if (!(await refExists(repoDir, ref))) continue;
     const diff = await git(repoDir, ['diff', '--name-only', '-z', `${ref}...HEAD`], {}, true);
-    // Unrelated histories have no merge base; a plain two-dot diff is the closest meaning.
-    if (diff.ok) return splitNul(diff.stdout);
-    return splitNul((await git(repoDir, ['diff', '--name-only', '-z', ref, 'HEAD'], {}, true)).stdout);
+    if (diff.ok) {
+      const files = splitNul(diff.stdout);
+      if (files.length > 0) return { files, range: `${ref}...HEAD` };
+    } else {
+      // Unrelated histories have no merge base; a plain two-dot diff is the closest meaning.
+      const files = splitNul((await git(repoDir, ['diff', '--name-only', '-z', ref, 'HEAD'], {}, true)).stdout);
+      if (files.length > 0) return { files, range: `${ref}..HEAD` };
+    }
+    break; // the base resolved but gave nothing: do not trust the emptiness, look at the anchor / parent
+  }
+  if (anchor && (await refExists(repoDir, anchor))) {
+    const files = splitNul((await git(repoDir, ['diff', '--name-only', '-z', anchor, 'HEAD'])).stdout);
+    return { files, range: `${anchor.slice(0, 8)}..HEAD` };
   }
   if (await refExists(repoDir, 'HEAD~1')) {
-    return splitNul((await git(repoDir, ['diff', '--name-only', '-z', 'HEAD~1', 'HEAD'])).stdout);
+    return { files: splitNul((await git(repoDir, ['diff', '--name-only', '-z', 'HEAD~1', 'HEAD'])).stdout), range: 'HEAD~1..HEAD' };
   }
-  return [];
+  return { files: [], range: null };
 }
 
 async function uncommittedChanges(repoDir: string): Promise<string[]> {

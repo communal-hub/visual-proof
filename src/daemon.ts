@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
-import { startWatch, type Status } from './watch.js';
+import { isAlive, livePid, readPid, readStatusFile as readStatus } from './status.js';
+import { startWatch } from './watch.js';
 
 export interface DaemonContext {
   configPath?: string;
@@ -21,43 +22,10 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 // ---- pid file ---------------------------------------------------------------
 
-export function readPid(pidFile: string): number | null {
-  try {
-    const pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-export function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-/** The live daemon's pid, removing a stale pid file as a side effect. */
-export function livePid(pidFile: string): number | null {
-  const pid = readPid(pidFile);
-  if (pid === null) return null;
-  if (isAlive(pid)) return pid;
-  fs.rmSync(pidFile, { force: true });
-  return null;
-}
+export { isAlive, livePid, readPid };
 
 function removePidIfOwnedBy(pidFile: string, pid: number): void {
   if (readPid(pidFile) === pid) fs.rmSync(pidFile, { force: true });
-}
-
-function readStatus(statusFile: string): Partial<Status> | null {
-  try {
-    return JSON.parse(fs.readFileSync(statusFile, 'utf8')) as Partial<Status>;
-  } catch {
-    return null;
-  }
 }
 
 function logTail(logFile: string, lines = 15): string {

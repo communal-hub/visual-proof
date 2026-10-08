@@ -116,7 +116,7 @@ describe('runFinish', () => {
     editAndCommit('README.md', '# changed\n');
     const result = await finish();
     expect(result).toMatchObject({ ok: true, noScreenChanges: true, failures: [], routes: [], summary: 'visual-proof: no screen changes' });
-    expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toBe('<!-- visual-proof: no screen changes -->\n');
+    expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toBe('<!-- visual-proof: no screen changes (diffed main...HEAD) -->\n');
     expect(fs.readdirSync(dirs.artifactDir)).toEqual([]);
   });
 
@@ -208,7 +208,7 @@ describe('runFinish', () => {
     editAndCommit('server/data.json', '{"v":2}\n');
     const result = await finish();
     expect(result).toMatchObject({ ok: true, routes: [], noScreenChanges: false });
-    expect(result.notes[0]).toContain('no route was ever captured');
+    expect(result.notes.join('\n')).toContain('no route was ever captured');
     expect(result.summary).toBe('visual-proof: 0 routes ok');
   });
 
@@ -322,6 +322,41 @@ describe('runFinish', () => {
     editAndCommit('src/pages/A.vue');
     const result = await finish({ buildGraph: async () => Promise.reject(new Error('bad router file')) });
     expect(result.failures).toEqual(['could not build the route graph: bad router file']);
+  });
+});
+
+describe('runFinish when working directly on the base branch', () => {
+  beforeEach(() => {
+    git(repo, 'checkout', '-q', 'main'); // base...HEAD is empty here whatever gets committed
+  });
+
+  it('a screen change committed on main is still expected (HEAD~1..HEAD without an anchor)', async () => {
+    editAndCommit('src/pages/A.vue');
+    const result = await finish();
+    expect(result.failures).toEqual(['no frame at HEAD for /a']);
+    expect(result.range).toBe('HEAD~1..HEAD');
+    expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain('- diffed HEAD~1..HEAD');
+    await frame('/a');
+    expect((await finish()).ok).toBe(true);
+  });
+
+  it("uses the daemon's anchor from status.json: every commit since it started", async () => {
+    const anchor = git(repo, 'rev-parse', 'HEAD');
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'stopped', anchor }));
+    editAndCommit('src/pages/A.vue');
+    editAndCommit('src/pages/C.vue');
+    await frame('/c');
+    const result = await finish();
+    expect(result.range).toBe(`${anchor.slice(0, 8)}..HEAD`);
+    expect(result.failures).toEqual(['no frame at HEAD for /a']);
+    expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain(`- diffed ${anchor.slice(0, 8)}..HEAD`);
+  });
+
+  it('with the anchor at HEAD and nothing uncommitted there is genuinely nothing to prove', async () => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'ready', anchor: git(repo, 'rev-parse', 'HEAD') }));
+    expect(await finish()).toMatchObject({ ok: true, noScreenChanges: true });
   });
 });
 

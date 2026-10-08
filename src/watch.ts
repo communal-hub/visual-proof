@@ -5,29 +5,17 @@ import path from 'node:path';
 import picomatch from 'picomatch';
 import { Browser, type Capturer, type CaptureSignals } from './browser.js';
 import type { Config } from './config.js';
-import { workingTreeHash } from './git.js';
+import { headCommit, workingTreeHash } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { joinUrl, resolveRoutes } from './resolve/routes.js';
 import { Timeline, type Frame, type Trigger } from './timeline.js';
 import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-watch.js';
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
+import { type DaemonState, type Status } from './status.js';
 import { triage } from './triage.js';
 
-export type DaemonState = 'starting' | 'ready' | 'capturing' | 'error' | 'stopped';
-
-export interface Status {
-  state: DaemonState;
-  sessionId: string;
-  startedAt: string;
-  trigger: 'fs-watch';
-  barrier: 'vite-hmr' | 'timeout-only';
-  lastCaptureAt: string | null;
-  lastError: string | null;
-  frames: number;
-  /** Written by `finish`, not by the watcher; carried over on every status write so it is never lost. */
-  lastFinish?: unknown;
-}
+export type { DaemonState, Status };
 
 /** The slice of the HMR client that `watch` relies on; tests substitute a fake. */
 export interface BarrierSource {
@@ -53,6 +41,8 @@ export interface WatchOptions {
   startTrigger?: typeof startFsWatch;
   treeHash?: (repoDir: string, scratchDir: string) => Promise<string>;
   buildGraph?: (config: Config) => Promise<ImportGraph>;
+  /** HEAD's commit sha, recorded as `anchor` in status.json. Default: `git rev-parse HEAD`. */
+  headCommit?: (repoDir: string) => Promise<string | null>;
   /** How long to wait for an HMR message after a screen change. Default 500 ms. */
   barrierTimeoutMs?: number;
   debounceMs?: number;
@@ -140,10 +130,15 @@ class Watcher {
     this.status = {
       state: 'starting',
       sessionId: this.sessionId,
+      pid: process.pid,
       startedAt: new Date().toISOString(),
       trigger: 'fs-watch',
       barrier: 'timeout-only',
+      anchor: null,
       lastCaptureAt: null,
+      lastEventAt: null,
+      pending: false,
+      pendingSince: null,
       lastError: null,
       frames: 0,
     };
@@ -160,6 +155,7 @@ class Watcher {
     try {
       const treeHash = this.opts.treeHash ?? workingTreeHash;
       await treeHash(this.config.repoDir, this.dirs.scratchDir); // fail fast outside a git repo
+      this.status.anchor = await (this.opts.headCommit ?? headCommit)(this.config.repoDir).catch(() => null);
 
       await this.startBarrier();
 
