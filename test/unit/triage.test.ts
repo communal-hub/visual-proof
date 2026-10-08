@@ -26,6 +26,11 @@ describe('triage', () => {
     expect(triage({ ...healthy, httpStatus })).toEqual({ status: 'error', reasons: [`HTTP ${httpStatus}`] });
   });
 
+  it('an auth failure (login failed or redirected to login) is an error', () => {
+    const result = triage({ ...healthy, authFailure: 'redirected to /login' });
+    expect(result).toEqual({ status: 'error', reasons: ['redirected to /login'] });
+  });
+
   it('does not treat 4xx as an error by itself', () => {
     expect(triage({ ...healthy, httpStatus: 404 }).status).toBe('clean');
   });

@@ -8,6 +8,8 @@ export interface TriageSignals {
   appRootPresent: boolean;
   appRootChildCount: number;
   visibleSpinnerCount: number;
+  /** Set when the page could not be loaded as the logged-in user (login failed, 401/403, login redirect). */
+  authFailure?: string;
 }
 
 export interface TriageResult {
@@ -21,6 +23,7 @@ const MAX_REASON_LENGTH = 200;
 export function triage(signals: TriageSignals): TriageResult {
   const errors: string[] = [];
   if (!signals.navOk) errors.push('navigation failed');
+  if (signals.authFailure) errors.push(signals.authFailure);
   if (signals.httpStatus !== null && signals.httpStatus >= 500) errors.push(`HTTP ${signals.httpStatus}`);
   for (const message of signals.consoleErrors) errors.push(`console error: ${clip(message)}`);
   for (const message of signals.pageErrors) errors.push(`page error: ${clip(message)}`);
