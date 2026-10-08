@@ -1,0 +1,7 @@
+{
+  "invoices": [
+    { "id": 1, "number": "INV-001", "status": "paid", "total": 120.5 },
+    { "id": 2, "number": "INV-002", "status": "pending", "total": 340 },
+    { "id": 3, "number": "INV-003", "status": "overdue", "total": 75.25 }
+  ]
+}
