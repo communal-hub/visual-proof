@@ -24,6 +24,8 @@ export interface Config {
   aliases: Record<string, string>;
   staticRoutes: Record<string, string[]>;
   routeParams: Record<string, string>;
+  /** JSON file of route params written at runtime by the app (e.g. a seeder); relative to `repoDir`. Overrides `routeParams`. */
+  routeParamsFile?: string;
   screenGlobs: string[];
   /** Files matching these are never screens, even when they match `screenGlobs` (shared helpers, stories, tests). */
   ignoreScreenGlobs: string[];
@@ -113,6 +115,7 @@ export function parseConfig(
     aliases: v.stringMap('aliases') ?? { '@': 'src' },
     staticRoutes: v.stringArrayMap('staticRoutes') ?? {},
     routeParams: v.stringMap('routeParams') ?? {},
+    routeParamsFile: v.string('routeParamsFile'),
     screenGlobs: v.stringArray('screenGlobs') ?? ['src/**/*.vue'],
     ignoreScreenGlobs: v.stringArray('ignoreScreenGlobs') ?? [],
     backendGlobs: v.stringArray('backendGlobs') ?? [],
