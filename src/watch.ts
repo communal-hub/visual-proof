@@ -25,6 +25,8 @@ export interface Status {
   lastCaptureAt: string | null;
   lastError: string | null;
   frames: number;
+  /** Written by `finish`, not by the watcher; carried over on every status write so it is never lost. */
+  lastFinish?: unknown;
 }
 
 /** The slice of the HMR client that `watch` relies on; tests substitute a fake. */
@@ -476,6 +478,13 @@ class Watcher {
 
   private writeStatus(): void {
     this.status.barrier = this.barrier?.state === 'connected' ? 'vite-hmr' : 'timeout-only';
+    // `finish` records its outcome in this same file; keep it across the watcher's own rewrites.
+    try {
+      const existing = (JSON.parse(fs.readFileSync(this.files.status, 'utf8')) as Partial<Status>).lastFinish;
+      if (existing !== undefined) this.status.lastFinish = existing;
+    } catch {
+      // No status file yet, or a torn one.
+    }
     const tmp = `${this.files.status}.${process.pid}.tmp`;
     try {
       fs.writeFileSync(tmp, `${JSON.stringify(this.status, null, 2)}\n`);

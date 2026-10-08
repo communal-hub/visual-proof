@@ -195,6 +195,23 @@ describe('startWatch', () => {
   });
 });
 
+describe('status.json shared with finish', () => {
+  it("keeps finish's lastFinish across the watcher's own status rewrites", async () => {
+    await start();
+    const lastFinish = { at: '2026-10-08T12:00:00.000Z', ok: false, failures: ['no frame at HEAD for /'] };
+    const file = path.join(dirs.statusDir, 'status.json');
+    fs.writeFileSync(file, JSON.stringify({ ...statusJson(), lastFinish }));
+
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    const status = statusJson();
+    expect(status).toMatchObject({ state: 'ready', frames: 1, lastFinish });
+
+    await handle!.stop();
+    expect(statusJson()).toMatchObject({ state: 'stopped', lastFinish });
+  });
+});
+
 describe('screen batches', () => {
   it('resolves routes, waits on the HMR barrier, and records a frame per route', async () => {
     await start();
