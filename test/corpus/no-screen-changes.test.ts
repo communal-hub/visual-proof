@@ -21,5 +21,10 @@ it('no-screen-changes: a commit that only touches a non-screen file exits 0 with
   expect(fs.readdirSync(h.dirs.artifactDir)).toEqual([]);
 
   const cli = await h.cli('finish');
-  expect(cli).toEqual({ code: 0, stdout: 'no screen changes\n', stderr: '' });
+  expect(cli).toEqual({
+    code: 0,
+    stdout: `${result.proofBlockPath}\n`,
+    stderr: 'visual-proof finish: no screen changes (diffed main...HEAD)\n',
+  });
+  expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toBe('<!-- visual-proof: no screen changes (diffed main...HEAD) -->\n');
 });

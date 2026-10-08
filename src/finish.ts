@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
-import { changeSet, headTree, workingTreeHash } from './git.js';
+import { CONFIG_FILE_NAME, ConfigError, loadConfig, type Config } from './config.js';
+import { EXIT } from './exit.js';
+import { changeSet, headTree, isGitRepo, workingTreeHash } from './git.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
-import { readStatusFile, watcherPid, type Status } from './status.js';
+import { readStatusFile, watcherPid, writeFileAtomic, type Status } from './status.js';
+import { describeError } from './text.js';
 import { Timeline } from './timeline.js';
 import type { FrameStatus } from './triage.js';
 
@@ -42,6 +44,8 @@ export interface RouteProof {
 export interface FinishResult {
   ok: boolean;
   failures: string[];
+  /** What to do about the failures (start the watcher, commit, ...); empty when `ok`. */
+  hints: string[];
   notes: string[];
   routes: RouteProof[];
   noScreenChanges: boolean;
@@ -69,10 +73,19 @@ export function routeSlug(route: string): string {
 const SHORT_TREE = 8;
 const EMPTY_GRAPH: ImportGraph = { fileToRoutes: new Map(), routes: [], unresolved: [] };
 
+/** Something is wrong with the setup (not a git repo, ...), as opposed to the proof being incomplete. */
+export class SetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SetupError';
+  }
+}
+
 interface State {
   tree: string | null;
   range: string | null;
   failures: string[];
+  hints: string[];
   notes: string[];
   routes: RouteProof[];
   expectedCount: number;
@@ -97,6 +110,7 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
     tree: null,
     range: null,
     failures: [],
+    hints: [],
     notes: [],
     routes: [],
     expectedCount: 0,
@@ -123,7 +137,7 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
       `truncated: finish budget of ${budgetMs} ms exceeded after ${state.routes.length} of ${state.expectedCount} route(s)`,
     );
   }
-  return finalize(config, dirs, state);
+  return finalize(dirs, state);
 }
 
 async function collect(
@@ -134,6 +148,20 @@ async function collect(
   deadline: number,
   now: () => number,
 ): Promise<void> {
+  await gather(config, dirs, opts, state, deadline, now);
+  if (!state.closed && state.failures.length > 0) await addHints(config, dirs, state);
+}
+
+async function gather(
+  config: Config,
+  dirs: Dirs,
+  opts: FinishOptions,
+  state: State,
+  deadline: number,
+  now: () => number,
+): Promise<void> {
+  if (!(await isGitRepo(config.repoDir))) throw new SetupError(`${config.repoDir} is not a git repository`);
+  if (state.closed) return;
   const tree = await headTree(config.repoDir);
   if (state.closed) return;
   if (tree === null) {
@@ -273,6 +301,45 @@ async function collect(
   }
 }
 
+/**
+ * Remedies for the failures, from what is observable: the watcher's state, why its last capture was
+ * refused, whether the commit matches the working tree, and which tree the newest frame is from.
+ * The failure strings themselves stay as they are.
+ */
+async function addHints(config: Config, dirs: Dirs, state: State): Promise<void> {
+  const tree = state.tree;
+  if (tree === null) return;
+  const short = tree.slice(0, SHORT_TREE);
+  const hints: string[] = [];
+  const status = readStatusFile(statusFiles(dirs).status);
+  const live = status !== null && status.state !== 'stopped' && status.state !== 'error' && watcherPid(dirs, status) !== null;
+  const noFrame = state.failures.some((f) => f.startsWith('no frame at HEAD for '));
+
+  if (noFrame && !live) {
+    hints.push('the watcher is not running, so nothing was captured while you edited: run visual-proof start');
+  }
+  if (noFrame && typeof status?.lastError === 'string' && status.lastError !== '') {
+    hints.push(`the watcher's last capture problem: ${status.lastError}`);
+  }
+  try {
+    const working = await workingTreeHash(config.repoDir, dirs.scratchDir);
+    if (working !== tree) {
+      hints.push(`working tree (${working.slice(0, SHORT_TREE)}) differs from HEAD (${short}): commit your changes, then rerun finish`);
+    }
+  } catch {
+    // The hint is a convenience; the failures already say what is wrong.
+  }
+  if (noFrame) {
+    const newest = new Timeline(dirs.scratchDir, config.maxFrames).list().at(-1);
+    if (newest && newest.treeHash !== tree) {
+      hints.push(
+        `the newest frame is at tree ${newest.treeHash.slice(0, SHORT_TREE)} but HEAD is ${short}: the committed state was never captured; save the changed files again with the watcher running, then rerun finish`,
+      );
+    }
+  }
+  if (!state.closed) state.hints.push(...hints);
+}
+
 interface WaitContext {
   config: Config;
   dirs: Dirs;
@@ -351,14 +418,20 @@ async function daemonBusy(
   }
 }
 
-function finalize(config: Config, dirs: Dirs, state: State): FinishResult {
+function finalize(dirs: Dirs, state: State): FinishResult {
   const proofBlockPath = statusFiles(dirs).proofBlock;
-  const proofBlock = state.noScreenChanges
+  let proofBlock = state.noScreenChanges
     ? `<!-- visual-proof: no screen changes (diffed ${describeRange(state.range)}) -->\n`
     : renderProofBlock(state);
-  fs.writeFileSync(proofBlockPath, proofBlock);
-
+  try {
+    writeProofBlock(proofBlockPath, proofBlock);
+  } catch (err) {
+    // A proof nobody can read is not a proof.
+    state.failures.push(`could not write the proof block to ${proofBlockPath}: ${describeError(err)}`);
+    proofBlock = renderProofBlock(state);
+  }
   const ok = state.failures.length === 0;
+
   let summary: string;
   if (state.noScreenChanges && ok) summary = 'visual-proof: no screen changes';
   else if (!ok) summary = `visual-proof: ${plural(state.failures.length, 'failure')}, see ${proofBlockPath}`;
@@ -367,6 +440,7 @@ function finalize(config: Config, dirs: Dirs, state: State): FinishResult {
   return {
     ok,
     failures: state.failures,
+    hints: state.hints,
     notes: state.notes,
     routes: state.routes,
     noScreenChanges: state.noScreenChanges && ok,
@@ -377,6 +451,39 @@ function finalize(config: Config, dirs: Dirs, state: State): FinishResult {
     proofBlock,
     summary,
   };
+}
+
+/** Atomic (tmp + rename) so an agent reading the block never sees half of one. */
+function writeProofBlock(file: string, content: string): void {
+  try {
+    writeFileAtomic(file, content);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeFileAtomic(file, content);
+  }
+}
+
+/**
+ * The result for a finish that could not even look at the timeline (bad config, not a git repo, an
+ * internal error): a failure block is still written, so the proof-block path is always valid.
+ */
+export function errorResult(dirs: Dirs, failure: string, hints: string[] = []): FinishResult {
+  const state: State = {
+    tree: null,
+    range: null,
+    failures: [failure],
+    hints,
+    notes: [],
+    routes: [],
+    expectedCount: 0,
+    noScreenChanges: false,
+    truncated: false,
+    closed: true,
+  };
+  const result = finalize(dirs, state);
+  result.summary = `visual-proof: finish error: ${failure}, see ${result.proofBlockPath}`;
+  return result;
 }
 
 function describeRange(range: string | null): string {
@@ -397,6 +504,10 @@ function renderProofBlock(state: State): string {
   if (state.failures.length > 0) {
     lines.push('', '**Failures**', '');
     for (const failure of state.failures) lines.push(`- ${failure}`);
+    if (state.hints.length > 0) {
+      lines.push('', '**Next steps**', '');
+      for (const hint of state.hints) lines.push(`- ${hint}`);
+    }
   }
 
   for (const route of state.routes) {
@@ -426,28 +537,30 @@ export interface LastFinish {
   at: string;
   ok: boolean;
   failures: string[];
+  proofBlockPath: string;
+  summary: string;
 }
 
 /**
  * Record the outcome for agents that read files, not processes: read-modify-write `lastFinish`
  * into status.json (the daemon's other fields are kept) and append to watcher.log.
  */
-export function recordFinish(dirs: Dirs, result: Pick<FinishResult, 'ok' | 'failures' | 'summary'>, at = new Date()): void {
+export function recordFinish(
+  dirs: Dirs,
+  result: Pick<FinishResult, 'ok' | 'failures' | 'summary' | 'proofBlockPath'>,
+  at = new Date(),
+): void {
   const files = statusFiles(dirs);
-  const lastFinish: LastFinish = { at: at.toISOString(), ok: result.ok, failures: result.failures };
+  const lastFinish: LastFinish = {
+    at: at.toISOString(),
+    ok: result.ok,
+    failures: result.failures,
+    proofBlockPath: result.proofBlockPath,
+    summary: result.summary,
+  };
   try {
-    let current: Record<string, unknown> = { state: 'stopped' };
-    try {
-      const parsed: unknown = JSON.parse(fs.readFileSync(files.status, 'utf8'));
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        current = parsed as Record<string, unknown>;
-      }
-    } catch {
-      // No status file yet (daemon never ran) or a torn one: start from a stopped stub.
-    }
-    const tmp = `${files.status}.${process.pid}.finish.tmp`;
-    fs.writeFileSync(tmp, `${JSON.stringify({ ...current, lastFinish }, null, 2)}\n`);
-    fs.renameSync(tmp, files.status);
+    const current: Record<string, unknown> = readStatusFile(files.status) ?? { state: 'stopped' };
+    writeFileAtomic(files.status, `${JSON.stringify({ ...current, lastFinish }, null, 2)}\n`);
   } catch {
     // Recording is best-effort; finish's own result is what matters.
   }
@@ -467,51 +580,51 @@ export function recordFinish(dirs: Dirs, result: Pick<FinishResult, 'ok' | 'fail
 export interface FinishCommandContext {
   configPath?: string;
   hook: boolean;
+  /** Print the {@link FinishResult} as JSON on stdout instead of the proof block path. */
+  json?: boolean;
   env: NodeJS.ProcessEnv;
   cwd?: string;
   out?: (text: string) => void;
   err?: (text: string) => void;
 }
 
-/** `visual-proof finish [--hook]`; returns the process exit code. */
+/**
+ * `visual-proof finish [--hook] [--json]`; returns the process exit code: 0 ok, 1 proof failures,
+ * 3 setup or config error, 4 internal error (`--hook` always returns 0). Whatever happens, a proof
+ * block is written and `lastFinish` recorded.
+ */
 export async function finishCommand(ctx: FinishCommandContext): Promise<number> {
   const out = ctx.out ?? ((t) => process.stdout.write(t));
   const err = ctx.err ?? ((t) => process.stderr.write(t));
   const dirs = resolveDirs(ctx.env);
-  const oneLine = (e: unknown): string => (e instanceof Error ? e.message : String(e)).split('\n')[0] ?? 'unknown error';
 
   let result: FinishResult;
+  let code: number;
   try {
     const cwd = ctx.cwd ?? process.cwd();
     const config = loadConfig({ configPath: path.resolve(cwd, ctx.configPath ?? CONFIG_FILE_NAME), cwd, env: ctx.env });
     result = await runFinish(config, { env: ctx.env, dirs });
+    code = result.ok ? EXIT.OK : EXIT.FAILURES;
   } catch (e) {
-    const failure = `finish error: ${oneLine(e)}`;
-    if (!ctx.hook) {
-      err(`visual-proof finish: ${oneLine(e)}\n`);
-      return 1;
-    }
+    const setup = e instanceof ConfigError || e instanceof SetupError;
     try {
       ensureDirs(dirs);
     } catch {
-      // fall through; recordFinish is best-effort
+      // writing the block below may then fail too; that is reported by the throw it causes
     }
-    const summary = `visual-proof: ${failure}, see ${statusFiles(dirs).log}`;
-    recordFinish(dirs, { ok: false, failures: [failure], summary });
-    out(`${summary}\n`);
-    return 0;
+    result = errorResult(dirs, setup ? describeError(e) : `internal error: ${describeError(e)}`);
+    code = setup ? EXIT.SETUP : EXIT.INTERNAL;
   }
 
   recordFinish(dirs, result);
   if (ctx.hook) {
     out(`${result.summary}\n`);
-    return 0;
+    return EXIT.OK;
   }
-  if (result.noScreenChanges) {
-    out('no screen changes\n');
-    return 0;
-  }
-  out(`${result.proofBlockPath}\n`);
+  if (ctx.json) out(`${JSON.stringify(result, null, 2)}\n`);
+  else out(`${result.proofBlockPath}\n`);
+  if (result.noScreenChanges) err(`visual-proof finish: no screen changes (diffed ${describeRange(result.range)})\n`);
   for (const failure of result.failures) err(`visual-proof finish: ${failure}\n`);
-  return result.ok ? 0 : 1;
+  for (const hint of result.hints) err(`visual-proof finish: hint: ${hint}\n`);
+  return code;
 }

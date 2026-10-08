@@ -2,8 +2,10 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
-import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
+import { EXIT } from './exit.js';
+import { ensureDirs, pathsInfo, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { isAlive, livePid, readPid, readStatusFile as readStatus } from './status.js';
+import { describeError } from './text.js';
 import { startWatch } from './watch.js';
 
 export interface DaemonContext {
@@ -46,7 +48,7 @@ function loadContextConfig(ctx: DaemonContext): { config: Config; configPath: st
   try {
     return { config: loadConfig({ configPath, cwd, env: ctx.env }), configPath };
   } catch (err) {
-    return { error: oneLine(err) };
+    return { error: describeError(err) };
   }
 }
 
@@ -58,7 +60,7 @@ export async function runWatch(ctx: DaemonContext): Promise<number> {
   const loaded = loadContextConfig(ctx);
   if ('error' in loaded) {
     err(`visual-proof watch: ${loaded.error}\n`);
-    return 1;
+    return EXIT.SETUP;
   }
   const dirs = resolveDirs(ctx.env);
   ensureDirs(dirs);
@@ -67,7 +69,7 @@ export async function runWatch(ctx: DaemonContext): Promise<number> {
   const existing = livePid(files.pid);
   if (existing !== null && existing !== process.pid) {
     err(`visual-proof watch: already running (pid ${existing})\n`);
-    return 1;
+    return EXIT.SETUP;
   }
   fs.writeFileSync(files.pid, `${process.pid}\n`);
 
@@ -81,7 +83,7 @@ export async function runWatch(ctx: DaemonContext): Promise<number> {
   } catch (e) {
     removePidIfOwnedBy(files.pid, process.pid);
     err(`visual-proof watch: failed to start: ${oneLine(e)}\n`);
-    return 1;
+    return EXIT.SETUP;
   }
 
   await new Promise<void>((resolve) => {
@@ -104,10 +106,10 @@ export async function runWatch(ctx: DaemonContext): Promise<number> {
 export async function startDaemon(ctx: DaemonContext): Promise<number> {
   const out = ctx.out ?? ((t) => process.stdout.write(t));
   const err = ctx.err ?? ((t) => process.stderr.write(t));
-  const fail = (reason: string, tail?: string): number => {
+  const fail = (reason: string, tail?: string, code: number = EXIT.SETUP): number => {
     err(`visual-proof start: ${reason}\n`);
     if (tail) err(`${tail}\n`);
-    return 1;
+    return code;
   };
 
   try {
@@ -116,13 +118,13 @@ export async function startDaemon(ctx: DaemonContext): Promise<number> {
     const dirs = resolveDirs(ctx.env);
     ensureDirs(dirs);
     const files = statusFiles(dirs);
+    const print = (status: object): void => out(`${JSON.stringify({ ...status, paths: pathsInfo(dirs) })}\n`);
 
     const running = livePid(files.pid);
     if (running !== null) {
       // Reattach: never a second browser.
-      const status = readStatus(files.status) ?? { state: 'starting' };
-      out(`${JSON.stringify(status)}\n`);
-      return 0;
+      print(readStatus(files.status) ?? { state: 'starting' });
+      return EXIT.OK;
     }
 
     fs.rmSync(files.status, { force: true }); // so a stale 'ready' from a dead session cannot satisfy the wait below
@@ -151,8 +153,8 @@ export async function startDaemon(ctx: DaemonContext): Promise<number> {
     while (Date.now() < deadline) {
       const status = readStatus(files.status);
       if (status?.state === 'ready' || status?.state === 'capturing') {
-        out(`${JSON.stringify(status)}\n`);
-        return 0;
+        print(status);
+        return EXIT.OK;
       }
       if (exited !== null || status?.state === 'error') {
         removePidIfOwnedBy(files.pid, pid);
@@ -169,7 +171,7 @@ export async function startDaemon(ctx: DaemonContext): Promise<number> {
     removePidIfOwnedBy(files.pid, pid);
     return fail(`watcher did not become ready within ${START_TIMEOUT_MS / 1000}s`, logTail(files.log));
   } catch (e) {
-    return fail(oneLine(e));
+    return fail(oneLine(e), undefined, EXIT.INTERNAL);
   }
 }
 
@@ -191,7 +193,7 @@ export async function stopDaemon(ctx: DaemonContext): Promise<number> {
     process.kill(pid, 'SIGTERM');
   } catch (e) {
     err(`visual-proof stop: cannot signal pid ${pid}: ${oneLine(e)}\n`);
-    return 1;
+    return EXIT.INTERNAL;
   }
 
   const deadline = Date.now() + STOP_TIMEOUT_MS;

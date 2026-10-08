@@ -5,9 +5,11 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 import { CONFIG_FILE_NAME, ConfigError, loadConfig, type Config } from './config.js';
 import { headTree, isGitRepo } from './git.js';
+import { EXIT } from './exit.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
+import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
 
@@ -114,14 +116,6 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
 }
 
 // ---- checks -----------------------------------------------------------------
-
-function flatten(message: string): string {
-  return message
-    .split('\n')
-    .map((l) => l.trim().replace(/^- /, ''))
-    .filter(Boolean)
-    .join('; ');
-}
 
 async function checkGit(config: Config | null): Promise<Capability> {
   if (!config) return { tier: 'unknown', status: 'skipped', required: false, detail: 'config is invalid, so the repo is unknown' };
@@ -333,22 +327,6 @@ async function countMatches(config: Config, ignored: string[]): Promise<{ screen
   return { screen, backend, capped: visited >= SCAN_CAP };
 }
 
-/**
- * One readable line for a failure. Node's connect errors for `localhost` (tried over IPv4 and IPv6)
- * are AggregateErrors with an empty message, so fall back to the error code.
- */
-function firstLine(err: unknown): string {
-  if (err instanceof Error) {
-    const line = err.message.split('\n')[0];
-    if (line) return line;
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code) return code;
-    if (err instanceof AggregateError && err.errors.length > 0) return firstLine(err.errors[0]);
-    return err.name;
-  }
-  return String(err).split('\n')[0] || 'unknown error';
-}
-
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: NodeJS.Timeout;
   const timeout = new Promise<never>((_, reject) => {
@@ -375,6 +353,8 @@ export function formatReport(report: DoctorReport): string {
 
 export interface DoctorCommandContext {
   configPath?: string;
+  /** Print the report as JSON instead of the table. */
+  json?: boolean;
   env: NodeJS.ProcessEnv;
   cwd?: string;
   out?: (text: string) => void;
@@ -382,7 +362,10 @@ export interface DoctorCommandContext {
   options?: DoctorOptions;
 }
 
-/** `visual-proof doctor`; exits non-zero only when the browser or the trigger is missing. */
+/**
+ * `visual-proof doctor [--json]`: 0, or 1 when the browser or the trigger is missing (an invalid
+ * config also leaves the trigger unknown, hence missing), or 4 when doctor itself breaks.
+ */
 export async function doctorCommand(ctx: DoctorCommandContext): Promise<number> {
   const out = ctx.out ?? ((t) => process.stdout.write(t));
   const err = ctx.err ?? ((t) => process.stderr.write(t));
@@ -396,11 +379,12 @@ export async function doctorCommand(ctx: DoctorCommandContext): Promise<number> 
   }
   try {
     const report = await runDoctor(config, { env: ctx.env, ...ctx.options });
-    out(formatReport(report));
+    if (ctx.json) out(`${JSON.stringify(report, null, 2)}\n`);
+    else out(`${formatReport(report)}details: ${statusFiles(ctx.options?.dirs ?? resolveDirs(ctx.env)).doctor}\n`);
     if (!report.ok) err('visual-proof doctor: a required capability is missing (browser or trigger)\n');
-    return report.ok ? 0 : 1;
+    return report.ok ? EXIT.OK : EXIT.FAILURES;
   } catch (e) {
     err(`visual-proof doctor: ${firstLine(e)}\n`);
-    return 1;
+    return EXIT.INTERNAL;
   }
 }

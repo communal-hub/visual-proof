@@ -29,6 +29,7 @@ it('wrong-route: a changed page that was never captured fails with "no frame at 
   expect(result.ok).toBe(false);
   expect(result.failures).toEqual([`no frame at HEAD for ${REPORTS_ROUTE}`]);
   expect(readBlock(result)).toContain(`- no frame at HEAD for ${REPORTS_ROUTE}`);
+  expect(result.hints.join('\n')).toContain('run visual-proof start'); // the watcher was stopped before the edit
   expect(fs.readdirSync(h.dirs.artifactDir)).toEqual([]);
 });
 

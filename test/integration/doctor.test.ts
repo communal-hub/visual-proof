@@ -68,9 +68,19 @@ describe('doctor against the vite-vue fixture', () => {
     expect(cli.code).toBe(0);
     expect(cli.stderr).toBe('');
     const lines = cli.stdout.trimEnd().split('\n');
-    expect(lines).toHaveLength(9);
+    expect(lines).toHaveLength(10);
+    expect(lines.at(-1)).toBe(`details: ${path.join(h.dirs.statusDir, 'doctor.json')}`);
     expect(cli.stdout).toMatch(/^barrier\s+vite-hmr\s+ok\s/m);
     expect(cli.stdout).toMatch(/^login\s+http-hook\s+ok\s/m);
+  });
+
+  it('--json prints the report itself, which is also what doctor.json holds', async () => {
+    const cli = await h.cli('doctor', '--json');
+    expect(cli.code).toBe(0);
+    const printed = JSON.parse(cli.stdout) as DoctorReport;
+    expect(printed.ok).toBe(true);
+    expect(Object.keys(printed.capabilities)).toEqual(Object.keys(green.capabilities));
+    expect(printed).toEqual(JSON.parse(fs.readFileSync(path.join(h.dirs.statusDir, 'doctor.json'), 'utf8')));
   });
 
   it('with the dev server stopped: barrier timeout-only, login failed, still exit 0, under 10 s', async () => {

@@ -34,7 +34,11 @@ src/
   cli.ts            arg parsing, subcommands
   config.ts         load + validate config, env overrides
   paths.ts          status/artifact/scratch dirs
-  git.ts            tree hash, HEAD tree, changed files
+  status.ts         status.json shape, reading it, pid helpers, atomic file writes
+  exit.ts           exit codes
+  text.ts           one-line error messages (config errors keep every field)
+  globs.ts          screen/backend classification shared by watch, finish, doctor
+  git.ts            tree hash, HEAD tree, changed files (and the range they came from)
   trigger/
     vite-hmr.ts     freshness barrier: HMR websocket client
     fs-watch.ts     trigger: screen + backend globs
@@ -95,10 +99,10 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 ## Files the daemon writes (status dir)
 
 - `daemon.pid`: pid as text.
-- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastEventAt, pending, pendingSince, lastError, frames }`. `pid` is the watcher process; `anchor` is the `HEAD` commit sha when the watcher started (null outside a repo or with no commits). `pending` is true from the first relevant file event of a change (before the debounce ends) until its batch, including re-queues, is fully handled; `pendingSince` and `lastEventAt` are ISO timestamps (or null). `lastError` is the latest unresolved problem (a refused capture, a failed capture) and is cleared by the next fully captured batch. `finish` adds `lastFinish` to the same file.
+- `status.json`: `{ state: "starting"|"ready"|"capturing"|"error"|"stopped", sessionId, pid, startedAt, trigger: "fs-watch", barrier: "vite-hmr"|"timeout-only", anchor, lastCaptureAt, lastEventAt, pending, pendingSince, lastError, frames }`. `pid` is the watcher process; `anchor` is the `HEAD` commit sha when the watcher started (null outside a repo or with no commits). `pending` is true from the first relevant file event of a change (before the debounce ends) until its batch, including re-queues, is fully handled; `pendingSince` and `lastEventAt` are ISO timestamps (or null). `lastError` is the latest unresolved problem (a refused capture, a failed capture) and is cleared by the next fully captured batch. `finish` adds `lastFinish: { at, ok, failures, proofBlockPath, summary }` to the same file on every outcome. `status` reports a stored `starting`/`ready`/`capturing` whose watcher process is gone as `state: "stopped"`, `stale: true`, `lastError: "watcher exited without stopping"`.
 - `watcher.log`: one line per event, ISO timestamp first.
 - `doctor.json`: resolved tier per capability.
-- `proof-block.md`: written by `finish`.
+- `proof-block.md`: written by `finish` on every outcome (a failure block when finish could not run: bad config, not a git repo, internal error), atomically (tmp + rename).
 - `scratch/index.jsonl` + `scratch/frames/<id>.png`.
 
 ## Frame record (one JSON line in index.jsonl)
@@ -139,8 +143,24 @@ Capture waits: `load`, then network idle (500 ms, capped at 5 s), `document.font
    - No such frame → failure `no frame at HEAD for <route>`.
    - Headline status not `clean` → failure `<route> final frame is <status>`. Never fall back to an earlier clean frame.
 5. Copy headlines to the artifact dir as `<slug>-<shortTree>.png`. Write `proof-block.md` with one `<img>` per route, plus the route, status, and tree hash.
-6. Exit 1 on any failure (proof block still written, failures listed in it). Exit 0 otherwise.
-7. `--hook`: same work, capped at `finishBudgetMs`, never prints to stdout except one summary line, always exits 0, writes failures to `watcher.log` and `status.json`.
+6. After failures, remedy hints are printed on stderr (`visual-proof finish: hint: ...`) and listed under `**Next steps**` in the proof block, and returned as `hints`. The failure strings above never change. Hints: the watcher is not running (`run visual-proof start`); the watcher's last problem, from `status.json` `lastError` (e.g. a refused capture); the working tree differs from HEAD (`commit your changes, then rerun finish`); the newest frame is at a different tree than HEAD (both short hashes named).
+7. Exit codes: 0 ok; 1 proof failures; 3 setup or config error (invalid config, not a git repo); 4 internal error. Every outcome, including 3 and 4, writes `proof-block.md` and records `lastFinish`. A config error keeps every invalid field (flattened onto one line with `; `) on stderr and in the block.
+8. `--hook`: same work, capped at `finishBudgetMs`, never prints to stdout except one summary line, always exits 0, writes failures to `watcher.log` and `status.json`.
+9. `--json`: print the `FinishResult` (`ok`, `failures`, `hints`, `notes`, `routes`, `noScreenChanges`, `truncated`, `treeHash`, `range`, `proofBlockPath`, `proofBlock`, `summary`) on stdout instead of the proof block path. Exit codes are unchanged.
+
+stdout of `finish` is the proof block path on every branch, including `no screen changes` (that message goes to stderr).
+
+## CLI output and exit codes
+
+| Command | stdout | exit |
+| --- | --- | --- |
+| `start` | status JSON plus `paths: { statusDir, proofBlock, log, doctor }` (reattaches if running) | 0; 3 config/setup (the watcher cannot start); 4 internal |
+| `status` | status JSON plus `paths` | 0 |
+| `stop` | status JSON | 0; 4 if the daemon cannot be signalled |
+| `watch` | log lines when a TTY | 0 after SIGINT/SIGTERM; 3 config/setup |
+| `finish` | proof block path (`--json`: the result; `--hook`: one summary line) | 0, 1, 3, 4 (`--hook`: always 0) |
+| `doctor` | table ending `details: <doctor.json path>` (`--json`: the report) | 0; 1 when the browser or the trigger is missing; 4 internal |
+| usage error | | 2 |
 
 ## Known-bad corpus (A1 Done gate)
 

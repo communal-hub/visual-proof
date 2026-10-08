@@ -26,6 +26,10 @@ it('stale-bundle: with the freshness marker gone the watcher refuses, and finish
   expect(result.ok).toBe(false);
   expect(result.failures).toEqual([`no frame at HEAD for ${REPORTS_ROUTE}`]);
   expect(readBlock(result)).toContain('**Failures**');
+  // The watcher is alive but refused: the hint says why there is no frame.
+  expect(result.hints.join('\n')).toContain("the watcher's last capture problem: stale: freshness marker missing, capture refused");
+  expect(result.hints.join('\n')).not.toContain('run visual-proof start');
+  expect(readBlock(result)).toContain('**Next steps**');
 
   const cli = await h.cli('finish');
   expect(cli.code).toBe(1);

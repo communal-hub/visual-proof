@@ -35,3 +35,9 @@ export function ensureDirs(dirs: Dirs): void {
     fs.mkdirSync(dir, { recursive: true });
   }
 }
+
+/** Where an agent should look: printed by `start` and `status`. */
+export function pathsInfo(dirs: Dirs) {
+  const files = statusFiles(dirs);
+  return { statusDir: dirs.statusDir, proofBlock: files.proofBlock, log: files.log, doctor: files.doctor };
+}

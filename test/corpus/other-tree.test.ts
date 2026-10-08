@@ -46,5 +46,8 @@ it('a full revert leaves nothing to prove: finish reports no screen changes (exi
 
   const result = await h.finish();
   expect(result).toMatchObject({ ok: true, noScreenChanges: true });
-  expect((await h.cli('finish')).stdout).toBe('no screen changes\n');
+  const cli = await h.cli('finish');
+  expect(cli.code).toBe(0);
+  expect(cli.stdout).toBe(`${result.proofBlockPath}\n`);
+  expect(cli.stderr).toContain('no screen changes');
 });

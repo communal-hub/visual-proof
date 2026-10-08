@@ -479,45 +479,128 @@ describe('runFinish when working directly on the base branch', () => {
   });
 });
 
+describe('remedy hints', () => {
+  const writeStatus = (extra: Record<string, unknown>): void => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'ready', sessionId: 's-test', ...extra }));
+  };
+
+  it('a missing watcher: run visual-proof start (and no hints at all when everything passes)', async () => {
+    editAndCommit('src/pages/A.vue');
+    const result = await finish();
+    expect(result.failures).toEqual(['no frame at HEAD for /a']);
+    expect(result.hints.join('\n')).toContain('run visual-proof start');
+    expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toMatch(/\*\*Next steps\*\*\n\n- the watcher is not running.*run visual-proof start/);
+
+    await frame('/a');
+    expect(await finish()).toMatchObject({ ok: true, hints: [] });
+  });
+
+  it('no start hint while the watcher is alive; its last problem is quoted instead', async () => {
+    editAndCommit('src/pages/A.vue');
+    writeStatus({ pid: process.pid, lastError: 'stale: freshness marker missing, capture refused' });
+    const result = await finish({ pollMs: 10 });
+    expect(result.hints.join('\n')).not.toContain('visual-proof start');
+    expect(result.hints).toContain("the watcher's last capture problem: stale: freshness marker missing, capture refused");
+  });
+
+  it('uncommitted changes: commit, then rerun finish', async () => {
+    editAndCommit('src/pages/A.vue');
+    write(repo, 'src/pages/A.vue', '<template>uncommitted</template>\n');
+    const result = await finish();
+    expect(result.hints.some((h) => /^working tree \([0-9a-f]{8}\) differs from HEAD \([0-9a-f]{8}\): commit your changes, then rerun finish$/.test(h))).toBe(true);
+  });
+
+  it('a newest frame from another tree: both short hashes are named', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: 'abcdef0123456789'.repeat(2) + 'abcdef01'.repeat(1) });
+    const head = (await headTree(repo))!;
+    const result = await finish();
+    expect(result.hints.some((h) => h.includes('the newest frame is at tree abcdef01 but HEAD is ' + head.slice(0, 8)))).toBe(true);
+  });
+
+  it('only failures other than "no frame" skip the capture-specific hints', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a', 'error');
+    const result = await finish();
+    expect(result.failures).toEqual(['/a final frame is error: error reason']);
+    expect(result.hints).toEqual([]);
+  });
+});
+
 describe('finishCommand', () => {
-  const writeConfig = (extra: Record<string, unknown> = {}): string => {
+  const blockPath = (): string => path.join(dirs.statusDir, 'proof-block.md');
+  const writeConfig = (extra: Record<string, unknown> = {}, body?: string): string => {
     const file = path.join(repo, 'visual-proof.config.json');
     fs.writeFileSync(
       file,
-      JSON.stringify({ appUrl: 'http://localhost:1', screenGlobs: ['src/**/*.vue'], backendGlobs: ['server/**'], ...extra }),
+      body ?? JSON.stringify({ appUrl: 'http://localhost:1', screenGlobs: ['src/**/*.vue'], backendGlobs: ['server/**'], ...extra }),
     );
     return file;
   };
+  const lastFinish = () => JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'status.json'), 'utf8')).lastFinish;
 
-  async function run(hook: boolean, configPath = writeConfig()) {
+  async function run(hook: boolean, configPath = writeConfig(), extra: { json?: boolean; env?: NodeJS.ProcessEnv } = {}) {
     let stdout = '';
     let stderr = '';
-    const code = await finishCommand({ configPath, hook, env, out: (t) => (stdout += t), err: (t) => (stderr += t) });
+    const code = await finishCommand({
+      configPath,
+      hook,
+      json: extra.json,
+      env: extra.env ?? env,
+      out: (t) => (stdout += t),
+      err: (t) => (stderr += t),
+    });
     return { code, stdout, stderr };
   }
 
-  it('prints only "no screen changes" and exits 0', async () => {
+  it('prints the proof block path even for "no screen changes", with the reason on stderr, and exits 0', async () => {
     editAndCommit('README.md', '# changed\n');
-    expect(await run(false)).toEqual({ code: 0, stdout: 'no screen changes\n', stderr: '' });
+    expect(await run(false)).toEqual({
+      code: 0,
+      stdout: `${blockPath()}\n`,
+      stderr: 'visual-proof finish: no screen changes (diffed main...HEAD)\n',
+    });
+    expect(fs.readFileSync(blockPath(), 'utf8')).toContain('no screen changes');
   });
 
-  it('exits 1 on failure, printing the block path on stdout and failures on stderr', async () => {
+  it('exits 1 on failure: block path on stdout, failures then hints on stderr', async () => {
     editAndCommit('src/pages/A.vue');
     const r = await run(false, writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] } }));
     expect(r.code).toBe(1);
-    expect(r.stdout).toBe(`${path.join(dirs.statusDir, 'proof-block.md')}\n`);
-    expect(r.stderr).toBe('visual-proof finish: no frame at HEAD for /a\n');
+    expect(r.stdout).toBe(`${blockPath()}\n`);
+    const lines = r.stderr.trimEnd().split('\n');
+    expect(lines[0]).toBe('visual-proof finish: no frame at HEAD for /a');
+    expect(lines.slice(1).every((l) => l.startsWith('visual-proof finish: hint: '))).toBe(true);
+    expect(r.stderr).toContain('run visual-proof start');
   });
 
   it('exits 1 when A.vue has no route: the block path on stdout, the way out on stderr', async () => {
     editAndCommit('src/pages/A.vue');
     const r = await run(false);
     expect(r.code).toBe(1);
-    expect(r.stdout.trim()).toBe(path.join(dirs.statusDir, 'proof-block.md'));
+    expect(r.stdout.trim()).toBe(blockPath());
     expect(r.stderr).toContain('no route for src/pages/A.vue (not reachable from routeFiles; add staticRoutes or ignoreScreenGlobs)');
   });
 
-  it('--hook prints exactly one line and exits 0, recording lastFinish without clobbering status.json', async () => {
+  it('--json prints the whole result on stdout (failures still on stderr)', async () => {
+    editAndCommit('src/pages/A.vue');
+    const r = await run(false, writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] } }), { json: true });
+    expect(r.code).toBe(1);
+    const result = JSON.parse(r.stdout);
+    expect(result).toMatchObject({
+      ok: false,
+      failures: ['no frame at HEAD for /a'],
+      noScreenChanges: false,
+      proofBlockPath: blockPath(),
+      range: 'main...HEAD',
+    });
+    expect(result.hints.length).toBeGreaterThan(0);
+    expect(result.proofBlock).toBe(fs.readFileSync(blockPath(), 'utf8'));
+    expect(r.stderr).toContain('no frame at HEAD for /a');
+  });
+
+  it('--hook prints exactly one line and exits 0, recording lastFinish (with the block path and summary) without clobbering status.json', async () => {
     fs.mkdirSync(dirs.statusDir, { recursive: true });
     fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'ready', sessionId: 's-1', frames: 7 }));
     const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] } });
@@ -526,28 +609,77 @@ describe('finishCommand', () => {
     const r = await run(true, file);
     expect(r.code).toBe(0);
     expect(r.stderr).toBe('');
-    expect(r.stdout).toBe(`visual-proof: 1 failure, see ${path.join(dirs.statusDir, 'proof-block.md')}\n`);
+    expect(r.stdout).toBe(`visual-proof: 1 failure, see ${blockPath()}\n`);
 
     const status = JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'status.json'), 'utf8'));
     expect(status).toMatchObject({ state: 'ready', sessionId: 's-1', frames: 7 });
-    expect(status.lastFinish).toMatchObject({ ok: false, failures: ['no frame at HEAD for /a'] });
+    expect(status.lastFinish).toMatchObject({
+      ok: false,
+      failures: ['no frame at HEAD for /a'],
+      proofBlockPath: blockPath(),
+      summary: `visual-proof: 1 failure, see ${blockPath()}`,
+    });
     expect(Date.parse(status.lastFinish.at)).not.toBeNaN();
     expect(fs.readFileSync(path.join(dirs.statusDir, 'watcher.log'), 'utf8')).toMatch(/^\S+ finish failure: no frame at HEAD for \/a$/m);
   });
 
-  it('--hook still exits 0 with one line when the config is broken', async () => {
-    const r = await run(true, path.join(repo, 'missing.json'));
-    expect(r.code).toBe(0);
-    expect(r.stdout.trim().split('\n')).toHaveLength(1);
-    expect(r.stdout).toContain('finish error: config file not found');
-    expect(JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'status.json'), 'utf8')).lastFinish.ok).toBe(false);
-  });
+  describe('a finish that cannot run still writes a failure block and records lastFinish', () => {
+    it('missing config: exit 3, one line on stderr', async () => {
+      const r = await run(false, path.join(repo, 'missing.json'));
+      expect(r.code).toBe(3);
+      expect(r.stderr).toMatch(/^visual-proof finish: config file not found: .*\n$/);
+      expect(r.stdout).toBe(`${blockPath()}\n`);
+      expect(fs.readFileSync(blockPath(), 'utf8')).toMatch(/\*\*Failures\*\*\n\n- config file not found/);
+      expect(lastFinish()).toMatchObject({ ok: false, proofBlockPath: blockPath() });
+      expect(lastFinish().failures[0]).toContain('config file not found');
+    });
 
-  it('without --hook a broken config exits 1 with a one-line reason', async () => {
-    const r = await run(false, path.join(repo, 'missing.json'));
-    expect(r.code).toBe(1);
-    expect(r.stderr).toMatch(/^visual-proof finish: config file not found: .*\n$/);
-    expect(r.stdout).toBe('');
+    it('invalid config: every invalid field is kept, on stderr and in the block', async () => {
+      const file = writeConfig({}, JSON.stringify({ appUrl: 5, viewport: 'wide', maxFrames: -1 }));
+      const r = await run(false, file);
+      expect(r.code).toBe(3);
+      for (const field of ['"appUrl"', '"viewport"', '"maxFrames"']) {
+        expect(r.stderr).toContain(field);
+        expect(fs.readFileSync(blockPath(), 'utf8')).toContain(field);
+      }
+      expect(r.stderr.trimEnd().split('\n')).toHaveLength(1);
+      expect(lastFinish().failures[0]).toContain('"maxFrames"');
+    });
+
+    it('--hook: still one line, exit 0, block and lastFinish written', async () => {
+      const r = await run(true, path.join(repo, 'missing.json'));
+      expect(r.code).toBe(0);
+      expect(r.stdout.trim().split('\n')).toHaveLength(1);
+      expect(r.stdout).toContain('finish error: config file not found');
+      expect(r.stdout).toContain(blockPath());
+      expect(fs.existsSync(blockPath())).toBe(true);
+      expect(lastFinish().ok).toBe(false);
+    });
+
+    it('not a git repository: setup error (3)', async () => {
+      const plain = tmpDir('vp-plain-');
+      fs.writeFileSync(path.join(plain, 'visual-proof.config.json'), JSON.stringify({ appUrl: 'http://localhost:1' }));
+      const r = await run(false, path.join(plain, 'visual-proof.config.json'));
+      expect(r.code).toBe(3);
+      expect(r.stderr).toContain('is not a git repository');
+      expect(fs.readFileSync(blockPath(), 'utf8')).toContain('is not a git repository');
+    });
+
+    it('an internal error: exit 4 (0 with --hook), block written', async () => {
+      const blocker = path.join(tmpDir('vp-blocker-'), 'file');
+      fs.writeFileSync(blocker, 'x');
+      const broken = { ...env, VISUAL_PROOF_ARTIFACT_DIR: path.join(blocker, 'artifacts') }; // cannot be created
+      editAndCommit('README.md', '# changed\n');
+      const r = await run(false, writeConfig(), { env: broken });
+      expect(r.code).toBe(4);
+      expect(r.stderr).toContain('internal error:');
+      expect(fs.readFileSync(blockPath(), 'utf8')).toContain('internal error');
+      expect(lastFinish()).toMatchObject({ ok: false });
+
+      const hook = await run(true, writeConfig(), { env: broken });
+      expect(hook.code).toBe(0);
+      expect(hook.stdout.trim().split('\n')).toHaveLength(1);
+    });
   });
 
   it('creates status.json with a stopped state when no daemon ever ran', async () => {
@@ -555,5 +687,11 @@ describe('finishCommand', () => {
     await run(true);
     const status = JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'status.json'), 'utf8'));
     expect(status).toMatchObject({ state: 'stopped', lastFinish: { ok: true, failures: [] } });
+  });
+
+  it('writes the block atomically: no temporary files are left behind', async () => {
+    editAndCommit('README.md', '# changed\n');
+    await run(false);
+    expect(fs.readdirSync(dirs.statusDir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
 });

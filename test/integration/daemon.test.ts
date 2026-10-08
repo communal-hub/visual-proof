@@ -69,7 +69,13 @@ describe('daemon lifecycle via the CLI', () => {
     const started = await cli('start');
     expect(started.stderr).toBe('');
     expect(started.code).toBe(0);
-    expect(JSON.parse(started.stdout)).toMatchObject({ state: 'ready', trigger: 'fs-watch', barrier: 'vite-hmr' });
+    expect(JSON.parse(started.stdout)).toMatchObject({
+      state: 'ready',
+      trigger: 'fs-watch',
+      barrier: 'vite-hmr',
+      pending: false,
+      paths: { statusDir: h.dirs.statusDir, proofBlock: files.proofBlock, log: files.log, doctor: files.doctor },
+    });
 
     const pid = readPid(files.pid)!;
     expect(pid).toBeGreaterThan(0);
@@ -96,7 +102,14 @@ describe('daemon lifecycle via the CLI', () => {
 
     // status command
     const st = await cli('status');
-    expect(JSON.parse(st.stdout)).toMatchObject({ state: 'ready', sessionId, frames: 1 });
+    expect(JSON.parse(st.stdout)).toMatchObject({
+      state: 'ready',
+      sessionId,
+      frames: 1,
+      pid,
+      anchor: h.git('rev-parse', 'HEAD'),
+      paths: { statusDir: h.dirs.statusDir, proofBlock: files.proofBlock, log: files.log, doctor: files.doctor },
+    });
 
     // stop
     const stopped = await cli('stop');
@@ -110,6 +123,28 @@ describe('daemon lifecycle via the CLI', () => {
     const stoppedAgain = await cli('stop');
     expect(stoppedAgain.code).toBe(0);
     expect(JSON.parse(stoppedAgain.stdout)).toMatchObject({ state: 'stopped' });
+  });
+
+  it('status after the daemon is SIGKILLed is stopped and stale, not "ready"', async () => {
+    const started = await cli('start');
+    expect(started.code).toBe(0);
+    const pid = readPid(files.pid)!;
+    expect(JSON.parse(fs.readFileSync(files.status, 'utf8')).state).toBe('ready');
+
+    process.kill(pid, 'SIGKILL');
+    await until(() => !isAlive(pid), 5000);
+    // The daemon never got to write "stopped": the file on disk still claims it is ready.
+    expect(JSON.parse(fs.readFileSync(files.status, 'utf8')).state).toBe('ready');
+
+    const st = await cli('status');
+    expect(st.code).toBe(0);
+    expect(JSON.parse(st.stdout)).toMatchObject({
+      state: 'stopped',
+      stale: true,
+      lastError: 'watcher exited without stopping',
+      paths: { statusDir: h.dirs.statusDir },
+    });
+    expect((await cli('stop')).code).toBe(0);
   });
 
   it('a stale pid file does not block start', async () => {
@@ -136,7 +171,7 @@ describe('daemon lifecycle via the CLI', () => {
         (r) => ({ code: 0, stderr: r.stderr }),
         (e: { code?: number; stderr?: string }) => ({ code: e.code ?? 1, stderr: e.stderr ?? '' }),
       );
-      expect(code).toBe(1);
+      expect(code).toBe(3);
       expect(stderr).toMatch(/^visual-proof start: watcher failed to start: /);
       expect(stderr).not.toContain('    at ');
       expect(fs.existsSync(files.pid)).toBe(false);
