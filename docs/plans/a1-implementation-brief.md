@@ -104,7 +104,7 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 
 ```json
 { "id": "f-000042", "sessionId": "s-...", "route": "/invoices/1", "routeKey": "/invoices/:id",
-  "at": "2026-10-08T12:00:00.000Z", "treeHash": "<40 hex>", "trigger": "vite-hmr|fs-watch|initial",
+  "at": "2026-10-08T12:00:00.000Z", "treeHash": "<40 hex>", "trigger": "screen|backend",
   "sourceFile": "src/pages/Invoice.vue", "status": "clean|loading|error|blank",
   "reasons": ["console error: ..."], "png": "frames/f-000042.png" }
 ```
