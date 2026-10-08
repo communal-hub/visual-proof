@@ -3,6 +3,32 @@ import path from 'node:path';
 
 export const CONFIG_FILE_NAME = 'visual-proof.config.json';
 
+/**
+ * Dev overlays that float over the app in a Vite dev server and have no business in a still.
+ * Sources (read from the published packages):
+ *  - `#__vue-devtools-container__`: root element vite-plugin-vue-devtools 8.x appends to `<body>`; it holds the
+ *    floating pill (`.vue-devtools__anchor`), the panel iframe (`.vue-devtools-frame`) and its resize handles.
+ *  - `.vue-devtools__anchor`, `.vue-devtools-frame`: the pill and panel by class, in case the root id changes.
+ *  - `#vue-devtools-anchor`: the pill's id in older vite-plugin-vue-devtools releases (still referenced by 7.x CSS).
+ *  - `#__vue-devtools-component-inspector__`: @vue/devtools-kit's component-inspector highlight box.
+ *  - `.vue-inspector-container`: vite-plugin-vue-inspector's floating toggle (standalone use or through devtools).
+ * `vite-error-overlay` is deliberately absent: an error on screen is evidence. `[data-v-inspector]` is absent too:
+ * vite-plugin-vue-inspector stamps that attribute on every element of the app, so hiding it would hide the app.
+ */
+export const DEFAULT_HIDE_SELECTORS: readonly string[] = [
+  '#__vue-devtools-container__',
+  '.vue-devtools__anchor',
+  '.vue-devtools-frame',
+  '#vue-devtools-anchor',
+  '#__vue-devtools-component-inspector__',
+  '.vue-inspector-container',
+];
+
+export type RenderCheckMode = 'fail' | 'warn' | 'off';
+
+export const DEFAULT_MAX_CAPTURE_HEIGHT = 6000;
+export const DEFAULT_WARMUP_BUDGET_MS = 60_000;
+
 export interface LoginConfig {
   type: 'http-hook' | 'none';
   url?: string;
@@ -33,6 +59,25 @@ export interface Config {
   login: LoginConfig;
   appRoot: string;
   spinnerSelectors: string[];
+  /**
+   * Routes (route keys or concrete paths) visited before the watcher reports `ready`, so Vite compiles and
+   * optimizes dependencies ahead of the first real capture. Undefined: the first route of the import graph
+   * without unfilled params, else `/`. An empty array disables the warm-up.
+   */
+  warmupRoutes?: string[];
+  /** Total time the warm-up may take before it is abandoned (the watcher still becomes ready). */
+  warmupBudgetMs: number;
+  /** CSS selector of the element that scrolls inside the page; undefined detects the largest scroller. */
+  scrollContainer?: string;
+  /** Stills taller than this many CSS pixels are cut off at this height. */
+  maxCaptureHeight: number;
+  /** Selectors hidden (`visibility: hidden`) before a screenshot: {@link DEFAULT_HIDE_SELECTORS} plus the configured ones. */
+  hideSelectors: string[];
+  /**
+   * Whether `finish` requires every changed `.vue` file to have rendered on at least one of its routes:
+   * `fail` (default) makes "never rendered" a failure, `warn` a note, `off` skips the check (and the capture-time walk).
+   */
+  renderCheck: RenderCheckMode;
   maxFrames: number;
   finishBudgetMs: number;
   baseRef: string;
@@ -122,6 +167,12 @@ export function parseConfig(
     login,
     appRoot: v.string('appRoot') ?? '#app',
     spinnerSelectors: v.stringArray('spinnerSelectors') ?? ['.spinner', '[aria-busy=true]'],
+    warmupRoutes: v.stringArray('warmupRoutes'),
+    warmupBudgetMs: v.posInt('warmupBudgetMs') ?? DEFAULT_WARMUP_BUDGET_MS,
+    scrollContainer: v.string('scrollContainer'),
+    maxCaptureHeight: v.posInt('maxCaptureHeight') ?? DEFAULT_MAX_CAPTURE_HEIGHT,
+    hideSelectors: hideSelectors(v.stringArray('hideSelectors'), v.boolean('hideSelectorsReplace') ?? false),
+    renderCheck: parseRenderCheck(v.string('renderCheck'), errors),
     maxFrames: v.posInt('maxFrames') ?? 200,
     finishBudgetMs: v.posInt('finishBudgetMs') ?? 25_000,
     baseRef: v.string('baseRef') ?? 'main',
@@ -131,6 +182,19 @@ export function parseConfig(
     throw new ConfigError(`${source}: invalid config\n${errors.map((e) => `  - ${e}`).join('\n')}`);
   }
   return config;
+}
+
+/** Defaults plus the configured selectors (deduplicated), or only the configured ones when `replace` is set. */
+function hideSelectors(configured: string[] | undefined, replace: boolean): string[] {
+  const extra = configured ?? [];
+  return [...new Set(replace ? extra : [...DEFAULT_HIDE_SELECTORS, ...extra])];
+}
+
+function parseRenderCheck(value: string | undefined, errors: string[]): RenderCheckMode {
+  if (value === undefined) return 'fail';
+  if (value === 'fail' || value === 'warn' || value === 'off') return value;
+  errors.push(`"renderCheck" must be "fail", "warn" or "off", got ${JSON.stringify(value)}`);
+  return 'fail';
 }
 
 function defaultLogin(): LoginConfig {

@@ -67,6 +67,8 @@ export interface Harness {
 export interface HarnessOptions {
   /** Fixture config keys to override before the real port is applied. */
   config?: Record<string, unknown>;
+  /** Give the dev server its own empty dependency cache, so its first page load really is a cold start. */
+  freshViteCache?: boolean;
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -99,7 +101,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 
   try {
     const port = await freePort();
-    vite = await startVite(dir, port);
+    vite = await startVite(dir, port, options.freshViteCache ? path.join(root, 'vite-cache') : undefined);
 
     const appUrl = `http://localhost:${port}`;
     const fixtureConfig = JSON.parse(fs.readFileSync(path.join(FIXTURE_DIR, 'visual-proof.config.json'), 'utf8')) as Record<string, unknown>;
@@ -267,11 +269,11 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function startVite(dir: string, port: number): Promise<ViteProcess> {
+async function startVite(dir: string, port: number, cacheDir?: string): Promise<ViteProcess> {
   const viteBin = path.join(dir, 'node_modules/vite/bin/vite.js');
   const child: ChildProcess = spawn(process.execPath, [viteBin, '--strictPort'], {
     cwd: dir,
-    env: { ...process.env, PORT: String(port), FORCE_COLOR: '0' },
+    env: { ...process.env, PORT: String(port), FORCE_COLOR: '0', ...(cacheDir ? { VP_FIXTURE_CACHE_DIR: cacheDir } : {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';

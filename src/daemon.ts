@@ -163,6 +163,14 @@ export async function startDaemon(ctx: DaemonContext): Promise<number> {
       await sleep(POLL_MS);
     }
 
+    // The warm-up of a cold dev server can outlast this wait. The watcher is up and still warming:
+    // report that (state `starting`, `warmup.state` running) and leave `status --wait` to block until ready.
+    const last = readStatus(files.status);
+    if (last?.state === 'starting' && last.warmup?.state === 'running' && isAlive(pid)) {
+      print(last);
+      return EXIT.OK;
+    }
+
     try {
       process.kill(pid, 'SIGTERM');
     } catch {

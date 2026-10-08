@@ -18,6 +18,11 @@ export interface Frame {
   sourceFile?: string;
   status: FrameStatus;
   reasons: string[];
+  /**
+   * Repo-relative component files that were mounted in the page (Vue 3, from `__file`), or null when that
+   * could not be read (production build, non-Vue app, render check off). Absent on frames from older versions.
+   */
+  renderedFiles?: string[] | null;
   /** Path of the PNG relative to the scratch dir. */
   png: string;
 }

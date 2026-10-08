@@ -5,19 +5,26 @@ import { runWatch, startDaemon, stopDaemon } from './daemon.js';
 import { doctorCommand } from './doctor.js';
 import { EXIT } from './exit.js';
 import { finishCommand } from './finish.js';
-import { pathsInfo, resolveDirs, statusFiles, type Dirs } from './paths.js';
-import { readStatusFile, watcherPid } from './status.js';
+import { pathsInfo, resolveDirs } from './paths.js';
+import { DEFAULT_READY_TIMEOUT_S, waitForReady } from './ready.js';
+import { readLiveStatus } from './status.js';
 import { firstLine } from './text.js';
 
-export type Command = 'start' | 'stop' | 'status' | 'watch' | 'finish' | 'doctor';
+export type Command = 'start' | 'stop' | 'status' | 'ready' | 'watch' | 'finish' | 'doctor';
 
-const COMMANDS: readonly Command[] = ['start', 'stop', 'status', 'watch', 'finish', 'doctor'];
+const COMMANDS: readonly Command[] = ['start', 'stop', 'status', 'ready', 'watch', 'finish', 'doctor'];
+
+export { readLiveStatus };
 
 export interface ParsedArgs {
   command: Command | null;
   configPath?: string;
   hook: boolean;
   json: boolean;
+  /** `status --wait` (and the `ready` command): block until the watcher is ready. */
+  wait: boolean;
+  /** Seconds `--wait` may block; undefined means the default. */
+  timeoutSec?: number;
   help: boolean;
 }
 
@@ -30,7 +37,8 @@ Usage: visual-proof <command> [options]
 Commands:
   start      start the capture daemon (or reattach to the running one)
   stop       stop the capture daemon
-  status     print the daemon status
+  status     print the daemon status (--wait: block until it is ready)
+  ready      alias for "status --wait"
   watch      run the watcher in the foreground
   finish     assemble headline stills and the proof block for HEAD
   doctor     check the browser, change trigger, barrier, login and routes
@@ -39,6 +47,10 @@ Options:
   --config <path>   config file (default: ./visual-proof.config.json)
   --hook            finish only: quiet, time-capped, always exits 0
   --json            finish, doctor: print the result as JSON on stdout
+  --wait            status: block until the watcher is ready with nothing pending
+                    (exit 0), or fail fast on error / a dead watcher / stop (exit 1)
+  --timeout <s>     status --wait, ready: give up after this many seconds
+                    (default ${DEFAULT_READY_TIMEOUT_S}); exit 1 with a one-line reason
   -h, --help        show this help
 
 Output:
@@ -52,15 +64,18 @@ Output:
                     --json prints the report instead
 
 Files (in $VISUAL_PROOF_STATUS_DIR, default /tmp/cursor/visual-proof):
-  status.json       daemon state, pending work, anchor, lastError, lastFinish
+  status.json       daemon state, warm-up, pending work, anchor, lastError, lastFinish
+  anchors.json      diff anchor per repo and branch (kept across daemon restarts)
   proof-block.md    what finish last wrote, success or failure
   watcher.log       one line per event
   doctor.json       the last doctor report
   Headline stills go to $VISUAL_PROOF_ARTIFACT_DIR (default /opt/cursor/artifacts).
 
 Exit codes:
-  0   ok (finish: every changed screen has a clean frame at HEAD, or there are none)
+  0   ok (finish: every changed screen has a clean frame at HEAD, or there are none;
+      status --wait / ready: the watcher is ready)
   1   finish: proof failures, listed on stderr and in the proof block
+      status --wait / ready: not ready (one line on stderr with the reason and paths)
       doctor: the browser or the change trigger is missing
   2   usage error
   3   setup or config error (invalid config, not a git repo, the watcher cannot start)
@@ -73,7 +88,7 @@ Examples:
 `;
 
 export function parseArgs(argv: string[]): ParsedArgs {
-  const parsed: ParsedArgs = { command: null, hook: false, json: false, help: false };
+  const parsed: ParsedArgs = { command: null, hook: false, json: false, wait: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '-h' || arg === '--help') {
@@ -82,6 +97,13 @@ export function parseArgs(argv: string[]): ParsedArgs {
       parsed.hook = true;
     } else if (arg === '--json') {
       parsed.json = true;
+    } else if (arg === '--wait') {
+      parsed.wait = true;
+    } else if (arg === '--timeout' || arg.startsWith('--timeout=')) {
+      const value = arg === '--timeout' ? argv[++i] : arg.slice('--timeout='.length);
+      const seconds = value === undefined || value === '' ? Number.NaN : Number(value);
+      if (!Number.isFinite(seconds) || seconds <= 0) throw new UsageError('--timeout requires a positive number of seconds');
+      parsed.timeoutSec = seconds;
     } else if (arg === '--config' || arg.startsWith('--config=')) {
       const value = arg === '--config' ? argv[++i] : arg.slice('--config='.length);
       if (!value) throw new UsageError('--config requires a path');
@@ -101,6 +123,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
   if (parsed.json && parsed.command !== 'finish' && parsed.command !== 'doctor' && !parsed.help) {
     throw new UsageError('--json is only valid with the finish and doctor commands');
+  }
+  if (parsed.wait && parsed.command !== 'status' && parsed.command !== 'ready' && !parsed.help) {
+    throw new UsageError('--wait is only valid with the status command');
+  }
+  if (parsed.timeoutSec !== undefined && !(parsed.wait || parsed.command === 'ready') && !parsed.help) {
+    throw new UsageError('--timeout is only valid with status --wait or ready');
   }
   return parsed;
 }
@@ -125,6 +153,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
   }
 
   try {
+    if (args.command === 'ready' || (args.command === 'status' && args.wait)) {
+      return await waitForReady({ dirs: resolveDirs(env), timeoutSec: args.timeoutSec });
+    }
     if (args.command === 'status') return printStatus(env);
     if (args.command === 'start') return await startDaemon({ configPath: args.configPath, env });
     if (args.command === 'stop') return await stopDaemon({ configPath: args.configPath, env });
@@ -137,27 +168,6 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     process.stderr.write(`visual-proof ${args.command}: internal error: ${firstLine(err)}\n`);
     return EXIT.INTERNAL;
   }
-}
-
-const RUNNING_STATES = ['starting', 'ready', 'capturing'];
-
-/**
- * The status file as it should be read: a status that claims the watcher is running while its
- * process is gone (killed, crashed, rebooted) is reported as stopped and stale rather than trusted.
- */
-export function readLiveStatus(dirs: Dirs): Record<string, unknown> {
-  const stored = readStatusFile(statusFiles(dirs).status);
-  if (stored === null) return { state: 'stopped' };
-  if (RUNNING_STATES.includes(stored.state as string) && watcherPid(dirs, stored) === null) {
-    return {
-      ...stored,
-      state: 'stopped',
-      stale: true,
-      pending: false,
-      lastError: 'watcher exited without stopping',
-    };
-  }
-  return { ...stored };
 }
 
 function printStatus(env: NodeJS.ProcessEnv): number {

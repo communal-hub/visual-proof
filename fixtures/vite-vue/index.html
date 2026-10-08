@@ -6,6 +6,13 @@
   </head>
   <body>
     <div id="app"></div>
+    <!-- Stand-in for the vite-plugin-vue-devtools overlay (same root id and pill class): visual-proof hides it. -->
+    <div id="__vue-devtools-container__" data-v-inspector-ignore="true">
+      <div
+        class="vue-devtools__anchor"
+        style="position: fixed; left: 50%; bottom: 12px; width: 80px; height: 30px; margin-left: -40px; background: rgb(255, 0, 255); z-index: 2147483645"
+      ></div>
+    </div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
