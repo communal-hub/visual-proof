@@ -45,6 +45,10 @@ export interface BrowserOptions {
   navigationTimeoutMs?: number;
   /** Cap on waiting for the network to go quiet. Default 5 s. */
   networkIdleCapMs?: number;
+  /** After a login failure, skip new login attempts for this long and reuse the failure. Default 30 s. */
+  loginBackoffMs?: number;
+  /** Clock for the login back-off; tests inject a fake. */
+  now?: () => number;
 }
 
 const STALE_DEP_RETRIES = 2;
@@ -53,6 +57,8 @@ const STALE_DEP_PAUSE_MS = 300;
 function hasStaleDepError(consoleErrors: string[]): boolean {
   return consoleErrors.some((message) => message.includes('Outdated Optimize Dep'));
 }
+
+const LOGIN_BACKOFF_MS = 30_000;
 
 const LOGIN_PATH = /(^|\/)(login|log-in|signin|sign-in)(\/|$)/i;
 
@@ -65,6 +71,8 @@ export class Browser implements Capturer {
   private browser: PwBrowser | null = null;
   private context: BrowserContext | null = null;
   private loggedIn = false;
+  /** The last login failure and when it happened; reused (not retried) until the back-off passes. */
+  private loginFailure: { error: LoginError; at: number } | null = null;
   private readonly pages = new Set<Page>();
 
   constructor(
@@ -130,6 +138,7 @@ export class Browser implements Capturer {
     this.browser = null;
     this.context = null;
     this.loggedIn = false;
+    this.loginFailure = null;
     for (const page of [...this.pages]) await page.close().catch(() => {});
     this.pages.clear();
     await browser?.close().catch(() => {});
@@ -150,6 +159,7 @@ export class Browser implements Capturer {
       reducedMotion: 'reduce',
     });
     this.loggedIn = false;
+    this.loginFailure = null;
     return this.context;
   }
 
@@ -157,7 +167,23 @@ export class Browser implements Capturer {
 
   private async ensureLoggedIn(): Promise<void> {
     if (this.config.login.type !== 'http-hook' || this.loggedIn) return;
-    await this.login();
+    const failure = this.loginFailure;
+    if (failure) {
+      const backoffMs = this.options.loginBackoffMs ?? LOGIN_BACKOFF_MS;
+      if (this.now() - failure.at < backoffMs) throw failure.error;
+      this.loginFailure = null;
+    }
+    try {
+      await this.login();
+    } catch (err) {
+      if (err instanceof LoginError) this.loginFailure = { error: err, at: this.now() };
+      throw err;
+    }
+    this.loginFailure = null;
+  }
+
+  private now(): number {
+    return (this.options.now ?? Date.now)();
   }
 
   /** POST the login hook through the context so its session cookie lands in the shared jar. */

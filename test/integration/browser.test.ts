@@ -88,6 +88,46 @@ describe('Browser.capture', () => {
     }
   });
 
+  it('does not hammer the login hook after a failure: one attempt per back-off window, cleared by a browser relaunch', async () => {
+    fs.writeFileSync(path.join(h.dir, 'wrong-token'), 'nope\n');
+    let clock = 1_000_000;
+    const bad = await Browser.launch(
+      { ...h.config, login: { ...h.config.login, tokenFile: 'wrong-token' } },
+      { now: () => clock, loginBackoffMs: 30_000 },
+    );
+    const internals = bad as unknown as { login(): Promise<void> };
+    const realLogin = internals.login.bind(bad);
+    let attempts = 0;
+    internals.login = () => {
+      attempts++;
+      return realLogin();
+    };
+    try {
+      const expected = 'login failed: HTTP 403 from /__playwright__/login';
+      for (let i = 0; i < 3; i++) {
+        const result = await bad.capture(url('/manage/invoices/1'));
+        expect(result.signals.authFailure).toBe(expected);
+        expect(triage(result.signals).status).toBe('error');
+      }
+      expect(attempts).toBe(1);
+
+      clock += 29_000;
+      await bad.capture(url('/manage/invoices/1'));
+      expect(attempts).toBe(1);
+
+      clock += 2_000;
+      const later = await bad.capture(url('/manage/invoices/1'));
+      expect(attempts).toBe(2);
+      expect(later.signals.authFailure).toBe(expected);
+
+      await bad.close(); // a relaunch forgets the cached failure
+      await bad.capture(url('/manage/invoices/1'));
+      expect(attempts).toBe(3);
+    } finally {
+      await bad.close();
+    }
+  });
+
   it('reports navigation failures as an error frame with a (blank) screenshot instead of throwing', async () => {
     const result = await browser.capture('http://localhost:1/never');
     expect(result.signals.navOk).toBe(false);
