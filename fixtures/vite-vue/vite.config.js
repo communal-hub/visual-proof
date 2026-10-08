@@ -64,6 +64,9 @@ function fixtureBackend() {
         const url = new URL(req.url, 'http://localhost')
         const { pathname } = url
 
+        if (req.method === 'GET' && pathname === '/api/flags') {
+          return send(res, 200, readData().flags ?? {})
+        }
         if (req.method === 'GET' && pathname === '/api/invoices') {
           return send(res, 200, readData().invoices)
         }
@@ -96,6 +99,8 @@ function fixtureBackend() {
 }
 
 export default defineConfig({
+  // Tests that measure a cold start give each dev server its own dependency cache.
+  cacheDir: process.env.VP_FIXTURE_CACHE_DIR || undefined,
   plugins: [vue(), fixtureBackend()],
   resolve: { alias: { '@': path.join(root, 'src') } },
   server: {
