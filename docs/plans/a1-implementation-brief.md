@@ -73,6 +73,7 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "staticRoutes": { "src/pages/Reports.vue": ["/reports"] },
   "routeParams": { "/invoices/:id": "/invoices/1" },
   "screenGlobs": ["src/**/*.vue"],
+  "ignoreScreenGlobs": [],                      // files matching these are never screens (shared helpers, stories)
   "backendGlobs": ["server/**"],
   "login": {
     "type": "http-hook",                        // or "none"
@@ -129,7 +130,10 @@ Capture waits: `load`, then network idle (500 ms, capped at 5 s), `document.font
 ## finish semantics
 
 1. Changed files = the committed diff plus uncommitted changes, with paths relative to the config directory (git reports toplevel-relative paths; `git rev-parse --show-prefix` is stripped and anything outside the config directory dropped). The committed diff is the first of these that yields files: `<baseRef>...HEAD` (or `origin/<baseRef>...HEAD`), then `<anchor>..HEAD` (the `anchor` in `status.json`), then `HEAD~1..HEAD`. An empty `<baseRef>...HEAD` is not trusted: working directly on the base branch makes it empty even after commits. The range used is printed in the proof block notes (`diffed <range>`). If no changed file matches `screenGlobs` or `backendGlobs`, write an empty proof block (an HTML comment naming the range), print `no screen changes`, exit 0.
-2. Expected routes = routes resolved from the changed screen files, plus every route captured this session when a backend file changed.
+2. Expected routes = routes resolved from the changed screen files (a file matching `ignoreScreenGlobs` is not a screen), plus every route captured by the current daemon session (the `sessionId` in `status.json`; all frames when there is none) when a backend file changed. Anything that cannot be turned into a capturable route is a failure, not a note:
+   - a changed screen file with no route → `no route for <file> (not reachable from routeFiles; add staticRoutes or ignoreScreenGlobs)`
+   - a route with unfilled params → `cannot capture <routeKey>: <reason> (add routeParams)`
+   - a backend change with no captured route → `backend change (<files>) has no captured route to prove; open a page so the watcher captures it, or add staticRoutes`
 3. For each expected route: the headline is the latest frame with `treeHash == HEAD^{tree}`.
    - No such frame → failure `no frame at HEAD for <route>`.
    - Headline status not `clean` → failure `<route> final frame is <status>`. Never fall back to an earlier clean frame.

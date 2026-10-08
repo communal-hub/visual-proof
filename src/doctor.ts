@@ -2,10 +2,10 @@ import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
-import picomatch from 'picomatch';
 import { chromium } from 'playwright';
 import { CONFIG_FILE_NAME, ConfigError, loadConfig, type Config } from './config.js';
 import { headTree, isGitRepo } from './git.js';
+import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { globBase } from './trigger/fs-watch.js';
@@ -296,8 +296,7 @@ const SKIP_DIRS = new Set(['node_modules', '.git']);
 
 /** Files under the glob bases that match `screenGlobs` / `backendGlobs`. */
 async function countMatches(config: Config, ignored: string[]): Promise<{ screen: number; backend: number; capped: boolean }> {
-  const isScreen = picomatch(config.screenGlobs, { dot: true });
-  const isBackend = picomatch(config.backendGlobs, { dot: true });
+  const { isScreen, isBackend } = classifier(config);
   const ignoredRoots = ignored.map((p) => path.resolve(p));
   const bases = [...new Set([...config.screenGlobs, ...config.backendGlobs].map(globBase))];
   // A base inside another base is covered by the outer walk.

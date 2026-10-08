@@ -47,6 +47,17 @@ async function until(predicate: () => boolean, timeoutMs = 3000): Promise<void> 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 describe('startFsWatch', () => {
+  it('does not report files matching ignoreScreenGlobs as screens', async () => {
+    write(root, 'src/stories/s.vue', 's');
+    await start({ ignoreScreenGlobs: ['src/stories/**'] });
+    write(root, 'src/stories/s.vue', 's2');
+    write(root, 'src/a.vue', 'a2');
+    await until(() => batches.length > 0);
+    await sleep(300);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toMatchObject({ screen: ['src/a.vue'], backend: [] });
+  });
+
   it('classifies changes into screen and backend, as repo-relative POSIX paths', async () => {
     await start();
     write(root, 'src/a.vue', 'a2');

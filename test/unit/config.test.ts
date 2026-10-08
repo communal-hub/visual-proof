@@ -31,6 +31,7 @@ describe('loadConfig', () => {
       staticRoutes: {},
       routeParams: {},
       screenGlobs: ['src/**/*.vue'],
+      ignoreScreenGlobs: [],
       backendGlobs: [],
       login: { type: 'none', tokenHeader: 'X-Visual-Proof-Token' },
       appRoot: '#app',
@@ -63,6 +64,15 @@ describe('loadConfig', () => {
       tokenFile: '.visual-proof/token',
     });
     expect(config.maxFrames).toBe(5);
+  });
+
+  it('reads ignoreScreenGlobs and rejects a non-array', () => {
+    expect(loadConfig({ cwd: project({ appUrl: 'http://a.test', ignoreScreenGlobs: ['src/stories/**'] }), env: {} }).ignoreScreenGlobs).toEqual([
+      'src/stories/**',
+    ]);
+    expect(() => loadConfig({ cwd: project({ appUrl: 'http://a.test', ignoreScreenGlobs: 'src/**' }), env: {} })).toThrow(
+      /"ignoreScreenGlobs" must be an array of strings/,
+    );
   });
 
   it('loads from an explicit --config path and sets repoDir to its directory', () => {

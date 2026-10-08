@@ -1,6 +1,6 @@
 import path from 'node:path';
 import chokidar from 'chokidar';
-import picomatch from 'picomatch';
+import { classifier } from '../globs.js';
 
 /** Repo-relative POSIX paths that changed in one debounce window, split by glob set. */
 export interface WatchBatch {
@@ -13,6 +13,8 @@ export interface WatchBatch {
 export interface FsWatchOptions {
   repoDir: string;
   screenGlobs: string[];
+  /** Files matching these are not screens (see `ignoreScreenGlobs` in the config). */
+  ignoreScreenGlobs?: string[];
   backendGlobs: string[];
   /** Absolute directories never reported (status and scratch dirs). `node_modules` and `.git` are always ignored. */
   ignorePaths?: string[];
@@ -52,8 +54,11 @@ const ALWAYS_IGNORED = new Set(['node_modules', '.git']);
 export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHandle> {
   const repoDir = path.resolve(options.repoDir);
   const debounceMs = options.debounceMs ?? 150;
-  const isScreen = picomatch(options.screenGlobs, { dot: true });
-  const isBackend = picomatch(options.backendGlobs, { dot: true });
+  const { isScreen, isBackend } = classifier({
+    screenGlobs: options.screenGlobs,
+    ignoreScreenGlobs: options.ignoreScreenGlobs ?? [],
+    backendGlobs: options.backendGlobs,
+  });
   const ignoredRoots = (options.ignorePaths ?? []).map((p) => path.resolve(p));
 
   const toRel = (abs: string): string => path.relative(repoDir, abs).split(path.sep).join('/');

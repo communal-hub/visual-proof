@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import picomatch from 'picomatch';
 import { CONFIG_FILE_NAME, loadConfig, type Config } from './config.js';
 import { changeSet, headTree } from './git.js';
+import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
@@ -145,8 +145,7 @@ async function collect(
   if (state.closed) return;
   state.range = range;
   state.notes.push(`diffed ${describeRange(range)}`);
-  const isScreen = picomatch(config.screenGlobs, { dot: true });
-  const isBackend = picomatch(config.backendGlobs, { dot: true });
+  const { isScreen, isBackend } = classifier(config);
   const screenFiles = changed.filter((f) => isScreen(f));
   const backendFiles = changed.filter((f) => !isScreen(f) && isBackend(f));
   if (screenFiles.length === 0 && backendFiles.length === 0) {
@@ -155,9 +154,11 @@ async function collect(
   }
 
   let graph = EMPTY_GRAPH;
+  let graphFailed = false;
   try {
     graph = await (opts.buildGraph ?? ((c: Config) => buildImportGraph(c)))(config);
   } catch (err) {
+    graphFailed = true;
     state.failures.push(`could not build the route graph: ${(err as Error).message.split('\n')[0]}`);
   }
   if (state.closed) return;
@@ -175,17 +176,25 @@ async function collect(
       reasons: [],
     });
   }
+  // A changed screen that cannot be tied to a capturable route is unproven, which is a failure, not a note.
   for (const skip of resolution.skipped) {
-    state.notes.push(`skipped ${skip.routeKey}: ${skip.reason} (from ${skip.sourceFiles.join(', ')})`);
+    state.failures.push(`cannot capture ${skip.routeKey}: ${skip.reason} (add routeParams)`);
   }
-  for (const file of resolution.unmapped) state.notes.push(`no route for ${file}`);
+  for (const file of graphFailed ? [] : resolution.unmapped) {
+    // (with no graph every file is unmapped; the graph failure above already says why)
+    state.failures.push(`no route for ${file} (not reachable from routeFiles; add staticRoutes or ignoreScreenGlobs)`);
+  }
 
   if (backendFiles.length > 0) {
     const knownKeys = new Set([...graph.routes.map((r) => r.path), ...Object.values(config.staticRoutes).flat()]);
+    // Only what the current daemon session captured counts; without a session, every frame does.
+    const sessionId = typeof status?.sessionId === 'string' && status.sessionId !== '' ? status.sessionId : undefined;
     const captured = new Map<string, string>();
-    for (const frame of timeline.list()) captured.set(frame.routeKey, frame.route);
+    for (const frame of timeline.list({ sessionId })) captured.set(frame.routeKey, frame.route);
     if (captured.size === 0) {
-      state.notes.push(`backend change (${backendFiles.join(', ')}) but no route was ever captured, so there is nothing to prove`);
+      state.failures.push(
+        `backend change (${backendFiles.join(', ')}) has no captured route to prove; open a page so the watcher captures it, or add staticRoutes`,
+      );
     }
     for (const [routeKey, lastRoute] of [...captured].sort(([a], [b]) => (a < b ? -1 : 1))) {
       if (expected.has(routeKey)) continue;
@@ -195,7 +204,7 @@ async function collect(
       }
       const concrete = concretePath(routeKey, config.routeParams);
       if (!concrete.ok) {
-        state.notes.push(`skipped ${routeKey}: ${concrete.reason}`);
+        state.failures.push(`cannot capture ${routeKey}: ${concrete.reason} (add routeParams)`);
         continue;
       }
       expected.set(routeKey, {

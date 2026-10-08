@@ -172,6 +172,7 @@ class Watcher {
       this.trigger = await startTrigger({
         repoDir: this.config.repoDir,
         screenGlobs: this.config.screenGlobs,
+        ignoreScreenGlobs: this.config.ignoreScreenGlobs,
         backendGlobs: this.config.backendGlobs,
         ignorePaths: [this.dirs.statusDir, this.dirs.scratchDir, this.dirs.artifactDir],
         debounceMs: this.opts.debounceMs,

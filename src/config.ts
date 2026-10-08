@@ -25,6 +25,8 @@ export interface Config {
   staticRoutes: Record<string, string[]>;
   routeParams: Record<string, string>;
   screenGlobs: string[];
+  /** Files matching these are never screens, even when they match `screenGlobs` (shared helpers, stories, tests). */
+  ignoreScreenGlobs: string[];
   backendGlobs: string[];
   login: LoginConfig;
   appRoot: string;
@@ -112,6 +114,7 @@ export function parseConfig(
     staticRoutes: v.stringArrayMap('staticRoutes') ?? {},
     routeParams: v.stringMap('routeParams') ?? {},
     screenGlobs: v.stringArray('screenGlobs') ?? ['src/**/*.vue'],
+    ignoreScreenGlobs: v.stringArray('ignoreScreenGlobs') ?? [],
     backendGlobs: v.stringArray('backendGlobs') ?? [],
     login,
     appRoot: v.string('appRoot') ?? '#app',

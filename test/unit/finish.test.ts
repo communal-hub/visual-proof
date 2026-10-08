@@ -204,28 +204,73 @@ describe('runFinish', () => {
     expect(result.notes.join('\n')).toContain('captured route /gone no longer resolves');
   });
 
-  it('notes a backend change when nothing was ever captured', async () => {
+  it('fails a backend change when no route was ever captured, instead of passing with nothing to prove', async () => {
     editAndCommit('server/data.json', '{"v":2}\n');
     const result = await finish();
-    expect(result).toMatchObject({ ok: true, routes: [], noScreenChanges: false });
-    expect(result.notes.join('\n')).toContain('no route was ever captured');
-    expect(result.summary).toBe('visual-proof: 0 routes ok');
+    expect(result).toMatchObject({ ok: false, routes: [], noScreenChanges: false });
+    expect(result.failures).toEqual([
+      'backend change (server/data.json) has no captured route to prove; open a page so the watcher captures it, or add staticRoutes',
+    ]);
+    expect(result.summary).toBe(`visual-proof: 1 failure, see ${result.proofBlockPath}`);
   });
 
-  it('lists skipped and unmapped files as notes, not failures', async () => {
-    configure({ routeParams: {} });
-    editAndCommit('src/pages/B.vue');
+  it("takes a backend change's routes from the current daemon session only, when status.json names one", async () => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'ready', sessionId: 's-now' }));
+    await frame('/a', 'clean', { sessionId: 's-old', tree: 'a'.repeat(40) });
+    editAndCommit('server/data.json', '{"v":2}\n');
+    // Only an older session captured /a: nothing from this session to prove.
+    expect((await finish()).failures[0]).toMatch(/^backend change \(server\/data\.json\) has no captured route/);
+
+    await frame('/c', 'clean', { sessionId: 's-now' });
+    const result = await finish();
+    expect(result.routes.map((r) => r.route)).toEqual(['/c']);
+    expect(result.ok).toBe(true);
+  });
+
+  it('fails a changed screen that no route reaches, naming the way out', async () => {
     write(repo, 'src/orphan/Lonely.vue', '<template>x</template>\n');
     commitAll(repo, 'orphan');
+    const result = await finish();
+    expect(result.failures).toEqual([
+      'no route for src/orphan/Lonely.vue (not reachable from routeFiles; add staticRoutes or ignoreScreenGlobs)',
+    ]);
+    expect(result.ok).toBe(false);
+    expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain('- no route for src/orphan/Lonely.vue');
+  });
+
+  it('fails a route whose params are unfilled, pointing at routeParams', async () => {
+    configure({ routeParams: {} });
+    editAndCommit('src/pages/B.vue');
+    editAndCommit('src/pages/A.vue');
+    await frame('/a');
+    const result = await finish();
+    expect(result.ok).toBe(false);
+    expect(result.failures).toEqual([
+      'cannot capture /b/:id: no routeParams entry for /b/:id (params: :id) (add routeParams)',
+    ]);
+    expect(result.routes.map((r) => r.route)).toEqual(['/a']);
+  });
+
+  it('ignoreScreenGlobs removes files from the screen set entirely', async () => {
+    configure({ ignoreScreenGlobs: ['src/orphan/**', 'src/pages/B.vue'] });
+    write(repo, 'src/orphan/Lonely.vue', '<template>x</template>\n');
+    commitAll(repo, 'orphan');
+    editAndCommit('src/pages/B.vue');
+    expect(await finish()).toMatchObject({ ok: true, noScreenChanges: true, failures: [] });
+
     editAndCommit('src/pages/A.vue');
     await frame('/a');
     const result = await finish();
     expect(result.ok).toBe(true);
-    const block = fs.readFileSync(result.proofBlockPath, 'utf8');
-    expect(block).toContain('**Notes**');
-    expect(block).toContain('skipped /b/:id: no routeParams entry for /b/:id');
-    expect(block).toContain('no route for src/orphan/Lonely.vue');
-    expect(block.indexOf('<img')).toBeLessThan(block.indexOf('**Notes**'));
+    expect(result.routes.map((r) => r.route)).toEqual(['/a']);
+  });
+
+  it('keeps the route-graph failure as the only failure when the graph cannot be built', async () => {
+    write(repo, 'src/orphan/Lonely.vue', '<template>x</template>\n');
+    commitAll(repo, 'orphan');
+    const result = await finish({ buildGraph: async () => Promise.reject(new Error('bad router file')) });
+    expect(result.failures).toEqual(['could not build the route graph: bad router file']);
   });
 
   it('puts the failures section before the routes', async () => {
@@ -258,7 +303,6 @@ describe('runFinish', () => {
 
   it('resolves a change in a config subdirectory of the git repo (paths are relative to the config, not the toplevel)', async () => {
     write(repo, 'sub/src/pages/A.vue', '<template>a</template>\n');
-    write(repo, 'sub/src/pages/B.vue', '<template>b</template>\n');
     commitAll(repo, 'sub app');
     write(repo, 'sub/src/pages/A.vue', '<template>a2</template>\n');
     write(repo, 'src/pages/B.vue', '<template>outside the config dir</template>\n');
@@ -390,11 +434,12 @@ describe('finishCommand', () => {
     expect(r.stderr).toBe('visual-proof finish: no frame at HEAD for /a\n');
   });
 
-  it('exits 0 with the block path when A.vue has no route (a note, not a failure)', async () => {
+  it('exits 1 when A.vue has no route: the block path on stdout, the way out on stderr', async () => {
     editAndCommit('src/pages/A.vue');
     const r = await run(false);
-    expect(r.code).toBe(0);
+    expect(r.code).toBe(1);
     expect(r.stdout.trim()).toBe(path.join(dirs.statusDir, 'proof-block.md'));
+    expect(r.stderr).toContain('no route for src/pages/A.vue (not reachable from routeFiles; add staticRoutes or ignoreScreenGlobs)');
   });
 
   it('--hook prints exactly one line and exits 0, recording lastFinish without clobbering status.json', async () => {
