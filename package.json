@@ -1,0 +1,37 @@
+{
+  "name": "visual-proof",
+  "version": "0.1.0",
+  "description": "Visual proof capture for agent tasks",
+  "type": "module",
+  "bin": {
+    "visual-proof": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration test/corpus",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "es-module-lexer": "^3.0.3",
+    "picomatch": "^4.0.7",
+    "playwright": "^1.64.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/picomatch": "^4.0.3",
+    "@types/ws": "^8.18.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0",
+    "vitest": "^5.0.3"
+  }
+}
