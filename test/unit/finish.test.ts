@@ -256,6 +256,22 @@ describe('runFinish', () => {
     expect(fs.readdirSync(dirs.artifactDir)).toHaveLength(2);
   });
 
+  it('resolves a change in a config subdirectory of the git repo (paths are relative to the config, not the toplevel)', async () => {
+    write(repo, 'sub/src/pages/A.vue', '<template>a</template>\n');
+    write(repo, 'sub/src/pages/B.vue', '<template>b</template>\n');
+    commitAll(repo, 'sub app');
+    write(repo, 'sub/src/pages/A.vue', '<template>a2</template>\n');
+    write(repo, 'src/pages/B.vue', '<template>outside the config dir</template>\n');
+    commitAll(repo, 'edit');
+    config = parseConfig({ appUrl: 'http://localhost:1', baseRef: 'main' }, path.join(repo, 'sub'), {});
+
+    expect((await finish()).failures).toEqual(['no frame at HEAD for /a']);
+    await frame('/a');
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+    expect(result.routes.map((r) => r.route)).toEqual(['/a']);
+  });
+
   it('fails when the frame PNG is gone', async () => {
     editAndCommit('src/pages/A.vue');
     await frame('/a');

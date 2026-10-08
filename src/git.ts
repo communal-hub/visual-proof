@@ -84,12 +84,28 @@ export async function headTree(repoDir: string): Promise<string | null> {
  * assume belongs to this task.
  */
 export async function changedFiles(repoDir: string, baseRef: string): Promise<string[]> {
+  const prefix = await showPrefix(repoDir);
   const files = new Set<string>();
 
   for (const file of await committedChanges(repoDir, baseRef)) files.add(file);
   for (const file of await uncommittedChanges(repoDir)) files.add(file);
 
-  return [...files].sort();
+  return [...files].flatMap((file) => relativeTo(prefix, file)).sort();
+}
+
+/**
+ * `git rev-parse --show-prefix`: the path of `repoDir` below the git toplevel (`sub/dir/`), or ''
+ * at the toplevel. `git diff --name-only` and `git status --porcelain` report toplevel-relative
+ * paths, while config globs are relative to the config directory.
+ */
+export async function showPrefix(repoDir: string): Promise<string> {
+  return (await git(repoDir, ['rev-parse', '--show-prefix'])).stdout.trim();
+}
+
+/** The path below `prefix` (a toplevel-relative directory ending in `/`), or nothing when it lies outside it. */
+function relativeTo(prefix: string, file: string): string[] {
+  if (prefix === '') return [file];
+  return file.startsWith(prefix) ? [file.slice(prefix.length)] : [];
 }
 
 async function committedChanges(repoDir: string, baseRef: string): Promise<string[]> {

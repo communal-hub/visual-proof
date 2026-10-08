@@ -189,4 +189,30 @@ describe('changedFiles', () => {
     commitAll(repo, 'f');
     expect(await changedFiles(repo, 'develop')).toEqual(['f.txt']);
   });
+
+  describe('when repoDir is a subdirectory of the git toplevel', () => {
+    it('keeps only paths under it and strips the prefix, for committed and uncommitted changes', async () => {
+      write(repo, 'sub/src/App.vue', 'a');
+      write(repo, 'sub/src/Old.vue', 'o');
+      write(repo, 'other/src/Elsewhere.vue', 'e');
+      commitAll(repo, 'add sub');
+      git(repo, 'checkout', '-q', '-b', 'feature');
+      write(repo, 'sub/src/App.vue', 'changed');
+      write(repo, 'other/src/Elsewhere.vue', 'changed');
+      commitAll(repo, 'committed');
+
+      write(repo, 'sub/src/New.vue', 'n');
+      write(repo, 'other/src/Untracked.vue', 'u');
+      git(repo, 'mv', 'sub/src/Old.vue', 'sub/src/Renamed.vue');
+
+      expect(await changedFiles(path.join(repo, 'sub'), 'main')).toEqual([
+        'src/App.vue',
+        'src/New.vue',
+        'src/Old.vue',
+        'src/Renamed.vue',
+      ]);
+      // From the toplevel the same changes keep their full paths.
+      expect(await changedFiles(repo, 'main')).toContain('sub/src/App.vue');
+    });
+  });
 });
