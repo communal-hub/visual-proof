@@ -46,6 +46,8 @@ src/
   ready.ts          `status --wait` / `ready`: block until the watcher is ready
   rendered.ts       in-page Vue component-tree walker and `__file` normalisation (render check)
   decisions/        A4: OpenRouter Decisions client, image check, prune, claim verdict, captions, budget, sidecar (see "Decisions (v0.6)")
+  sidecar.ts        sidecar scenario DSL: parser, file discovery, role/route validation (v0.7)
+  replay.ts         replay video: ffmpeg probe, frame selection, captions, build (v0.7)
   trigger/
     vite-hmr.ts     freshness barrier: HMR websocket client
     fs-watch.ts     trigger: screen + backend globs
@@ -90,6 +92,9 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
     "/manage/invoices/:id": { "url": "/api/invoices", "pick": "data.0.id" },
     "/accounts/:id/:tab": { "url": "/api/accounts", "pick": { "id": "0.uuid", "tab": "'invoices'" } }
   },
+  "sidecars": [".visual-proof/sidecars/*.vp"],  // sidecar scenario globs (relative to the config dir); this is the default
+  "roles": { "finance": "finance@example.test" }, // role name -> login email for `login <role>`; `login default` is login.email
+  "replay": { "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600 }, // replay video built by finish when ffmpeg is on PATH
   "screenGlobs": ["src/**/*.vue"],
   "ignoreScreenGlobs": [],                      // files matching these are never screens (shared helpers, stories)
   "backendGlobs": ["server/**"],
@@ -172,6 +177,62 @@ Model calls at bounded decision points through OpenRouter's Decisions API, in `s
 - **Budget and accounting** (`runtime.ts`, `budget.ts`): `budgetMs` is shared by every decision phase of a finish (prune before the daemon wait, then image + claim + captions together, concurrently); the clock only runs inside phases and never past finish's own deadline - 250 ms; work unfinished at the deadline is cancelled and noted (`decisions: unfinished work was skipped at the <n> ms budget`). `FinishResult.decisions = { requests, ms, cost, inputTokens, failed }` and the proof block ends with `decisions: N requests, M ms, $cost` (only when decisions were active). Target: one image request per headline plus at most 3 text requests (prune on a cache miss, claim, captions).
 - **doctor:** capability `decisions` (never required; after `renderCheck`): tier `off` (`enabled: false`), `heuristics-only` (no key; status `warn`), `key-present` (not probed), `openrouter` (both models probed ok), `degraded` (a probe failed or timed out; `warn`). Models are probed (one tiny request each, 5 s total) only with `doctor --probe-decisions` or when `appUrl` answers HTTP (1.5 s check); detail names the key source, each model as `<id> -> <resolved id> ok (<ms> ms)` and the mode summary.
 - **Tests:** the suite strips `OPENROUTER_API_KEY` (`test/setup.ts`); the integration harness writes `decisions: { enabled: false }`; `test/live/**` is gated on a key (`VP_LIVE_OPENROUTER_API_KEY` or the worktree `.env`).
+### Sidecar scenarios (v0.7)
+
+`src/sidecar.ts`. One `.vp` file is one scenario, named by its filename without the extension (`refund.vp` -> `refund`). A file is found when its config-relative POSIX path matches a `sidecars` glob (`findSidecarFiles` walks from each glob's literal base; `node_modules` and `.git` are skipped; a base that does not exist matches nothing).
+
+- **Config** (validated at load): `sidecars` = array of strings (default `[".visual-proof/sidecars/*.vp"]`; `[]` disables); `roles` = object of role name to non-empty email (names `[A-Za-z0-9._-]+`; `default` is reserved: it is `login.email`); `replay` = `{ enabled: boolean, maxFrames: positive int, secondsPerFrame: positive number, maxHeight: positive int }`.
+- **Grammar**, one step per line. Lines are trimmed; blank lines and lines starting with `#` are skipped (no trailing comments: `click #submit` is a selector). CRLF and a BOM are accepted. The verb is the first word, lowercase, and must be one of:
+  - `goto <target>`: one token starting with `/` (not `//`); a route key (`/a/:id`) or a concrete path with optional query.
+  - `click <selector>`: the rest of the line, raw.
+  - `fill <selector> <text...>`: selector = first word, or a `"..."` / `'...'` string; text = the rest of the line raw, or exactly one quoted string (`""` = empty); escapes inside quotes `\\ \" \' \n \t`, any other `\x` is kept as written; anything after the closing quote is an error; missing text is an error.
+  - `press <key>`: one token (a Playwright key such as `Enter`, `Control+A`).
+  - `wait <selector | ms>`: `^\d+(ms)?$` is a delay (1 to 30000), anything else is a selector (rest of the line).
+  - `still <name>`: `[A-Za-z0-9][A-Za-z0-9._-]*`, unique in the file.
+  - `login <role>`: one token matching the role-name pattern.
+  Parse errors never throw: `Sidecar.errors` is `[{ line, message }]` (line 0 = the file as a whole: no steps, no `still`). Messages: `unknown verb "x" (the verbs are goto, click, fill, press, wait, still, login)`, `<verb> needs ...`, `duplicate still name "x" (first used on line N)`, `missing closing " quote`, and so on. `validateSidecar(sidecar, config)` adds what needs the config: `unknown role "x" (known: default, finance; add it to "roles")` and `login needs a login hook: set login.type to "http-hook"`. A formatted error is `<file>:<line>: <message>` (`<file>: <message>` for line 0).
+- **Routes.** A still's frame has `route` = `routeKey` = `sidecar:<file>#<still>` (`<file>` = config-relative path). `sidecarRoute`, `isSidecarRoute`, `parseSidecarRoute` build and read it. The synthetic frame of a failure after the last `still` uses the still name `!failed` (cannot collide with a real name).
+- **Route keys of a scenario** (`scenarioRouteKeys`): for each `goto`, the target itself when it is a known route key, else the known route patterns (`:param` = `[^/]+`) that match its pathname (query and hash ignored), a route without params winning over parametrised ones; a target that matches nothing stands for its pathname.
+
+**Execution** (`Browser.runScenario(plan)`, `Capturer.runScenario?`). The watcher resolves each `goto` to a concrete URL before handing the plan over (`ScenarioPlan.gotos`: line -> `{ url, path }` or `{ error }`): a concrete path as is; a route key through `concretePath` over `routeParams` + seed file, then `paramSources` (the same tiers and cache as route captures; failing that, `cannot fill <key>: <reason>`, shown to the user as `<reason> (add routeParams)`).
+
+- One fresh page in the shared context, opened with the same listeners as a capture. After each `goto` the page settles (network idle, fonts, two frames, DOM read, re-settle on a self-navigation); after `click` / `fill` / `press` a short settle (network idle capped at 2 s, two frames).
+- `still`: settle, read the DOM, then the capture's screenshot half (`shoot`: renderedFiles walk, `preparePage`, masks, PNG) and then `UNPREPARE_SCRIPT` (removes the `style[data-visual-proof]` elements and the `data-vp-grow` / `data-vp-flow` attributes) so the scenario continues from the same page. Signals: `navOk` true, `httpStatus` of the last document load, console and page errors since the previous still (the list is cleared after each), `authFailure` when a `goto` landed on a login page after one re-login.
+- Selectors are found with `locator(sel).first()` waiting for `visible` up to `stepTimeoutMs` (5000): a timeout is `selector not found` (nothing matches) or `selector not visible`; any other Playwright error is `invalid selector: <first line>`. `click` / `fill` errors are `click failed: ...` / `fill failed: ...`, `press` is `press failed: ...`, a `goto` that throws is `navigation failed: ...`. A 504 `Outdated Optimize Dep` after a `goto` loads the page again (2 retries). `wait <ms>` sleeps.
+- `login <role>`: `context.clearCookies()`, then the login hook POST as the role's email (`sessionEmail` is tracked; `ensureLoggedIn` only trusts a session whose email is `login.email`). After the scenario (always) the default login is restored; a failed restore leaves the session marked logged out so the next capture logs in again.
+- **Limits.** Every wait and navigation is capped by what is left of `scenarioTimeoutMs` (60000); a hard race at that limit plus 1 s closes the run (`scenario exceeded 60 s`). Both are `BrowserOptions` (tests shorten them).
+- **Failure.** The first failing step ends the run: `failure = { line, text, reason }` and an extra still whose frame is an error: the name of the first `still` at or after the failing line (it may be the failing step itself), else `!failed`; the signals carry `stepFailure = "line <n> <step text>: <reason>"` (`triage` puts it first in `reasons`, status `error`); the screenshot is the page as left (best effort, 8 s guard, a blank PNG when the page is gone). Stills before the failure are normal frames; later stills get no frame.
+- **Result:** `ScenarioResult = { stills: ScenarioStill[], failure?, ms }`; a `ScenarioStill` has `name`, `at`, `png`, `signals`, `renderedFiles`, `timing`, `steps` (`{ line, text }` from the start up to and including the still or the failing step) and `failed`.
+
+**Frames.** `Frame.trigger` gains `sidecar` (the scenario's file changed; otherwise `screen` or `backend` for the cause of a replay); `Frame.steps?: { line, text }[]` (sidecar frames only); `sourceFile` is the sidecar file. Sidecar stills also write the decisions page-text file (`frames/<id>.text.json`, the same one route frames get when `decisions.verdict` is on; unrelated to `.vp` sidecar files, which live in the repo) and appear in the decisions headlines with `via: 'sidecar'`. Sidecar frames never enter the watcher's `sessionRoutes` (route recapture) and `finish` ignores them when listing captured routes for a backend change.
+
+**Trigger.** `startFsWatch` takes `sidecarGlobs` and reports a third list, `WatchBatch.sidecar` (optional in the type). A sidecar file is neither a screen nor a backend file even when it matches those globs (`classifier(...).isSidecar`). A sidecar-only batch does not wait for the HMR barrier. `BatchEvent` gains `sidecar` and its `routes` include sidecar routes.
+
+**When the watcher replays** (`pickScenarios`, after the batch's route targets are known, in the same queue and under the same before/after tree-hash check, so a batch discarded for a tree change drops scenario frames too and is re-queued with its `sidecar` list):
+1. every changed sidecar file that still exists;
+2. every scenario whose `goto` route keys intersect the routes of the batch's screen files (`graph.fileToRoutes` then `staticRoutes`);
+3. when the batch re-captures routes (a backend change, or a screen file with no route), every scenario that produced frames earlier this session.
+A deleted file is forgotten. A scenario that does not parse or validate is skipped: one `warning: sidecar <file>:<line>: <message>` log line per distinct problem set and `sidecar <file> skipped: N parse error(s)`; it records no frame, and `finish` reports it. A capturer without `runScenario` logs `sidecar <file> skipped: this capturer cannot run scenarios`.
+
+**finish.** After the route expectations, for each file at HEAD (`git ls-tree`, read with `git show HEAD:./<file>`) that matches `sidecars`: expected when it is in the changed set, or one of its route keys is in the expected route set (screen routes, `paramSources` keys, and routes added by a backend change). A changed set made only of sidecar files is not "no screen changes"; one whose sidecars are all deleted is. A scenario that does not parse or validate adds `sidecar <file>:<line>: <message>` failures. Each `still` becomes a `RouteProof` (`via: 'sidecar'`, `scenario: { file, name, still }`, `route` = `routeKey` = `sidecar:<file>#<still>`), appended after the route proofs, so `waitForDaemon` waits for them too. Failures:
+- no frame at HEAD's tree: `sidecar <file> still <name>: no frame at HEAD` (plus the hint to replay it);
+- not clean: `sidecar <file> still <name>: final frame is <status>: <reasons joined by "; ">`;
+- a `!failed` frame at HEAD's tree newer (by frame id) than every still frame of that scenario at HEAD: `sidecar <file>: final frame is <status>: <reasons>`.
+Headline PNGs are copied as `sidecar-<scenario>-<still>-<shortTree>.png`. The render check also accepts a clean sidecar still whose `renderedFiles` contain the changed `.vue` file (note `<file> rendered in sidecar <file> still <name>`; a route frame that rendered it needs no note). The proof block labels them `sidecar <scenario> / <still>` and adds ` · <sidecar file>` after the tree; `FinishResult.routes` carries them.
+
+### Replay video (v0.7)
+
+`src/replay.ts`, called by `finish` after the render check, only when there are expected routes or stills, no failures, the finish is not truncated and `replay.enabled`. Never a failure: every problem is a note.
+
+- **ffmpeg probe** (`probeFfmpeg(env)`, cached per `env.PATH`): `ffmpeg -version` (ENOENT -> `ffmpeg not found`), `-encoders` (needs `libx264`), `-filters` (`drawtext`), then a one-frame `drawtext` run (default font, then common font files) to prove captions work. `finish` runs ffmpeg through `FinishOptions.env` (PATH), so tests can hide it.
+- **Frames:** `timeline.list({ sessionId })` of the daemon session (all frames when there is no session id), those with a PNG on disk, the latest `replay.maxFrames`, oldest first.
+- **Canvas:** width = viewport width, height = the tallest selected frame (at least the viewport height) capped at `replay.maxHeight`, both rounded down to even; a 36 px caption bar is added below when captions are on. Frames are scaled to fit (`force_original_aspect_ratio=decrease`) and padded top-aligned on `0x202020`.
+- **Encode:** a numbered image sequence in a throwaway directory under the scratch dir (`-framerate 1/<secondsPerFrame>`; the concat demuxer was rejected: it drops or stretches the last entry depending on frame sizes), `-vf <chain>` inline (`-filter_script` is gone from recent ffmpeg), no `fps` filter (a frame-size change re-initialises the graph and drops the frame it holds), `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r 10 -t <frames * secondsPerFrame> -movflags +faststart`. Output `replay-<shortTree>.mp4` in the artifact dir (written in the work dir, then copied). ffmpeg 6 ends one output frame (0.1 s) early, 9 does not.
+- **Captions:** one `drawtext` per frame from a text file (`expansion=none`), enabled for `gte(t, (i-0.5)*d) * lt(t, (i+0.5)*d)`. Text: `<route or "sidecar <scenario> / <still>"> [<status> if not clean]   |   <source file>   |   HH:MM:SS` (UTC), non-ASCII replaced by `?`. Without drawtext or a font: no bar, note `replay built without captions: <reason>`.
+- **Budget:** skipped with a note when `remaining < 600 + 40 * frames` ms; otherwise ffmpeg gets `remaining - 250` ms and is killed (SIGKILL, without waiting for its pipes) on overrun: `replay skipped: ffmpeg did not finish within the <n> ms of finish budget left`.
+- **Notes:** `replay skipped: ffmpeg not found`, `replay skipped: this ffmpeg has no libx264 encoder`, `replay skipped: no frames with a screenshot in this session`, `replay skipped: <n> ms of the finish budget left, about <m> ms needed for <k> frame(s)`, `replay failed: <ffmpeg's last stderr line>`.
+- **Result:** `FinishResult.replay?: { path, frames, seconds, captions, ms }`; the proof block has `[Replay](<absolute path, spaces and parentheses percent-encoded>) · <frames> frame(s), <seconds> s` after the stills.
+- **doctor:** `sidecars` (tier `none` | `files` | `invalid`; `N scenario(s) found, M still(s), 0 parse errors`, or the first five `<file>:<line>: <message>`; `invalid` is status `missing`, never required) and `replay` (tier `ffmpeg` | `no-captions` | `no-x264` | `none` | `off`; detail `ffmpeg <version>, drawtext available`; warn when anything is missing; never required) after `renderCheck`. `Probes.ffmpeg(env)` is the new probe. `normalize` also replaces `ffmpeg <version>`.
 
 ### Warm-up
 
@@ -212,6 +273,8 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 - `decisions-cache.json`: route pruning decisions (A4), shared by the watcher and `finish`.
 - `scratch/index.jsonl` + `scratch/frames/<id>.png` (+ `<id>.text.json` page text sidecar, A4).
 
+The artifact dir holds the headline stills, the sidecar stills (`sidecar-<scenario>-<still>-<shortTree>.png`) and `replay-<shortTree>.mp4`.
+
 ## Frame record (one JSON line in index.jsonl)
 
 ```json
@@ -222,6 +285,17 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
   "timing": { "settleMs": 362, "screenshotMs": 44 },
   "png": "frames/f-000042.png" }
 ```
+
+A sidecar still (v0.7):
+
+```json
+{ "id": "f-000043", "route": "sidecar:.visual-proof/sidecars/refund.vp#refund-modal",
+  "routeKey": "sidecar:.visual-proof/sidecars/refund.vp#refund-modal", "trigger": "sidecar|screen|backend",
+  "sourceFile": ".visual-proof/sidecars/refund.vp", "status": "clean",
+  "steps": [{ "line": 2, "text": "goto /manage/invoices/:id" }, { "line": 3, "text": "click [data-test=invoice-refund]" }, { "line": 5, "text": "still refund-modal" }], ... }
+```
+
+`steps`: sidecar frames only; the steps run from the start of the scenario up to and including the `still` (an error frame: up to and including the failing step).
 
 `renderedFiles`: repo-relative component files mounted in the page (see Rendered components; at most 2000), or `null` when unknown (production build, non-Vue app, `renderCheck: "off"`); absent on frames written by versions before 0.3.
 
@@ -258,7 +332,7 @@ Capture waits: `load`, then network idle (`settle.networkIdleMs`, default 250 ms
    - No such frame → failure `no frame at HEAD for <route>`.
    - Headline status not `clean` → failure `<route> final frame is <status>`. Never fall back to an earlier clean frame.
    - Render check (config `renderCheck`, default `fail`; `off` skips it). For each changed `.vue` screen file that resolved to routes (via `screen`; not routes added by a backend change), consider its routes that have a `clean` headline frame (routes without one already carry a failure). If any of those frames' `renderedFiles` contains the file, it passed (a note `<file> rendered on <A> but not on <B>` when only some did; a parent or layout in the mounted tree counts as rendered). Else if some of those frames have no data (`renderedFiles` null or absent) it is skipped with a note `render check skipped for <file>: ...`. Else failure `<file> never rendered on <routes>; seed the state that shows it (RecordsVisualProofRoutes) or add it to ignoreScreenGlobs`; with `renderCheck: "warn"` the same text is a note. Only `.vue` files are checked (the only files that carry `__file`).
-5. Copy headlines to the artifact dir as `<slug>-<shortTree>.png`. Write `proof-block.md` with one `<img>` per route, plus the route, status, and tree hash.
+5. Copy headlines to the artifact dir as `<slug>-<shortTree>.png`. Write `proof-block.md` with one `<img>` per route, plus the route, status, and tree hash. Sidecar stills follow the route stills and the replay link follows them (see Sidecar scenarios and Replay video).
 6. After failures, remedy hints are printed on stderr (`visual-proof finish: hint: ...`) and listed under `**Next steps**` in the proof block, and returned as `hints`. The failure strings above never change. Hints: the watcher is not running (`run visual-proof start`); the watcher's last problem, from `status.json` `lastError` (e.g. a refused capture); the working tree differs from HEAD (`commit your changes, then rerun finish`); the newest frame is at a different tree than HEAD (both short hashes named).
 7. Exit codes: 0 ok; 1 proof failures; 3 setup or config error (invalid config, not a git repo); 4 internal error. Every outcome, including 3 and 4, writes `proof-block.md` and records `lastFinish`. A config error keeps every invalid field (flattened onto one line with `; `) on stderr and in the block.
 8. `--hook`: same work, capped at `finishBudgetMs`, never prints to stdout except one summary line, always exits 0, writes failures to `watcher.log` and `status.json`.
@@ -276,7 +350,7 @@ stdout of `finish` is the proof block path on every branch, including `no screen
 | `stop` | status JSON | 0; 4 if the daemon cannot be signalled |
 | `watch` | log lines when a TTY | 0 after SIGINT/SIGTERM; 3 config/setup |
 | `finish` | proof block path (`--json`: the result; `--hook`: one summary line) | 0, 1, 3, 4 (`--hook`: always 0) |
-| `doctor` | table (one row per capability, including `paramTiers`, `renderCheck` and `decisions`; `--probe-decisions` probes the models) ending `details: <doctor.json path>` (`--json`: the report; `--json --normalize`: the report with timestamp, dirs, ports, hashes, timings and versions replaced, see below) | 0; 1 when the browser or the trigger is missing; 4 internal |
+| `doctor` | table (one row per capability, including `paramTiers`, `renderCheck`, `decisions`, `sidecars` and `replay`; `--probe-decisions` probes the models) ending `details: <doctor.json path>` (`--json`: the report; `--json --normalize`: the report with timestamp, dirs, ports, hashes, timings and versions replaced, see below) | 0; 1 when the browser or the trigger is missing; 4 internal |
 | usage error | | 2 |
 
 ### `doctor --json --normalize`
@@ -296,6 +370,7 @@ Each is an integration test against the fixture, using real Chromium and a real 
 | other-tree | Edit, capture, then revert the edit without a capture, commit | `no frame at HEAD for <route>` |
 
 | never-rendered | Edit a child component that the fixture page only mounts when a seeded data flag is on (flag off), capture (clean frame), commit | `<file> never rendered on <route>; seed the state that shows it ...`; passes with the flag on |
+| sidecar-broken-step | Add a sidecar whose `click` selector matches nothing, let the watcher replay it, commit | `sidecar <file> still <name>: final frame is error: line 3 click [data-test=...]: selector not found` |
 
 Plus one happy path: edit → clean frame → commit → `finish` exits 0 with a valid proof block.
 
@@ -306,6 +381,7 @@ Plus one happy path: edit → clean frame → commit → `finish` exits 0 with a
 - `/long`: `src/pages/Long.vue` in `src/layouts/ScrollLayout.vue`, whose `html, body` never scroll while `main.content` (flex child, `overflow-y: auto`) holds 60 rows plus a solid green bottom marker, under a sticky header. `/flagged`: `src/pages/Flagged.vue` mounts `src/components/FlaggedDetails.vue` only when `GET /api/flags` (from `server/data.json` `flags.showDetails`, off by default) says so.
 - `index.html` carries a stand-in for the devtools overlay (`#__vue-devtools-container__` holding a magenta `.vue-devtools__anchor` pill fixed at bottom-centre), so tests can check it is hidden.
 - `visual-proof.param-sources.config.json`: the fixture config without `routeParams` and with `paramSources: { "/manage/invoices/:id": { "url": "/api/invoices", "pick": "0.id" } }`; the integration harness starts from it with `createHarness({ configFile })`.
+- `/manage/interact` (`src/pages/Interact.vue`): a button (`[data-test=open-modal]`) that opens `src/components/ConfirmModal.vue` (`[data-test=confirm-modal]`), the two-step `src/components/TwoStepForm.vue` (`name-input`, `next`, `submit`, `done`) and `[data-test=finance-only]`, shown only to `finance@example.test`. The login hook accepts `admin@example.test` (the config default) and `finance@example.test` and rejects other emails with 403; `GET /api/me` returns `{ email, role }`. `.gitignore` is `.visual-proof/*` plus `!.visual-proof/sidecars/`; the integration harness writes scenarios with `writeSidecar(name, text)`.
 - `VP_FIXTURE_CACHE_DIR` makes the fixture's Vite use its own dependency cache (cold-start tests).
 - `#app` root. A `.spinner` element shown while data loads.
 - Dev-only Vite middleware (in the fixture's own `vite.config.js`) that serves:
