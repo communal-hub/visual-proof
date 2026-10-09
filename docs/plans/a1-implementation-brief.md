@@ -47,7 +47,8 @@ src/
   rendered.ts       in-page Vue component-tree walker and `__file` normalisation (render check)
   decisions/        A4: OpenRouter Decisions client, image check, prune, claim verdict, captions, budget, sidecar (see "Decisions (v0.6)")
   sidecar.ts        sidecar scenario DSL: parser, file discovery, role/route validation (v0.7)
-  replay.ts         replay video: ffmpeg probe, frame selection, captions, build (v0.7)
+  replay.ts         replay video: ffmpeg probe, frame selection, captions, build (v0.7); motion segments and join (v0.9)
+  motion.ts         motion clips: drawn cursor, glide and typing pacing, screencast recorder, clip resampling (v0.9)
   trigger/
     vite-hmr.ts     freshness barrier: HMR websocket client
     fs-watch.ts     trigger: screen + backend globs
@@ -102,7 +103,7 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "paramDiscovery": "links",                    // "links" | "off": last tier, take an id from a link on the parent route's page (v0.8)
   "sidecars": [".visual-proof/sidecars/*.vp"],  // sidecar scenario globs (relative to the config dir); this is the default
   "roles": { "finance": "finance@example.test" }, // role name -> login email for `login <role>`; `login default` is login.email
-  "replay": { "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600 }, // replay video built by finish when ffmpeg is on PATH
+  "replay": { "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600, "motion": true }, // replay video built by finish when ffmpeg is on PATH; motion: record sidecar runs as clips (v0.9)
   "screenGlobs": ["src/**/*.vue"],
   "ignoreScreenGlobs": [],                      // files matching these are never screens (shared helpers, stories)
   "backendGlobs": ["server/**"],
@@ -272,7 +273,21 @@ Headline PNGs are copied as `sidecar-<scenario>-<still>-<shortTree>.png`. The re
 - **Budget:** skipped with a note when `remaining < 600 + 40 * frames` ms; otherwise ffmpeg gets `remaining - 250` ms and is killed (SIGKILL, without waiting for its pipes) on overrun: `replay skipped: ffmpeg did not finish within the <n> ms of finish budget left`.
 - **Notes:** `replay skipped: ffmpeg not found`, `replay skipped: this ffmpeg has no libx264 encoder`, `replay skipped: no frames with a screenshot in this session`, `replay skipped: <n> ms of the finish budget left, about <m> ms needed for <k> frame(s)`, `replay failed: <ffmpeg's last stderr line>`.
 - **Result:** `FinishResult.replay?: { path, frames, seconds, captions, ms }`; the proof block has `[Replay](<absolute path, spaces and parentheses percent-encoded>) · <frames> frame(s), <seconds> s` after the stills.
+- **Motion (v0.9):** see Motion clips. Motion segments only when `replay.motion`, `finish` passes `clipDir` and a selected frame has a readable clip; otherwise everything above holds unchanged.
 - **doctor:** `sidecars` (tier `none` | `files` | `invalid`; `N scenario(s) found, M still(s), 0 parse errors`, or the first five `<file>:<line>: <message>`; `invalid` is status `missing`, never required) and `replay` (tier `ffmpeg` | `no-captions` | `no-x264` | `none` | `off`; detail `ffmpeg <version>, drawtext available`; warn when anything is missing; never required) after `renderCheck`. `Probes.ffmpeg(env)` is the new probe. `normalize` also replaces `ffmpeg <version>`.
+
+### Motion clips (v0.9)
+
+`replay.motion` (boolean, default `true`). The watcher records sidecar runs only when `replay.enabled && replay.motion` and `probeFfmpeg` (once per watcher) finds ffmpeg with libx264; otherwise it logs `motion clips off: <reason>; the replay shows stills` once and runs scenarios as in v0.7.
+
+- **Plan:** `ScenarioPlan.record?: { dir, holdMs }` (`dir` from `Timeline.newClip()`, not created yet; `holdMs = secondsPerFrame * 1000`). `ScenarioResult.clip?: { dir, frames, seconds }`.
+- **Recorded page:** `emulateMedia({ reducedMotion: 'no-preference' })`; init scripts: the drawn cursor (`#__vp-cursor` on `<html>`, `pointer-events: none`, follows trusted `mousemove`, a ring on `mousedown`, last position in `sessionStorage` so it reappears after a navigation) and a style that applies `hideSelectors` (`visibility: hidden`) and CSS-valid `maskSelectors` (magenta, contents hidden) for the whole run. Non-CSS mask selectors are logged once per browser. Every screenshot (recorded or not) passes `style: '#__vp-cursor { display: none !important; }'`.
+- **Screencast:** CDP `Page.startScreencast` (`jpeg`, quality 82, max size = viewport) on the scenario page, started before the first step that is not `goto`/`login`, or after the first `goto` succeeds. Frames are written to `dir` as they arrive, acked at once, thinned to one per 33 ms (the newest picture kept), and dropped when their size is not the viewport's (a full-page screenshot resizes the view). Capture time = `metadata.timestamp`.
+- **Pacing (recording only):** `click`/`fill`: scroll into view, glide from the last mouse position to the element centre (eased, one move per 16 ms, 280 to 900 ms by distance), 120 ms pause; `click` = Playwright's click; `fill` = ring, `fill('')`, focus, `pressSequentially` (15 to 70 ms a key, about 1.1 s per value), then a plain `fill` when `inputValue()` differs. `press` holds the key 60 ms. After each action, 350 ms more. The mouse starts in the middle of the view.
+- **Stills:** the recorder pauses from just before `shoot` until after `UNPREPARE_SCRIPT` (+60 ms); frames captured in that stretch are dropped and the stretch becomes a `holdMs` hold of the frame before. A failure still pauses without a hold. The clip ends on another `holdMs` of the last frame.
+- **Manifest:** `clips/<id>/manifest.json` = `{ version: 1, name, width, height, duration, frames: [{ file, t }], captions: [{ t, text: "<scenario> / <step as written>" }] }`, times in clip ms, the first frame at 0. JPEGs not in the manifest are deleted; a run with no usable frame leaves no directory.
+- **Frames:** `Frame.clip?: "clips/<id>"` on every still of a recorded run. Eviction removes a clip directory with the last record that names it; the watcher removes the clip of a scenario that threw, recorded nothing, or whose batch was discarded.
+- **Replay:** `planSegments`: in frame order, a used clip replaces its stills at the position of its first still; consecutive other frames form stills segments. Clips are used newest first while their durations fit 120 s (the newest is always used). Every segment is encoded on a viewport-sized canvas (`even(width) x even(height)`, plus the caption bar when captions work) at 25 fps with `-video_track_timescale 12800`: stills as before (`-framerate 1/<secondsPerFrame>`, per-frame captions), clips as a 25 fps sequence of links to the newest frame at or before each tick, captioned `sidecar <scenario> / <step>` by time windows. The parts are joined with the concat demuxer and `-c copy -movflags +faststart`. Budget: `400 + 350 * segments + 6 * output frames` ms; when it does not fit, note `replay shows stills only: about <n> ms needed for its motion clips, <m> ms of the finish budget left` and build the stills replay. `ReplayResult.clips` (0 for stills only); the proof block line adds `, <n> motion clip(s)` when it is not 0.
 
 ### Warm-up
 
@@ -326,6 +341,8 @@ The artifact dir holds the headline stills, the sidecar stills (`sidecar-<scenar
   "timing": { "settleMs": 362, "screenshotMs": 44 },
   "png": "frames/f-000042.png" }
 ```
+
+v0.9: sidecar stills of a recorded run also carry `"clip": "clips/c-..."` (see Motion clips).
 
 A sidecar still (v0.7):
 
