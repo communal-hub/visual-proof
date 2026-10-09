@@ -8,6 +8,7 @@ import Settings from '../pages/Settings.vue'
 import Profile from '../pages/Profile.vue'
 import Long from '../pages/Long.vue'
 import Flagged from '../pages/Flagged.vue'
+import Interact from '../pages/Interact.vue'
 
 const routes = [
   { path: '/', component: Home },
@@ -17,6 +18,7 @@ const routes = [
   { path: '/login', component: Login },
   { path: '/long', component: Long },
   { path: '/flagged', component: Flagged },
+  { path: '/manage/interact', component: Interact },
   {
     path: '/settings',
     component: Settings,

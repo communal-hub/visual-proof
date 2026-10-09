@@ -36,6 +36,12 @@ function readBody(req) {
   })
 }
 
+// Two fixture users: the default admin and a finance user, the only one who sees the role-gated element.
+const USERS = {
+  'admin@example.test': { role: 'admin' },
+  'finance@example.test': { role: 'finance' },
+}
+
 function sessionEmail(req) {
   const match = /(?:^|;\s*)vp_session=([^;]+)/.exec(req.headers.cookie || '')
   return match ? decodeURIComponent(match[1]) : null
@@ -82,6 +88,7 @@ function fixtureBackend() {
           if (!expected || given !== expected) return send(res, 403, { error: 'forbidden' })
           const { email } = await readBody(req)
           if (!email) return send(res, 422, { error: 'email required' })
+          if (!USERS[email]) return send(res, 403, { error: 'unknown user' })
           return send(res, 204, undefined, {
             'set-cookie': `vp_session=${email}; Path=/; HttpOnly; SameSite=Lax`,
           })
@@ -89,7 +96,7 @@ function fixtureBackend() {
 
         if (req.method === 'GET' && pathname === '/api/me') {
           const email = sessionEmail(req)
-          return email ? send(res, 200, { email }) : send(res, 401, { error: 'unauthenticated' })
+          return email ? send(res, 200, { email, role: USERS[email]?.role ?? 'unknown' }) : send(res, 401, { error: 'unauthenticated' })
         }
 
         next()

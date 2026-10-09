@@ -12,7 +12,8 @@ let green: DoctorReport;
 let greenMs: number;
 let greenOnDisk: unknown;
 beforeAll(async () => {
-  h = await createHarness();
+  // replay.enabled false keeps the golden file independent of whether this machine has ffmpeg (the replay row has its own unit tests).
+  h = await createHarness({ config: { replay: { enabled: false } } });
   // Computed here (not in an `it`) so every test below stands alone, in any order or on its own.
   const t0 = Date.now();
   green = await runDoctor(h.config, { dirs: h.dirs });
@@ -63,7 +64,7 @@ describe('doctor against the vite-vue fixture', () => {
     expect(cli.code).toBe(0);
     expect(cli.stderr).toBe('');
     const lines = cli.stdout.trimEnd().split('\n');
-    expect(lines).toHaveLength(14);
+    expect(lines).toHaveLength(16);
     expect(lines.at(-1)).toBe(`details: ${path.join(h.dirs.statusDir, 'doctor.json')}`);
     expect(cli.stdout).toMatch(/^barrier\s+vite-hmr\s+ok\s/m);
     expect(cli.stdout).toMatch(/^login\s+http-hook\s+ok\s/m);

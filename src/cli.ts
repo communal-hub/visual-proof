@@ -45,7 +45,7 @@ Commands:
   ready      alias for "status --wait"
   watch      run the watcher in the foreground
   finish     assemble headline stills and the proof block for HEAD
-  doctor     check the browser, change trigger, barrier, login, routes and route params
+  doctor     check the browser, change trigger, barrier, login, routes, route params, sidecars and replay
 
 Options:
   --config <path>   config file (default: ./visual-proof.config.json)
@@ -77,7 +77,8 @@ Files (in $VISUAL_PROOF_STATUS_DIR, default /tmp/cursor/visual-proof):
   proof-block.md    what finish last wrote, success or failure
   watcher.log       one line per event
   doctor.json       the last doctor report
-  Headline stills go to $VISUAL_PROOF_ARTIFACT_DIR (default /opt/cursor/artifacts).
+  Headline stills and replay-<shortTree>.mp4 (needs ffmpeg) go to $VISUAL_PROOF_ARTIFACT_DIR
+  (default /opt/cursor/artifacts).
 
 Exit codes:
   0   ok (finish: every changed screen has a clean frame at HEAD, or there are none;

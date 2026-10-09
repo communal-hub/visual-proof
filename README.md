@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) and the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) and the v0.7 interaction work (sidecar scenarios, replay video). Vite apps only; Chromium only.
 
 ## Install
 
@@ -58,6 +58,9 @@ Only `appUrl` is required.
 | `routeParams` | `{}` | concrete URL for a parametrised route |
 | `routeParamsFile` | none | JSON file of route params the app writes at runtime (e.g. a seeder), relative to the config dir; see below |
 | `paramSources` | `{}` | route key to `{ url, pick }`: fill a route's params from a list endpoint when nothing above has them; see below |
+| `sidecars` | `[".visual-proof/sidecars/*.vp"]` | globs (relative to the config dir) of sidecar scenario files; see "Sidecar scenarios" |
+| `roles` | `{}` | role name to login email, for `login <role>` in a sidecar (`login default` is `login.email`) |
+| `replay` | `{ "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600 }` | the replay video `finish` builds when ffmpeg is on PATH; see "Replay video" |
 | `screenGlobs` | `src/**/*.vue` | files whose changes trigger a capture |
 | `ignoreScreenGlobs` | `[]` | files that match `screenGlobs` but are not screens |
 | `backendGlobs` | `[]` | backend files; a change re-captures routes already captured this session (as does a screen file with no route) |
@@ -177,6 +180,86 @@ with `hideSelectorsReplace: true`:
 `vite-error-overlay` is never hidden: an error on screen is evidence. Do not hide
 `[data-v-inspector]`: vite-plugin-vue-inspector puts that attribute on every element of the app.
 
+## Sidecar scenarios
+
+A route still shows what a page renders on load. An open modal, step 2 of a form or another role's view needs
+steps. A sidecar is a short script, one file per scenario (named by its filename), that ends in stills:
+
+```
+# .visual-proof/sidecars/refund.vp
+goto /manage/invoices/:id
+click [data-test=invoice-refund]
+wait [data-test=refund-modal]
+still refund-modal
+```
+
+| Verb | Meaning |
+| --- | --- |
+| `goto <route key or path>` | load a page. A route key (`/manage/invoices/:id`) is filled through `routeParams`, then `routeParamsFile`, then `paramSources`; a concrete path (`/manage/invoices/1?tab=2`) is used as is. Must start with `/` |
+| `click <selector>` | click the first match once it is visible. The rest of the line is the selector, spaces included |
+| `fill <selector> <text...>` | fill an input. The selector is the first word (or a quoted string when it has spaces); the text is the rest of the line, or one quoted string. `""` is empty text |
+| `press <key>` | press a key on the page (`Enter`, `Escape`, `Control+A`) |
+| `wait <selector \| ms>` | wait until the selector is visible, or sleep `ms` (1 to 30000, `wait 500` or `wait 500ms`) |
+| `still <name>` | settle the page and take a still. Names are letters, digits, `.`, `_`, `-`, unique in the file |
+| `login <role>` | switch the session to that role's login email (`roles` in the config; `default` is `login.email`). A fresh session: cookies are cleared first |
+
+Nothing else. Blank lines and lines starting with `#` are skipped (a `#` later in a line belongs to the line:
+`click #submit` is an id selector). Quotes use `"..."` or `'...'` with the escapes `\\ \" \' \n \t`. A scenario
+needs at least one `still`. Every problem is reported with its line (`refund.vp:3: unknown verb "clik" ...`).
+
+**Running.** Scenarios run in the warm browser context on one fresh page, through the same settle, triage,
+overlay hiding, mask and rendered-component machinery as route stills; the page is left as it was after each
+still so the scenario goes on. Each `still` is a frame with `route` and `routeKey` `sidecar:<file>#<name>`,
+`sourceFile` the sidecar file, and `steps` (the lines run so far). `login <role>` switches the shared session and
+the default login is restored afterwards. Waits for a selector are bounded (5 s) and the whole scenario is
+bounded (60 s), so a scenario never hangs.
+
+**A failing step** stops the scenario. It becomes an `error` frame for the next `still` that was not reached
+(or, when none is left, a frame named `!failed`), showing the page as the step left it, with the reason
+`line 3 click [data-test=x]: selector not found`. The other reasons are `selector not visible`,
+`invalid selector: ...`, `navigation failed: ...`, `cannot fill <route key>: ... (add routeParams)`,
+`unknown role "..."` and `scenario exceeded 60 s`.
+
+**When the watcher replays a scenario:** when its file changes; when a batch touches a screen file that renders
+one of its `goto` routes (through the import graph, as for route stills); and, on a backend change or a screen
+file with no route, when it has run this session. It goes through the same serialized queue and the same
+tree-hash check as route captures. A scenario that does not parse is skipped with a `warning: sidecar ...` line
+in `watcher.log`.
+
+**finish.** A sidecar file that exists at HEAD and was touched in the diff, or visits a route that is expected
+anyway, becomes expected: each of its stills needs a clean frame at HEAD's tree.
+
+```
+sidecar .visual-proof/sidecars/refund.vp still refund-modal: no frame at HEAD
+sidecar .visual-proof/sidecars/refund.vp still refund-modal: final frame is error: line 3 click [data-test=x]: selector not found
+sidecar .visual-proof/sidecars/refund.vp: final frame is error: line 5 click [x]: selector not found   (a step after the last still)
+sidecar .visual-proof/sidecars/refund.vp:3: unknown verb "clik" (the verbs are ...)                    (does not parse)
+```
+
+The render check counts sidecar stills: a changed `.vue` file that only mounts after a click passes when a
+sidecar still rendered it (`<file> rendered in sidecar <file> still <name>` note). In the proof block the stills
+come after the route stills, labeled `sidecar <scenario> / <still>`. `.visual-proof/` is usually gitignored for
+the token and the freshness marker; keep the scenarios: `.visual-proof/*` then `!.visual-proof/sidecars/`.
+
+## Replay video
+
+At `finish`, when `ffmpeg` is on PATH, the session's frames (this daemon session, in the order captured, the
+latest `replay.maxFrames`, default 60) are put into `replay-<shortTree>.mp4` in the artifact dir, each shown for
+`replay.secondsPerFrame` (default 1.2 s). Every frame is scaled to fit and padded onto one canvas: the viewport
+width by the tallest frame, capped at `replay.maxHeight` (default 1600). A caption bar drawn by ffmpeg
+(`drawtext`) names the route or `sidecar <scenario> / <still>`, the source file and the capture time (HH:MM:SS,
+UTC), and flags a frame that is not clean. H.264, `yuv420p`, `faststart`, 10 fps, so it plays inline in a PR.
+
+The proof block links it with a plain markdown link to the absolute path, like the stills:
+`[Replay](/opt/cursor/artifacts/replay-1a2b3c4d.mp4) · 12 frame(s), 14.4 s`.
+
+It only ever adds a note, never a failure: `replay skipped: ffmpeg not found`; `replay built without captions:
+...` when ffmpeg has no `drawtext` filter or no font (Homebrew's default `ffmpeg` has none; `ffmpeg-full` does);
+`replay skipped: ...` when there is no libx264, no frame, or the build does not fit in what is left of
+`finishBudgetMs` (ffmpeg is killed when it overruns); `replay failed: <ffmpeg's last line>`. It is built only
+when the proof has no failures. `replay.enabled: false` turns it off. `doctor` has a `sidecars` row (scenarios
+found, parse errors) and a `replay` row (ffmpeg found, version, drawtext).
+
 ## Rendered-component check
 
 A clean still can still miss the change: the route loads, but the changed component sits behind a
@@ -263,7 +346,7 @@ Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 ## Commands
 
 ```sh
-npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes, param tiers, decisions
+npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes, param tiers, decisions, sidecars, replay
 npx visual-proof start      # start the watcher (reattaches if running); prints status JSON
 npx visual-proof status     # status JSON; a dead watcher is reported as stale
 npx visual-proof status --wait [--timeout <s>]   # block until ready (alias: npx visual-proof ready)
@@ -298,9 +381,14 @@ the status JSON.
 | 3 | setup or config error (invalid config, not a git repo, watcher cannot start) |
 | 4 | internal error |
 
-`finish` never falls back to an earlier clean frame: the final frame of each expected
-route at HEAD must be `clean`. Failures and remedy hints go to stderr and into the proof
-block.
+`finish` carries an earlier frame forward only when nothing it depends on has changed since (edit page A, then page
+B, then commit: A keeps its frame from before B's edit). The frame's tree is diffed with HEAD's; the frame goes
+stale when a changed file is a backend file (`backendGlobs`), a route file (`routeFiles`), a screen file no route
+renders, a screen file on one of the frame's routes, a component the frame rendered, or (for a sidecar still) its own
+sidecar file. Docs, tests and config do not. A stale frame fails as before, naming the file
+(`no frame at HEAD for /a (the last clean frame, at tree 1a2b3c4d, is stale: src/shared/S.vue changed since)`); a
+carried one is noted (`/a carried forward from tree 1a2b3c4d: ...`) and listed as `carriedFrom` in `finish --json`.
+It never falls back to an earlier clean frame behind a newer one that is not clean.
 
 A changed screen file that maps to no route still fails `finish` (add `staticRoutes` or
 `ignoreScreenGlobs`), but the watcher now re-captures every route captured this session when one
@@ -322,7 +410,8 @@ In the status dir:
 - `proof-block.md` (written by `finish` on every outcome)
 - `scratch/index.jsonl` (one frame record per line, with `timing`) and `scratch/frames/<id>.png`
 
-Headline stills are copied to the artifact dir as `<route-slug>-<shortTree>.png`.
+Headline stills are copied to the artifact dir as `<route-slug>-<shortTree>.png` (sidecar stills as
+`sidecar-<scenario>-<still>-<shortTree>.png`), and the replay video as `replay-<shortTree>.mp4`.
 
 ## Model decisions (A4)
 

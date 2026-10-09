@@ -164,6 +164,31 @@ describe('startFsWatch', () => {
   });
 });
 
+describe('sidecar files', () => {
+  it('reports sidecar files in their own list, keeps them out of screen and backend, and sees one created after start', async () => {
+    write(root, '.visual-proof/sidecars/a.vp', 'goto /\nstill s\n');
+    await start({ sidecarGlobs: ['.visual-proof/sidecars/*.vp'], screenGlobs: ['**/*.vue', '.visual-proof/**/*.vp'] }); // a sidecar also matching a screen glob stays a sidecar
+    write(root, '.visual-proof/sidecars/a.vp', 'goto /\nstill t\n');
+    write(root, '.visual-proof/sidecars/new.vp', 'goto /\nstill u\n');
+    write(root, '.visual-proof/sidecars/ignored.txt', 'x');
+    await until(() => batches.length > 0);
+    await sleep(300);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toMatchObject({
+      screen: [],
+      backend: [],
+      sidecar: ['.visual-proof/sidecars/a.vp', '.visual-proof/sidecars/new.vp'],
+    });
+  });
+
+  it('creates the watch for a sidecar directory that does not exist yet', async () => {
+    await start({ sidecarGlobs: ['scenarios/*.vp'] });
+    write(root, 'scenarios/late.vp', 'goto /\nstill s\n');
+    await until(() => batches.length > 0, 5000);
+    expect(batches[0]!.sidecar).toEqual(['scenarios/late.vp']);
+  });
+});
+
 describe('globBase', () => {
   it.each([
     ['src/**', 'src'],

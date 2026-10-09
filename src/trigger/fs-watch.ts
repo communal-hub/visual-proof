@@ -6,6 +6,8 @@ import { classifier } from '../globs.js';
 export interface WatchBatch {
   screen: string[];
   backend: string[];
+  /** Sidecar scenario files (`sidecars` globs) that were added, changed or removed. Absent from batches of older callers. */
+  sidecar?: string[];
   /** Epoch ms of the first event in this window; lets the HMR barrier credit a message that beat the debounce. */
   startedAt: number;
 }
@@ -16,6 +18,8 @@ export interface FsWatchOptions {
   /** Files matching these are not screens (see `ignoreScreenGlobs` in the config). */
   ignoreScreenGlobs?: string[];
   backendGlobs: string[];
+  /** Sidecar scenario globs: a change to one of these files is reported in `batch.sidecar`. */
+  sidecarGlobs?: string[];
   /** Absolute directories never reported (status and scratch dirs). `node_modules` and `.git` are always ignored. */
   ignorePaths?: string[];
   /** Quiet period after the last event before a batch is emitted. Default 150 ms. */
@@ -61,16 +65,17 @@ const ALWAYS_IGNORED = new Set(['node_modules', '.git']);
 export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHandle> {
   const repoDir = path.resolve(options.repoDir);
   const debounceMs = options.debounceMs ?? 150;
-  const { isScreen, isBackend } = classifier({
+  const { isScreen, isBackend, isSidecar } = classifier({
     screenGlobs: options.screenGlobs,
     ignoreScreenGlobs: options.ignoreScreenGlobs ?? [],
     backendGlobs: options.backendGlobs,
+    sidecars: options.sidecarGlobs ?? [],
   });
   const ignoredRoots = (options.ignorePaths ?? []).map((p) => path.resolve(p));
 
   const toRel = (abs: string): string => path.relative(repoDir, abs).split(path.sep).join('/');
 
-  const roots = [...new Set([...options.screenGlobs, ...options.backendGlobs].map(globBase))].map((base) =>
+  const roots = [...new Set([...options.screenGlobs, ...options.backendGlobs, ...(options.sidecarGlobs ?? [])].map(globBase))].map((base) =>
     path.join(repoDir, base),
   );
 
@@ -85,7 +90,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
       // Directories are never filtered by glob (a directory can match no pattern yet contain matches).
       if (stats?.isFile()) {
         const rel = toRel(abs);
-        return !isScreen(rel) && !isBackend(rel);
+        return !isScreen(rel) && !isBackend(rel) && !isSidecar(rel);
       }
       return false;
     },
@@ -93,6 +98,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
 
   const screen = new Set<string>();
   const backend = new Set<string>();
+  const sidecar = new Set<string>();
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
   let startedAt = 0;
@@ -100,10 +106,11 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
 
   const flush = (): void => {
     timer = null;
-    if (stopped || (screen.size === 0 && backend.size === 0)) return;
-    const batch: WatchBatch = { screen: [...screen].sort(), backend: [...backend].sort(), startedAt };
+    if (stopped || (screen.size === 0 && backend.size === 0 && sidecar.size === 0)) return;
+    const batch: WatchBatch = { screen: [...screen].sort(), backend: [...backend].sort(), sidecar: [...sidecar].sort(), startedAt };
     screen.clear();
     backend.clear();
+    sidecar.clear();
     try {
       options.onBatch(batch);
     } catch (err) {
@@ -117,12 +124,14 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
     if (rel === '' || rel.startsWith('../')) return;
     const s = isScreen(rel);
     const b = isBackend(rel);
-    if (!s && !b) return;
+    const c = isSidecar(rel);
+    if (!s && !b && !c) return;
     eventCount++;
     options.onEvent?.();
-    if (screen.size === 0 && backend.size === 0) startedAt = Date.now();
+    if (screen.size === 0 && backend.size === 0 && sidecar.size === 0) startedAt = Date.now();
     if (s) screen.add(rel);
     if (b) backend.add(rel);
+    if (c) sidecar.add(rel);
     if (timer) clearTimeout(timer);
     timer = setTimeout(flush, debounceMs);
   };
@@ -141,6 +150,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
       timer = null;
       screen.clear();
       backend.clear();
+      sidecar.clear();
       await watcher.close();
     },
   };

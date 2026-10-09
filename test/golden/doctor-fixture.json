@@ -24,7 +24,7 @@
       "tier": "fs-watch",
       "status": "ok",
       "required": true,
-      "detail": "16 screen file(s), 1 backend file(s) match the globs"
+      "detail": "19 screen file(s), 1 backend file(s) match the globs"
     },
     "barrier": {
       "tier": "vite-hmr",
@@ -48,7 +48,7 @@
       "tier": "import-graph",
       "status": "ok",
       "required": false,
-      "detail": "9 route(s), 13 file(s) mapped, 0 unresolved"
+      "detail": "10 route(s), 16 file(s) mapped, 0 unresolved"
     },
     "params": {
       "tier": "config",
@@ -73,6 +73,18 @@
       "status": "ok",
       "required": false,
       "detail": "off (decisions.enabled is false)"
+    },
+    "sidecars": {
+      "tier": "none",
+      "status": "ok",
+      "required": false,
+      "detail": "no sidecar files match [\".visual-proof/sidecars/*.vp\"]"
+    },
+    "replay": {
+      "tier": "off",
+      "status": "ok",
+      "required": false,
+      "detail": "replay.enabled is false; finish builds no replay video"
     }
   }
 }

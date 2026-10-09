@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import picomatch from 'picomatch';
-import { Browser, type Capturer, type CaptureSignals, type CaptureTiming } from './browser.js';
+import { Browser, type Capturer, type CaptureSignals, type CaptureTiming, type ScenarioPlan } from './browser.js';
 import type { Config } from './config.js';
 import { resolveAnchor } from './anchor.js';
 import { headCommit, workingTreeHash } from './git.js';
@@ -12,7 +12,16 @@ import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { ParamSourceResolver, type SourceOutcome } from './resolve/param-sources.js';
 import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
-import { Timeline, type Frame, type Trigger } from './timeline.js';
+import {
+  findSidecarFiles,
+  formatSidecarError,
+  loadSidecar,
+  scenarioRouteKeys,
+  sidecarRoute,
+  validateSidecar,
+  type Sidecar,
+} from './sidecar.js';
+import { Timeline, type Frame, type FrameStep, type Trigger } from './timeline.js';
 import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-watch.js';
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
 import { type DaemonState, type Status, type WarmupRouteStatus } from './status.js';
@@ -70,6 +79,8 @@ export interface FrameEvent {
 export interface BatchEvent {
   screen: string[];
   backend: string[];
+  /** Sidecar files that changed in this batch (scenarios replayed for other reasons are only in `routes`). */
+  sidecar: string[];
   routes: string[];
   outcome: 'captured' | 'refused' | 'discarded' | 'no-routes' | 'error';
 }
@@ -84,6 +95,7 @@ export interface WatchHandle {
 interface Pending {
   screen: Set<string>;
   backend: Set<string>;
+  sidecar: Set<string>;
   startedAt: number;
   attempts: number;
 }
@@ -94,6 +106,13 @@ interface Target {
   url: string;
   trigger: Trigger;
   sourceFile?: string;
+}
+
+/** A sidecar scenario chosen to run in a batch. */
+interface ScenarioJob {
+  sidecar: Sidecar;
+  plan: ScenarioPlan;
+  trigger: Trigger;
 }
 
 const STALE_MESSAGE = 'stale: freshness marker missing, capture refused';
@@ -137,6 +156,10 @@ class Watcher {
   private lastParamsProblems = '';
   /** Concrete path -> route, for every route that produced a frame this session. */
   private readonly sessionRoutes = new Map<string, { routeKey: string; url: string }>();
+  /** Sidecar files that produced frames this session; a backend (or unmapped) change replays them. */
+  private readonly sidecarsRun = new Set<string>();
+  /** The sidecar problems last logged, so an unchanged bad file does not log on every batch. */
+  private readonly sidecarProblems = new Map<string, string>();
 
   constructor(
     private readonly config: Config,
@@ -205,6 +228,7 @@ class Watcher {
         screenGlobs: this.config.screenGlobs,
         ignoreScreenGlobs: this.config.ignoreScreenGlobs,
         backendGlobs: this.config.backendGlobs,
+        sidecarGlobs: this.config.sidecars,
         ignorePaths: [this.dirs.statusDir, this.dirs.scratchDir, this.dirs.artifactDir],
         debounceMs: this.opts.debounceMs,
         onEvent: () => this.onFileEvent(),
@@ -438,21 +462,29 @@ class Watcher {
       this.refreshPending();
       return;
     }
-    this.merge({ screen: batch.screen, backend: batch.backend, startedAt: batch.startedAt, attempts: 0 });
+    this.merge({ screen: batch.screen, backend: batch.backend, sidecar: batch.sidecar ?? [], startedAt: batch.startedAt, attempts: 0 });
     if (!this.warmingUp) this.running ??= this.drain();
     this.refreshPending();
     this.writeStatus(); // carries the final lastEventAt of this change
   }
 
-  private merge(part: { screen: Iterable<string>; backend: Iterable<string>; startedAt: number; attempts: number }): void {
+  private merge(part: {
+    screen: Iterable<string>;
+    backend: Iterable<string>;
+    sidecar: Iterable<string>;
+    startedAt: number;
+    attempts: number;
+  }): void {
     const pending = (this.pending ??= {
       screen: new Set(),
       backend: new Set(),
+      sidecar: new Set(),
       startedAt: part.startedAt,
       attempts: part.attempts,
     });
     for (const f of part.screen) pending.screen.add(f);
     for (const f of part.backend) pending.backend.add(f);
+    for (const f of part.sidecar) pending.sidecar.add(f);
     pending.startedAt = Math.min(pending.startedAt, part.startedAt);
     pending.attempts = Math.max(pending.attempts, part.attempts);
   }
@@ -475,8 +507,9 @@ class Watcher {
   private async process(batch: Pending): Promise<void> {
     const screen = [...batch.screen].sort();
     const backend = [...batch.backend].sort();
+    const sidecar = [...batch.sidecar].sort();
     const done = (outcome: BatchEvent['outcome'], routes: string[] = []): void => {
-      this.events.emit('batch', { screen, backend, routes, outcome } satisfies BatchEvent);
+      this.events.emit('batch', { screen, backend, sidecar, routes, outcome } satisfies BatchEvent);
     };
 
     const marker = this.config.freshnessMarker;
@@ -550,7 +583,9 @@ class Watcher {
         else if (recapture.trigger === 'screen') this.log(`${recapture.why}: re-capturing ${this.sessionRoutes.size} route(s) captured this session`);
       }
 
-      if (targets.size === 0) {
+      const scenarios = await this.pickScenarios({ changed: sidecar, screen, recapture: recapture?.trigger ?? null, params });
+
+      if (targets.size === 0 && scenarios.length === 0) {
         this.log('no routes to capture');
         await beforeP.catch(() => {}); // the tree hash writes into the scratch dir; do not leave git running behind a finished batch
         done('no-routes');
@@ -567,6 +602,8 @@ class Watcher {
         renderedFiles: string[] | null;
         timing?: CaptureTiming;
         pageText?: string;
+        /** Sidecar stills only. */
+        steps?: FrameStep[];
       }> = [];
       let captureFailed = false;
       for (const target of targets.values()) {
@@ -577,6 +614,40 @@ class Watcher {
         } catch (err) {
           captureFailed = true;
           this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
+        }
+      }
+
+      const ranScenarios: string[] = [];
+      for (const job of scenarios) {
+        if (this.stopping) return;
+        const file = job.sidecar.file;
+        if (!this.capturer!.runScenario) {
+          this.log(`sidecar ${file} skipped: this capturer cannot run scenarios`);
+          continue;
+        }
+        try {
+          const result = await this.capturer!.runScenario(job.plan);
+          for (const still of result.stills) {
+            const route = sidecarRoute(file, still.name);
+            captured.push({
+              target: { path: route, routeKey: route, url: '', trigger: job.trigger, sourceFile: file },
+              at: still.at,
+              png: still.png,
+              signals: still.signals,
+              renderedFiles: still.renderedFiles,
+              timing: still.timing,
+              pageText: still.pageText,
+              steps: still.steps,
+            });
+          }
+          ranScenarios.push(file);
+          this.log(
+            `sidecar ${file}: ${result.stills.filter((x) => !x.failed).length} still(s) in ${result.ms} ms` +
+              (result.failure ? `; failed at line ${result.failure.line} ${result.failure.text}: ${result.failure.reason}` : ''),
+          );
+        } catch (err) {
+          captureFailed = true;
+          this.fail(new Error(`sidecar ${file} failed: ${(err as Error).message}`));
         }
       }
 
@@ -592,16 +663,17 @@ class Watcher {
             ? `working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})`
             : `${eventsDuring} file event(s) arrived during capture (tree unchanged: ${after.slice(0, 8)})`;
         this.log(`discarded ${captured.length} frame(s): ${why}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
-        this.events.emit('discarded', { routes: [...targets.keys()], before, after, requeued: requeue, events: eventsDuring });
+        const routes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
+        this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
         if (requeue) {
           // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
-          this.merge({ screen, backend, startedAt: Date.now(), attempts: batch.attempts + 1 });
+          this.merge({ screen, backend, sidecar, startedAt: Date.now(), attempts: batch.attempts + 1 });
         }
-        done('discarded', [...targets.keys()]);
+        done('discarded', routes);
         return;
       }
 
-      for (const { target, at, png, signals, renderedFiles, timing, pageText } of captured) {
+      for (const { target, at, png, signals, renderedFiles, timing, pageText, steps } of captured) {
         const verdict = triage(signals);
         const frame = this.timeline.append(
           {
@@ -616,6 +688,7 @@ class Watcher {
             reasons: verdict.reasons,
             renderedFiles,
             ...(timing ? { timing } : {}),
+            ...(steps ? { steps } : {}),
           },
           png,
         );
@@ -623,7 +696,7 @@ class Watcher {
         if (pageText !== undefined && this.config.decisions.verdict && this.config.decisions.enabled !== false) {
           writeTextSidecar(this.timeline.pngPath(frame), pageText);
         }
-        this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url });
+        if (!steps) this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url });
         this.status.frames++;
         this.status.lastCaptureAt = at;
         this.log(
@@ -631,10 +704,11 @@ class Watcher {
         );
         this.events.emit('frame', { frame, signals, pngPath: this.timeline.pngPath(frame) } satisfies FrameEvent);
       }
+      for (const file of ranScenarios) this.sidecarsRun.add(file);
       mark('write');
       if (!captureFailed && captured.length > 0) this.status.lastError = null; // the last problem is resolved
       this.log(`timing ${JSON.stringify(lap)} (ms since batch start; the debounce before it is not included)`);
-      done('captured', [...targets.keys()]);
+      done('captured', [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)]);
     } catch (err) {
       this.fail(err as Error);
       done('error');
@@ -642,6 +716,93 @@ class Watcher {
       if (!this.stopping) this.setState('ready');
       if (this.graphStale && !this.stopping) this.refreshGraph();
     }
+  }
+
+  // ---- sidecars ------------------------------------------------------------
+
+  /**
+   * The scenarios to replay for this batch: the sidecar files that changed; those with a `goto` on a route that a
+   * changed screen file renders (through the import graph); and, when the batch re-captures routes (a backend
+   * change, or a screen file with no route), every scenario that has run this session. A scenario that does not
+   * parse is logged and skipped: `finish` reports it.
+   */
+  private async pickScenarios(batch: {
+    changed: string[];
+    screen: string[];
+    recapture: Trigger | null;
+    params: Record<string, string>;
+  }): Promise<ScenarioJob[]> {
+    if (this.config.sidecars.length === 0) return [];
+    const existing = new Set(findSidecarFiles(this.config.repoDir, this.config.sidecars));
+    for (const file of [...this.sidecarsRun]) if (!existing.has(file)) this.sidecarsRun.delete(file);
+    for (const file of this.sidecarProblems.keys()) if (!existing.has(file)) this.sidecarProblems.delete(file);
+    if (existing.size === 0) return [];
+
+    const reasons = new Map<string, Trigger>();
+    for (const file of batch.changed) if (existing.has(file)) reasons.set(file, 'sidecar');
+    if (batch.recapture) {
+      for (const file of this.sidecarsRun) if (!reasons.has(file)) reasons.set(file, batch.recapture);
+    }
+
+    const loaded = new Map<string, Sidecar>();
+    const load = (file: string): Sidecar => {
+      let sidecar = loaded.get(file);
+      if (!sidecar) loaded.set(file, (sidecar = loadSidecar(this.config.repoDir, file)));
+      return sidecar;
+    };
+
+    if (batch.screen.length > 0) {
+      try {
+        const graph = await this.getGraph();
+        const knownKeys = new Set([...graph.routes.map((r) => r.path), ...Object.values(this.config.staticRoutes).flat()]);
+        const touched = new Set<string>();
+        for (const file of batch.screen) for (const key of graph.fileToRoutes.get(file) ?? this.config.staticRoutes[file] ?? []) touched.add(key);
+        if (touched.size > 0) {
+          for (const file of existing) {
+            if (reasons.has(file)) continue;
+            const sidecar = load(file);
+            if (scenarioRouteKeys(sidecar, knownKeys).some((key) => touched.has(key))) reasons.set(file, 'screen');
+          }
+        }
+      } catch (err) {
+        this.log(`sidecars: import graph unavailable: ${(err as Error).message.split('\n')[0]}`);
+      }
+    }
+
+    const jobs: ScenarioJob[] = [];
+    for (const [file, trigger] of [...reasons].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      const sidecar = load(file);
+      const errors = validateSidecar(sidecar, this.config);
+      const problems = errors.map((e) => formatSidecarError(file, e)).join('\n');
+      if (errors.length > 0) {
+        if (this.sidecarProblems.get(file) !== problems) {
+          this.sidecarProblems.set(file, problems);
+          for (const line of problems.split('\n')) this.log(`warning: sidecar ${line}`);
+        }
+        this.log(`sidecar ${file} skipped: ${errors.length} parse error(s)`);
+        continue;
+      }
+      this.sidecarProblems.delete(file);
+      const gotos = new Map<number, { url: string; path: string } | { error: string }>();
+      for (const step of sidecar.steps) {
+        if (step.verb === 'goto') gotos.set(step.line, await this.resolveGoto(step.target, batch.params));
+      }
+      jobs.push({ sidecar, trigger, plan: { file, name: sidecar.name, steps: sidecar.steps, gotos } });
+    }
+    if (jobs.length > 0) this.log(`sidecars: ${jobs.map((j) => `${j.sidecar.file} (${j.trigger})`).join(', ')}`);
+    return jobs;
+  }
+
+  /** A `goto` target is a concrete path, or a route key filled through routeParams, the seed file, then paramSources. */
+  private async resolveGoto(target: string, params: Record<string, string>): Promise<{ url: string; path: string } | { error: string }> {
+    const concrete = concretePath(target, params);
+    if (concrete.ok) return { path: concrete.path, url: joinUrl(this.config.appUrl, concrete.path) };
+    if (this.paramSources.has(target)) {
+      const outcome = await this.fromSource(target);
+      if (outcome.ok) return { path: outcome.path, url: joinUrl(this.config.appUrl, outcome.path) };
+      return { error: `cannot fill ${target}: ${outcome.reason}` };
+    }
+    return { error: `cannot fill ${target}: ${concrete.reason}` };
   }
 
   private async waitBarrier(startedAt: number, files: string[]): Promise<BarrierResult> {

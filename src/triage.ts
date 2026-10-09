@@ -10,6 +10,8 @@ export interface TriageSignals {
   visibleSpinnerCount: number;
   /** Set when the page could not be loaded as the logged-in user (login failed, 401/403, login redirect). */
   authFailure?: string;
+  /** Sidecar scenarios only: the step that failed (`line 3 click [data-test=x]: selector not found`); the frame is an error. */
+  stepFailure?: string;
   /** Set when `page.screenshot` threw: the PNG on disk is a placeholder, so the frame cannot be trusted. */
   screenshotError?: string;
 }
@@ -24,6 +26,7 @@ const MAX_REASON_LENGTH = 200;
 /** DOM heuristics, first match wins: error, blank, loading, clean. */
 export function triage(signals: TriageSignals): TriageResult {
   const errors: string[] = [];
+  if (signals.stepFailure) errors.push(signals.stepFailure);
   if (!signals.navOk) errors.push('navigation failed');
   if (signals.authFailure) errors.push(signals.authFailure);
   if (signals.screenshotError) errors.push(`screenshot failed: ${clip(signals.screenshotError)}`);

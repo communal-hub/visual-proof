@@ -47,6 +47,24 @@ export const DEFAULT_MAX_CAPTURE_HEIGHT = 6000;
 export const DEFAULT_WARMUP_BUDGET_MS = 60_000;
 export const DEFAULT_NETWORK_IDLE_MS = 250;
 export const DEFAULT_SETTLE_MAX_WAIT_MS = 5000;
+export const DEFAULT_SIDECARS: readonly string[] = ['.visual-proof/sidecars/*.vp'];
+export const DEFAULT_REPLAY_MAX_FRAMES = 60;
+export const DEFAULT_REPLAY_SECONDS_PER_FRAME = 1.2;
+export const DEFAULT_REPLAY_MAX_HEIGHT = 1600;
+/** Role names usable in `login <role>`; `default` is reserved for the configured login email. */
+export const ROLE_NAME = /^[A-Za-z0-9._-]+$/;
+export const DEFAULT_ROLE = 'default';
+
+/** The replay video `finish` builds from the session's frames when ffmpeg is on PATH. */
+export interface ReplayConfig {
+  enabled: boolean;
+  /** At most this many frames (the latest) go into the video. */
+  maxFrames: number;
+  /** How long each frame is shown. */
+  secondsPerFrame: number;
+  /** Cap on the canvas height (CSS px); the width is the viewport width. */
+  maxHeight: number;
+}
 
 /** How a route key gets its params from a list endpoint (see `paramSources`). */
 export interface ParamSourceConfig {
@@ -87,6 +105,12 @@ export interface Config {
    * `pick` the param(s) out of the JSON. Resolved lazily, cached per session, refreshed on a backend recapture.
    */
   paramSources: Record<string, ParamSourceConfig>;
+  /** Globs (relative to `repoDir`) of sidecar scenario files (`.vp`): scripted interaction steps that end in stills. */
+  sidecars: string[];
+  /** Role name to login email, for `login <role>` in a sidecar. `login default` is the configured `login.email`. */
+  roles: Record<string, string>;
+  /** The replay video built at `finish`. */
+  replay: ReplayConfig;
   screenGlobs: string[];
   /** Files matching these are never screens, even when they match `screenGlobs` (shared helpers, stories, tests). */
   ignoreScreenGlobs: string[];
@@ -197,6 +221,9 @@ export function parseConfig(
   const settleRaw = v.object('settle');
   const settle = settleRaw ? new Validator(settleRaw, errors, 'settle.') : undefined;
 
+  const replayRaw = v.object('replay');
+  const replayV = replayRaw ? new Validator(replayRaw, errors, 'replay.') : undefined;
+
   const loginRaw = v.object('login');
   const login = loginRaw ? parseLogin(loginRaw, errors) : defaultLogin();
 
@@ -214,6 +241,14 @@ export function parseConfig(
     routeParams: v.stringMap('routeParams') ?? {},
     routeParamsFile: v.string('routeParamsFile'),
     paramSources: parseParamSources(v.object('paramSources'), errors),
+    sidecars: v.stringArray('sidecars') ?? [...DEFAULT_SIDECARS],
+    roles: parseRoles(v.stringMap('roles'), errors),
+    replay: {
+      enabled: replayV?.boolean('enabled') ?? true,
+      maxFrames: replayV?.posInt('maxFrames') ?? DEFAULT_REPLAY_MAX_FRAMES,
+      secondsPerFrame: replayV?.posNumber('secondsPerFrame') ?? DEFAULT_REPLAY_SECONDS_PER_FRAME,
+      maxHeight: replayV?.posInt('maxHeight') ?? DEFAULT_REPLAY_MAX_HEIGHT,
+    },
     screenGlobs: v.stringArray('screenGlobs') ?? ['src/**/*.vue'],
     ignoreScreenGlobs: v.stringArray('ignoreScreenGlobs') ?? [],
     backendGlobs: v.stringArray('backendGlobs') ?? [],
@@ -330,6 +365,22 @@ function parseParamSources(raw: Record<string, unknown> | undefined, errors: str
   return sources;
 }
 
+function parseRoles(raw: Record<string, string> | undefined, errors: string[]): Record<string, string> {
+  const roles: Record<string, string> = {};
+  for (const [role, email] of Object.entries(raw ?? {})) {
+    if (!ROLE_NAME.test(role)) {
+      errors.push(`"roles" key ${JSON.stringify(role)} must be letters, digits, ".", "_" or "-"`);
+    } else if (role === DEFAULT_ROLE) {
+      errors.push(`"roles" key "${DEFAULT_ROLE}" is reserved: it always means the configured login.email`);
+    } else if (email === '') {
+      errors.push(`"roles.${role}" must be a non-empty login email`);
+    } else {
+      roles[role] = email;
+    }
+  }
+  return roles;
+}
+
 function parseRenderCheck(value: string | undefined, errors: string[]): RenderCheckMode {
   if (value === undefined) return 'fail';
   if (value === 'fail' || value === 'warn' || value === 'off') return value;
@@ -412,6 +463,15 @@ class Validator {
     if (value === undefined) return undefined;
     if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
       return this.fail(key, 'a positive integer', value);
+    }
+    return value;
+  }
+
+  posNumber(key: string): number | undefined {
+    const value = this.raw[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return this.fail(key, 'a positive number', value);
     }
     return value;
   }

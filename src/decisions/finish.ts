@@ -19,7 +19,7 @@ export interface DecisionHeadline {
   routeKey: string;
   /** Changed files that led to the route. */
   sourceFiles: string[];
-  via: 'screen' | 'backend';
+  via: 'screen' | 'backend' | 'sidecar';
   /** Absolute path of the frame's PNG. */
   png: string;
   renderedFiles: string[] | null;
