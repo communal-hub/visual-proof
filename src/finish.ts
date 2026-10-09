@@ -12,6 +12,21 @@ import { readStatusFile, watcherPid, writeFileAtomic, type Status } from './stat
 import { describeError } from './text.js';
 import { Timeline, type Frame } from './timeline.js';
 import type { FrameStatus } from './triage.js';
+// A4 decisions hooks (v0.6): everything else lives in src/decisions/**.
+import type { ClaimReport } from './decisions/claim.js';
+import type { DecisionsApi } from './decisions/client.js';
+import {
+  escapeCaption,
+  pruneForFinish,
+  renderClaimSection,
+  renderFooter,
+  runFinishDecisions,
+  stillLine,
+  summarize,
+  type DecisionsSummary,
+} from './decisions/finish.js';
+import type { ImageCheck } from './decisions/image-check.js';
+import { DecisionRuntime } from './decisions/runtime.js';
 
 export interface FinishOptions {
   env?: NodeJS.ProcessEnv;
@@ -23,6 +38,8 @@ export interface FinishOptions {
   buildGraph?: (config: Config) => Promise<ImportGraph>;
   /** How often to re-check a daemon that is still capturing. Default 200 ms. */
   pollMs?: number;
+  /** Replaces the OpenRouter Decisions client (tests). */
+  decisionsClient?: DecisionsApi;
 }
 
 /** One expected route and what `finish` found for it. */
@@ -40,6 +57,10 @@ export interface RouteProof {
   sessionId?: string;
   /** Absolute path of the copied headline PNG. */
   artifact?: string;
+  /** A4: what the image check made of the still (absent when decisions did not run for it). */
+  imageCheck?: ImageCheck;
+  /** A4: the caption shown under the still (chosen by the text model, else the first template). */
+  caption?: string;
 }
 
 export interface FinishResult {
@@ -59,6 +80,10 @@ export interface FinishResult {
   proofBlock: string;
   /** Exactly the line `--hook` prints. */
   summary: string;
+  /** A4: requests, time and cost of the decisions this finish made; absent when decisions were not active. */
+  decisions?: DecisionsSummary;
+  /** A4: the advisory claim check; absent when there was no claim or it was skipped. */
+  claim?: ClaimReport;
 }
 
 /** `/manage/invoices/1` -> `manage-invoices-1`; the root route is `root`. Only `[A-Za-z0-9._-]` survive. */
@@ -94,6 +119,9 @@ interface State {
   truncated: boolean;
   /** Set once the result is final; a late-finishing step must not touch anything after that. */
   closed: boolean;
+  /** A4 decisions: the summary footer and the advisory claim check, set once the decision phase is over. */
+  decisions?: DecisionsSummary;
+  claim?: ClaimReport;
 }
 
 /**
@@ -119,12 +147,21 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
     truncated: false,
     closed: false,
   };
+  const runtime = new DecisionRuntime({
+    config: config.decisions,
+    env: opts.env ?? process.env,
+    configDir: config.repoDir,
+    client: opts.decisionsClient,
+    capAt: deadline - 250, // finish's own deadline wins over the decision budget
+    now,
+    log: (message) => logLine(dirs, message),
+  });
 
   let timer: NodeJS.Timeout | undefined;
   const expired = new Promise<'expired'>((resolve) => {
     timer = setTimeout(() => resolve('expired'), budgetMs);
   });
-  const core = collect(config, dirs, opts, state, deadline, now);
+  const core = collect(config, dirs, opts, state, deadline, now, runtime);
   core.catch(() => {}); // after an expiry its rejection must not go unhandled
   try {
     const outcome = await Promise.race([core.then(() => 'done' as const), expired]);
@@ -148,8 +185,9 @@ async function collect(
   state: State,
   deadline: number,
   now: () => number,
+  runtime: DecisionRuntime,
 ): Promise<void> {
-  await gather(config, dirs, opts, state, deadline, now);
+  await gather(config, dirs, opts, state, deadline, now, runtime);
   if (!state.closed && state.failures.length > 0) await addHints(config, dirs, state);
 }
 
@@ -160,6 +198,7 @@ async function gather(
   state: State,
   deadline: number,
   now: () => number,
+  runtime: DecisionRuntime,
 ): Promise<void> {
   if (!(await isGitRepo(config.repoDir))) throw new SetupError(`${config.repoDir} is not a git repository`);
   if (state.closed) return;
@@ -200,7 +239,21 @@ async function gather(
   const seed = loadRouteParams(config);
   if (seed.error) state.notes.push(`${seed.error}; using routeParams from the config only`);
   for (const warning of seed.warnings) state.notes.push(warning);
-  const resolution = resolveRoutes(screenFiles, graph, { ...config, routeParams: seed.params });
+  if (runtime.missingKey) state.notes.push(runtime.missingKeyNote);
+  let resolution = resolveRoutes(screenFiles, graph, { ...config, routeParams: seed.params });
+  // A4 hook: the same pruned route set the watcher captured (its decision is cached in the status dir).
+  if (!graphFailed) {
+    const pruned = await pruneForFinish(config, runtime, dirs.statusDir, screenFiles, resolution, graph, range);
+    if (state.closed) return;
+    state.notes.push(...pruned.notes);
+    if (pruned.dropped.size > 0) {
+      resolution = {
+        ...resolution,
+        routes: resolution.routes.filter((r) => !pruned.dropped.has(r.routeKey)),
+        skipped: resolution.skipped.filter((r) => !pruned.dropped.has(r.routeKey)),
+      };
+    }
+  }
   for (const route of resolution.routes) {
     expected.set(route.routeKey, {
       route: route.path,
@@ -315,6 +368,45 @@ async function gather(
     }
   }
   if (!state.closed && !state.truncated) checkRendered(config, state, list, headlines);
+  if (!state.closed && !state.truncated) await decide(config, dirs, state, runtime, graph, timeline, headlines);
+}
+
+/** A4 hook: image check, claim verdict and captions for the clean headline frames, within the decision budget. */
+async function decide(
+  config: Config,
+  dirs: Dirs,
+  state: State,
+  runtime: DecisionRuntime,
+  graph: ImportGraph,
+  timeline: Timeline,
+  headlines: Map<RouteProof, Frame>,
+): Promise<void> {
+  if (!runtime.active) return;
+  const result = await runFinishDecisions({
+    config,
+    runtime,
+    statusDir: dirs.statusDir,
+    range: state.range,
+    graph,
+    headlines: [...headlines].map(([route, frame]) => ({
+      route: route.route,
+      routeKey: route.routeKey,
+      sourceFiles: route.sourceFiles,
+      via: route.via,
+      png: timeline.pngPath(frame),
+      renderedFiles: frame.renderedFiles ?? null,
+    })),
+  });
+  if (state.closed) return; // finish gave up while the decisions were running: the result is already final
+  for (const route of headlines.keys()) {
+    const entry = result.routes.get(route.route);
+    if (entry?.imageCheck) route.imageCheck = entry.imageCheck;
+    if (entry?.caption) route.caption = entry.caption;
+  }
+  state.failures.push(...result.failures);
+  state.notes.push(...result.notes);
+  if (result.claim) state.claim = result.claim;
+  state.decisions = summarize(runtime);
 }
 
 /** Only Vue single-file components carry the `__file` the render check reads. */
@@ -508,6 +600,8 @@ function finalize(dirs: Dirs, state: State): FinishResult {
     proofBlockPath,
     proofBlock,
     summary,
+    ...(state.decisions ? { decisions: state.decisions } : {}),
+    ...(state.claim ? { claim: state.claim } : {}),
   };
 }
 
@@ -544,6 +638,15 @@ export function errorResult(dirs: Dirs, failure: string, hints: string[] = []): 
   return result;
 }
 
+/** Best-effort line in watcher.log (decisions log here too: the image-token guard must be loud). */
+function logLine(dirs: Dirs, message: string): void {
+  try {
+    fs.appendFileSync(statusFiles(dirs).log, `${new Date().toISOString()} finish: ${message}\n`);
+  } catch {
+    // The log is a convenience.
+  }
+}
+
 function describeRange(range: string | null): string {
   return range ?? 'uncommitted changes only (no base ref, watcher anchor or parent commit)';
 }
@@ -570,18 +673,18 @@ function renderProofBlock(state: State): string {
 
   for (const route of state.routes) {
     if (!route.artifact || !route.status) continue;
-    lines.push(
-      '',
-      `<img src="${escapeAttr(route.artifact)}" alt="${escapeAttr(route.route)}">`,
-      '',
-      `\`${route.route}\` · ${route.status} · tree ${short}`,
-    );
+    lines.push('', `<img src="${escapeAttr(route.artifact)}" alt="${escapeAttr(route.route)}">`, '');
+    if (route.caption) lines.push(`_${escapeCaption(route.caption)}_`, '');
+    lines.push(stillLine(`\`${route.route}\` · ${route.status} · tree ${short}`, route));
   }
+
+  if (state.claim) lines.push('', ...renderClaimSection(state.claim));
 
   if (state.notes.length > 0) {
     lines.push('', '**Notes**', '');
     for (const note of state.notes) lines.push(`- ${note}`);
   }
+  if (state.decisions) lines.push('', renderFooter(state.decisions));
   return `${lines.join('\n')}\n`;
 }
 

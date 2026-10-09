@@ -110,7 +110,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     const configPath = path.join(dir, 'visual-proof.config.json');
     fs.writeFileSync(
       configPath,
-      JSON.stringify({ ...fixtureConfig, appUrl, viteUrl: appUrl, ...options.config }, null, 2),
+      JSON.stringify({ ...fixtureConfig, appUrl, viteUrl: appUrl, decisions: { enabled: false }, ...options.config }, null, 2),
     );
 
     const env: NodeJS.ProcessEnv = {

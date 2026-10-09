@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { chromium, type Browser as PwBrowser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import type { Config } from './config.js';
+import { SIDECAR_TEXT_LIMIT } from './decisions/sidecar.js';
 import { hostBlocker } from './hosts.js';
 import { normalizeRenderedFiles, renderedFilesScript } from './rendered.js';
 import type { TriageSignals } from './triage.js';
@@ -43,6 +44,8 @@ export interface CaptureResult {
   signals: CaptureSignals;
   /** URL the page ended on after redirects and client-side routing. */
   finalUrl: string;
+  /** Up to 8 KB of the app root's visible text (A4 decisions: stored in a sidecar next to the PNG); absent from fakes. */
+  pageText?: string;
   /** Absent from capturers that do not prepare the page (test fakes). */
   layout?: CaptureLayout;
   /** Component files mounted in the page (see {@link Frame.renderedFiles}); absent from fakes. */
@@ -215,9 +218,9 @@ export class Browser implements Capturer {
       attempt = await this.captureOnce(context, url);
     }
 
-    const { png, signals, finalUrl, layout, renderedFiles, timing } = attempt;
+    const { png, signals, finalUrl, layout, renderedFiles, timing, pageText } = attempt;
     if (authFailure) signals.authFailure = authFailure;
-    return { png, signals, finalUrl, ...(layout ? { layout } : {}), renderedFiles, timing };
+    return { png, signals, finalUrl, ...(layout ? { layout } : {}), renderedFiles, timing, pageText };
   }
 
   async getJson(urlPath: string): Promise<JsonResponse> {
@@ -459,6 +462,7 @@ export class Browser implements Capturer {
   private async captureOnce(context: BrowserContext, url: string): Promise<CaptureResult & { httpStatus: number | null }> {
     const loaded = await this.loadPage(context, url);
     const { page, navOk, httpStatus, dom, consoleErrors, pageErrors } = loaded;
+    const { fullText: _fullText, ...signalDom } = dom; // the long text goes to the sidecar, not into the signals
     const screenshotStart = Date.now();
     try {
       let layout: CaptureLayout | undefined;
@@ -500,11 +504,12 @@ export class Browser implements Capturer {
       return {
         png,
         finalUrl: page.url(),
+        pageText: dom.fullText,
         httpStatus,
         ...(layout ? { layout } : {}),
         renderedFiles,
         timing: { settleMs: loaded.settleMs, screenshotMs: Date.now() - screenshotStart },
-        signals: { navOk, httpStatus, consoleErrors, pageErrors, ...dom, ...(screenshotError ? { screenshotError } : {}) },
+        signals: { navOk, httpStatus, consoleErrors, pageErrors, ...signalDom, ...(screenshotError ? { screenshotError } : {}) },
       };
     } finally {
       this.pages.delete(page);
@@ -632,10 +637,12 @@ interface Dom {
   appRootChildCount: number;
   visibleSpinnerCount: number;
   text: string;
+  /** Like `text`, with the larger {@link SIDECAR_TEXT_LIMIT} cut. */
+  fullText: string;
 }
 
 function emptyDom(): Dom {
-  return { appRootPresent: false, appRootChildCount: 0, visibleSpinnerCount: 0, text: '' };
+  return { appRootPresent: false, appRootChildCount: 0, visibleSpinnerCount: 0, text: '', fullText: '' };
 }
 
 /** Null when the page navigated away mid-read (execution context destroyed). */
@@ -649,6 +656,7 @@ async function readDom(
     const appRoot = ${JSON.stringify(appRoot)};
     const spinnerSelectors = ${JSON.stringify(spinnerSelectors)};
     const limit = ${TEXT_EXCERPT_LIMIT};
+    const fullLimit = ${SIDECAR_TEXT_LIMIT};
     const isVisible = (el) => {
       const style = getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
@@ -675,6 +683,7 @@ async function readDom(
       appRootChildCount: root ? root.childElementCount : 0,
       visibleSpinnerCount: spinners,
       text: text.slice(0, limit),
+      fullText: text.slice(0, fullLimit),
     };
   })()`;
   try {
