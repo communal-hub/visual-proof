@@ -24,7 +24,7 @@ export interface NormalizeOptions {
  *  - `localhost:5173`, `127.0.0.1:3000`, `app.test:8080` -> `...:<port>`
  *  - 7 to 40 hex digits (git hashes, short or long) -> `<hash>`
  *  - `123 ms` -> `<n> ms`
- *  - `Chromium 130.0.6723.58`, `Playwright 1.64.0`, ... -> `Chromium <version>`
+ *  - `Chromium 130.0.6723.58`, `Playwright 1.64.0`, `ffmpeg 7.1`, ... -> `Chromium <version>`
  */
 export function normalizeText(text: string, options: NormalizeOptions = {}): string {
   const roots = [...(options.roots ?? [])];
@@ -52,7 +52,7 @@ export function normalizeText(text: string, options: NormalizeOptions = {}): str
     .replace(/((?:localhost|\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9-]+(?:\.[a-z0-9-]+)+)):\d{2,5}\b/gi, '$1:<port>')
     .replace(/\b[0-9a-f]{7,40}\b/g, '<hash>')
     .replace(/\d+ ms\b/g, '<n> ms')
-    .replace(/\b(Chromium|Chrome|Firefox|WebKit|Playwright|Vite|Node(?:\.js)?|visual-proof) v?\d+(?:\.\d+)+\S*/gi, '$1 <version>');
+    .replace(/\b(Chromium|Chrome|Firefox|WebKit|Playwright|Vite|Node(?:\.js)?|ffmpeg|visual-proof) v?\d+(?:\.\d+)+\S*/gi, '$1 <version>');
 }
 
 /**
