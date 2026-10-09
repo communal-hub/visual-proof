@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work and the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) and the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter). Vite apps only; Chromium only.
 
 ## Install
 
@@ -79,6 +79,8 @@ Only `appUrl` is required.
 | `maxFrames` | `200` | oldest frames are evicted beyond this |
 | `finishBudgetMs` | `25000` | how long `finish` waits for in-flight captures |
 | `baseRef` | `main` | branch that `finish` diffs against |
+| `decisions` | see "Model decisions" | OpenRouter-backed checks at bounded decision points: `enabled`, `models`, `triage`, `prune`, `verdict`, `captions`, `budgetMs` |
+| `claimFile` | `<statusDir>/claim.md` | the claim the change should prove (bullet or numbered lines are criteria); relative to the config dir |
 
 ### Route params from a seed file
 
@@ -261,7 +263,7 @@ Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 ## Commands
 
 ```sh
-npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes, param tiers
+npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes, param tiers, decisions
 npx visual-proof start      # start the watcher (reattaches if running); prints status JSON
 npx visual-proof status     # status JSON; a dead watcher is reported as stale
 npx visual-proof status --wait [--timeout <s>]   # block until ready (alias: npx visual-proof ready)
@@ -270,7 +272,7 @@ npx visual-proof stop
 npx visual-proof watch      # run the watcher in the foreground
 ```
 
-Options: `--config <path>`, `--json` (finish, doctor), `--normalize` (doctor --json), `--hook` (finish: quiet,
+Options: `--config <path>`, `--json` (finish, doctor), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
 time-capped, always exits 0), `--wait` and `--timeout <s>` (status). Run
 `npx visual-proof --help` for details.
 
@@ -316,15 +318,84 @@ In the status dir:
 - `anchors.json` (the diff anchor per repo root and branch; survives daemon restarts, entries expire after 24 h)
 - `watcher.log` (one line per event)
 - `doctor.json` (last doctor report)
+- `decisions-cache.json` (route pruning decisions per file content, shared by the watcher and `finish`)
 - `proof-block.md` (written by `finish` on every outcome)
 - `scratch/index.jsonl` (one frame record per line, with `timing`) and `scratch/frames/<id>.png`
 
 Headline stills are copied to the artifact dir as `<route-slug>-<shortTree>.png`.
 
-## Planned (A4)
+## Model decisions (A4)
 
-OpenRouter-backed model decisions (reviewing frames beyond the DOM heuristics) are
-planned for milestone A4 and are not implemented.
+Fast typed-answer model calls at a few bounded decision points, never navigation. They need an OpenRouter key:
+`OPENROUTER_API_KEY` in the environment, or in a `.env` file next to the config. **Without a key nothing changes:**
+the DOM heuristics are all there is, and `doctor` says `heuristics-only`. Both models are served by OpenRouter's
+Decisions API (`POST https://openrouter.ai/api/alpha/decisions`): questions of type `choice`, `noul` (probability
+of yes) or `score` against one state, answered in parallel, with no free text. A request has an 8 s timeout and one
+retry on 429/5xx (honoring `retry-after`); the key never appears in logs, notes or the proof block.
+
+```json
+{
+  "decisions": {
+    "enabled": true,
+    "models": { "triage": "openai/gpt-6-luna-decisions-20261006", "text": "typesafe/jev-1.13" },
+    "triage": "warn",
+    "prune": { "above": 6, "keep": 4 },
+    "verdict": true,
+    "captions": true,
+    "budgetMs": 10000
+  },
+  "claimFile": "docs/claim.md"
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | on when a key exists | `false` never makes a request (cached prune decisions still apply); `true` without a key adds a note to the proof block |
+| `models.triage` | `openai/gpt-6-luna-decisions-20261006` | image model (pinned) for the image check |
+| `models.text` | `typesafe/jev-1.13` | text model (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the dated id is what answers) for pruning, claim and captions |
+| `triage` | `warn` | `fail`, `warn` or `off`: what a non-clean image check does; `off` sends no image requests |
+| `prune` | `{ above: 6, keep: 4 }` | prune when one changed file fans out to more than `above` routes, keeping the `keep` likeliest; `false` disables |
+| `verdict` | `true` | advisory claim check against `claimFile` |
+| `captions` | `true` | a caption under each headline still |
+| `budgetMs` | `10000` | time all decisions of one `finish` share; unfinished work is skipped with a note |
+
+**Image check.** Each headline frame the DOM heuristics call `clean` is shown to the image model as a `choice`
+between `clean`, `loading`, `error` and `blank` (DOM says fine, the pixels may not). One request per frame, up to 6
+at a time. A non-clean answer with confidence 0.7 or more fails `finish` with
+`<route> looks <label> to the image check (<confidence>)` (`triage: "fail"`) or becomes a note (`"warn"`, the
+default). The answer is recorded on the route in the proof block and in `--json` (`routes[].imageCheck`). An empty
+state with an explicit message ("No invoices yet") counts as clean. If an image request reports more than 2000
+input tokens, the image was read as text (a wrong-encoding regression): it is logged loudly in `watcher.log`, noted,
+and the answer is ignored.
+
+**Route pruning.** When one changed file fans out to more than `prune.above` routes, one text request asks, per
+route, whether the change visibly affects it; the `prune.keep` likeliest and anything at 0.5 or more are kept. A
+route whose page component or layout *is* the changed file is never asked about or pruned. The decision is cached
+per (file, content hash, route set) in `decisions-cache.json` in the status dir, so the watcher captures, and
+`finish` expects, the same routes; a cached decision applies even with decisions off. A failed or late request prunes
+nothing. Pruned routes are listed in the notes.
+
+**Claim check (advisory).** `finish` reads the claim (`claimFile`, default `<statusDir>/claim.md`; missing means a
+note), splits it into criteria in code (bullet or numbered lines; otherwise the whole text is one criterion) and asks
+one `noul` per criterion against the headline pages' visible text (up to 8 KB of the app root's text per frame, kept
+in `frames/<id>.text.json` next to the PNG) and rendered component files. 0.7 or more is `satisfied`, below 0.3
+`not visible`, else `partial`; the overall verdict is derived in code. It never fails `finish`. The model reads text,
+so colors and layout are not visible to it. The proof block gets a "Claim check (advisory)" section ending with
+`Advisory — reviewer decides.`
+
+**Captions.** Three to five candidate captions are built in code (route title from the route file's `title`, else the
+path; changed file names; style, template or script change from the diff); the text model picks one, shown under
+the still. Without a key, or on failure, the first template is used.
+
+**Accounting.** The proof block ends with `decisions: N requests, M ms, $cost` (M is wall time inside decision phases,
+which run concurrently). One finish makes one image request per headline frame plus at most three text requests
+(prune on a cache miss, claim, captions), about 1.2k input tokens and $0.00012 per image and about $0.00002 per
+text request.
+
+`doctor` has a `decisions` row: key present (and from where), the mode summary, and, with `doctor --probe-decisions`
+or when the app answers, one tiny probe per model (bounded to 5 s) with the resolved model id and latency.
+Tests and the known-bad corpus run with `decisions.enabled: false` so they stay offline and deterministic; the live
+tests (`test/live`) run only when a key is available.
 
 ## License
 
