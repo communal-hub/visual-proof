@@ -11,6 +11,10 @@ onMounted(async () => {
 <template>
   <main>
     <h1>Invoices</h1>
+    <p>
+      <a href="https://example.com/manage/invoices/99">Archive (other site)</a>
+      <router-link to="/manage/invoices/new">New invoice</router-link>
+    </p>
     <div v-if="!invoices" class="spinner">Loading...</div>
     <ul v-else data-test="invoice-list">
       <li v-for="invoice in invoices" :key="invoice.id">

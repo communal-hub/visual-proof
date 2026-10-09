@@ -6,13 +6,15 @@ import { doctorCommand } from './doctor.js';
 import { EXIT } from './exit.js';
 import { finishCommand } from './finish.js';
 import { pathsInfo, resolveDirs } from './paths.js';
+// v0.8 dynamic params: `params set|list|clear` lives in params.ts.
+import { DEFAULT_SET_TIMEOUT_S, PARAMS_ACTIONS, paramsCommand, type ParamsAction } from './params.js';
 import { DEFAULT_READY_TIMEOUT_S, waitForReady } from './ready.js';
 import { readLiveStatus } from './status.js';
 import { firstLine } from './text.js';
 
-export type Command = 'start' | 'stop' | 'status' | 'ready' | 'watch' | 'finish' | 'doctor';
+export type Command = 'start' | 'stop' | 'status' | 'ready' | 'watch' | 'finish' | 'doctor' | 'params';
 
-const COMMANDS: readonly Command[] = ['start', 'stop', 'status', 'ready', 'watch', 'finish', 'doctor'];
+const COMMANDS: readonly Command[] = ['start', 'stop', 'status', 'ready', 'watch', 'finish', 'doctor', 'params'];
 
 export { readLiveStatus };
 
@@ -30,6 +32,9 @@ export interface ParsedArgs {
   /** Seconds `--wait` may block; undefined means the default. */
   timeoutSec?: number;
   help: boolean;
+  /** `params`: the action (set, list, clear) and its positional arguments. */
+  paramsAction?: ParamsAction;
+  paramsArgs: string[];
 }
 
 export class UsageError extends Error {}
@@ -46,11 +51,12 @@ Commands:
   watch      run the watcher in the foreground
   finish     assemble headline stills and the proof block for HEAD
   doctor     check the browser, change trigger, barrier, login, routes, route params, sidecars and replay
+  params     set, list or clear route params for this session (see below)
 
 Options:
   --config <path>   config file (default: ./visual-proof.config.json)
   --hook            finish only: quiet, time-capped, always exits 0
-  --json            finish, doctor: print the result as JSON on stdout
+  --json            finish, doctor, params list: print the result as JSON on stdout
   --normalize       doctor --json: strip ports, absolute paths, hashes, timings and
                     versions, so the report can be checked in as a golden file
   --probe-decisions doctor only: send one tiny request to each decisions model (needs
@@ -59,7 +65,18 @@ Options:
                     (exit 0), or fail fast on error / a dead watcher / stop (exit 1)
   --timeout <s>     status --wait, ready: give up after this many seconds
                     (default ${DEFAULT_READY_TIMEOUT_S}); exit 1 with a one-line reason
+                    params set: wait this long for the watcher's capture (default ${DEFAULT_SET_TIMEOUT_S})
   -h, --help        show this help
+
+Route params (a route like /invoices/:id needs an id before it can be captured):
+  params set <routeKey> key=value [key=value...]
+                    use these values for the route, ahead of every other source;
+                    a running watcher captures it at once (exit 2: unknown route key,
+                    missing or extra params; exit 1: the capture was not clean)
+  params list       what was set, what link discovery found, and the seed candidates
+  params clear [<routeKey>]
+                    drop one route's session params, or all of them
+  Example: npx visual-proof params set '/invoices/:id' id=42
 
 Output:
   start, status     one JSON object on stdout: the daemon status plus
@@ -73,6 +90,8 @@ Output:
 
 Files (in $VISUAL_PROOF_STATUS_DIR, default /tmp/cursor/visual-proof):
   status.json       daemon state, warm-up, pending work, anchor, lastError, lastFinish
+  session-params.json   route params set with "params set" (never committed)
+  param-discovery.json  ids link discovery found this watcher session
   anchors.json      diff anchor per repo and branch (kept across daemon restarts)
   proof-block.md    what finish last wrote, success or failure
   watcher.log       one line per event
@@ -97,7 +116,7 @@ Examples:
 `;
 
 export function parseArgs(argv: string[]): ParsedArgs {
-  const parsed: ParsedArgs = { command: null, hook: false, json: false, normalize: false, probeDecisions: false, wait: false, help: false };
+  const parsed: ParsedArgs = { command: null, hook: false, json: false, normalize: false, probeDecisions: false, wait: false, help: false, paramsArgs: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '-h' || arg === '--help') {
@@ -123,6 +142,13 @@ export function parseArgs(argv: string[]): ParsedArgs {
       parsed.configPath = value;
     } else if (arg.startsWith('-')) {
       throw new UsageError(`unknown option: ${arg}`);
+    } else if (parsed.command === 'params') {
+      if (parsed.paramsAction === undefined) {
+        if (!(PARAMS_ACTIONS as readonly string[]).includes(arg)) throw new UsageError(`unknown params action: ${arg} (expected set, list or clear)`);
+        parsed.paramsAction = arg as ParamsAction;
+      } else {
+        parsed.paramsArgs.push(arg);
+      }
     } else if (parsed.command !== null) {
       throw new UsageError(`unexpected argument: ${arg}`);
     } else if ((COMMANDS as readonly string[]).includes(arg)) {
@@ -134,8 +160,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (parsed.hook && parsed.command !== 'finish' && !parsed.help) {
     throw new UsageError('--hook is only valid with the finish command');
   }
-  if (parsed.json && parsed.command !== 'finish' && parsed.command !== 'doctor' && !parsed.help) {
-    throw new UsageError('--json is only valid with the finish and doctor commands');
+  if (parsed.json && parsed.command !== 'finish' && parsed.command !== 'doctor' && !(parsed.command === 'params' && parsed.paramsAction === 'list') && !parsed.help) {
+    throw new UsageError('--json is only valid with the finish, doctor and params list commands');
   }
   if (parsed.normalize && !parsed.help && (parsed.command !== 'doctor' || !parsed.json)) {
     throw new UsageError('--normalize is only valid with doctor --json');
@@ -146,8 +172,15 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (parsed.wait && parsed.command !== 'status' && parsed.command !== 'ready' && !parsed.help) {
     throw new UsageError('--wait is only valid with the status command');
   }
-  if (parsed.timeoutSec !== undefined && !(parsed.wait || parsed.command === 'ready') && !parsed.help) {
-    throw new UsageError('--timeout is only valid with status --wait or ready');
+  if (parsed.timeoutSec !== undefined && !(parsed.wait || parsed.command === 'ready' || (parsed.command === 'params' && parsed.paramsAction === 'set')) && !parsed.help) {
+    throw new UsageError('--timeout is only valid with status --wait, ready or params set');
+  }
+  if (parsed.command === 'params' && !parsed.help) {
+    const { paramsAction: action, paramsArgs: rest } = parsed;
+    if (action === undefined) throw new UsageError('params needs an action: set, list or clear');
+    if (action === 'set' && rest.length < 2) throw new UsageError("params set needs a route key and at least one param=value, e.g. params set '/invoices/:id' id=5");
+    if (action === 'list' && rest.length > 0) throw new UsageError(`params list takes no arguments, got: ${rest.join(' ')}`);
+    if (action === 'clear' && rest.length > 1) throw new UsageError(`params clear takes at most one route key, got: ${rest.join(' ')}`);
   }
   return parsed;
 }
@@ -181,6 +214,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     if (args.command === 'watch') return await runWatch({ configPath: args.configPath, env });
     if (args.command === 'finish') {
       return await finishCommand({ configPath: args.configPath, hook: args.hook, json: args.json, env });
+    }
+    if (args.command === 'params') {
+      return await paramsCommand({ configPath: args.configPath, action: args.paramsAction!, args: args.paramsArgs, json: args.json, timeoutSec: args.timeoutSec, env });
     }
     return await doctorCommand({
       configPath: args.configPath,

@@ -2,8 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FrameStatus } from './triage.js';
 
-/** Which glob set caused the capture: a screen file changed, a backend file did, or a sidecar scenario file did. */
-export type Trigger = 'screen' | 'backend' | 'sidecar';
+/** Which glob set caused the capture: a screen file changed, a backend file did, a sidecar scenario file did, or `visual-proof params set` asked for it (`params`). */
+export type Trigger = 'screen' | 'backend' | 'sidecar' | 'params';
+
+/** Which tier filled a route's params (v0.8); see the brief, "Dynamic route params". */
+export type ParamsFrom = 'session' | 'config' | 'file' | 'source' | 'discovered';
 
 /** One executed step of a sidecar scenario, as kept on its frames. */
 export interface FrameStep {
@@ -32,12 +35,16 @@ export interface Frame {
    */
   renderedFiles?: string[] | null;
   /** Where the capture spent its time (ms), to tune `settle`; absent on frames from older versions. */
-  timing?: { settleMs: number; screenshotMs: number };
+  timing?: { settleMs: number; screenshotMs: number; discoveryMs?: number };
   /**
    * Sidecar frames only: every step executed from the start of the scenario up to and including the `still`
    * (for an error frame, up to and including the step that failed). Absent on route frames.
    */
   steps?: FrameStep[];
+  /** v0.8: the tier that filled the route's params; absent for a route without params and on older frames. */
+  paramsFrom?: ParamsFrom;
+  /** v0.8: with `paramsFrom: "discovered"`, the page whose links gave the id. */
+  paramsFoundOn?: string;
   /** Path of the PNG relative to the scratch dir. */
   png: string;
 }

@@ -260,6 +260,35 @@ export default routes
     );
   });
 
+  it('reads Vue Router syntax in a path: custom regex (escaped backslashes), optional, repeatable, nested', async () => {
+    write(
+      root,
+      'src/router/index.js',
+      [
+        "import A from '@/A.vue'",
+        'export default [',
+        "  { path: '/users/:id(\\\\d+)', component: A },",
+        "  { path: '/docs/:slug?', component: A },",
+        "  { path: '/files/:path+', component: A },",
+        "  { path: '/clubs/:clubId', component: A, children: [{ path: 'teams/:teamId(\\\\d+)', component: A }] },",
+        "  { path: '/:pathMatch(.*)*', component: A },",
+        ']',
+      ].join('\n'),
+    );
+    write(root, 'src/A.vue', '<template/>');
+    const graph = await build();
+    expect(graph.routes.map((r) => r.path).sort()).toEqual(['/:pathMatch(.*)*', '/clubs/:clubId/teams/:teamId(\\d+)', '/docs/:slug?', '/files/:path+', '/users/:id(\\d+)'].sort());
+    expect(graph.unresolved).toEqual([]);
+  });
+
+  it('still drops a path with an escape it cannot decode, as non-literal', async () => {
+    write(root, 'src/router/index.js', "import A from '@/A.vue'\nexport default [{ path: '/x/\\n', component: A }]");
+    write(root, 'src/A.vue', '<template/>');
+    const graph = await build();
+    expect(graph.routes).toEqual([]);
+    expect(graph.unresolved).toEqual([expect.stringContaining('non-literal route path')]);
+  });
+
   it('returns an empty graph when no route files match', async () => {
     write(root, 'src/App.vue', '<template/>');
     const graph = await build();

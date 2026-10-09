@@ -43,6 +43,9 @@ export const DEFAULT_BLOCK_HOSTS: readonly string[] = [
 
 export type RenderCheckMode = 'fail' | 'warn' | 'off';
 
+/** How a route with params that no earlier tier fills gets an id (v0.8): from the links of its parent page, or not at all. */
+export type ParamDiscoveryMode = 'links' | 'off';
+
 export const DEFAULT_MAX_CAPTURE_HEIGHT = 6000;
 export const DEFAULT_WARMUP_BUDGET_MS = 60_000;
 export const DEFAULT_NETWORK_IDLE_MS = 250;
@@ -111,6 +114,12 @@ export interface Config {
   roles: Record<string, string>;
   /** The replay video built at `finish`. */
   replay: ReplayConfig;
+  /**
+   * v0.8, the last tier of route params: `links` (default) loads the nearest parent route and takes the first link
+   * that fits the route's pattern; `off` leaves the route unfilled. Session params set with `visual-proof params set`
+   * outrank every tier.
+   */
+  paramDiscovery: ParamDiscoveryMode;
   screenGlobs: string[];
   /** Files matching these are never screens, even when they match `screenGlobs` (shared helpers, stories, tests). */
   ignoreScreenGlobs: string[];
@@ -249,6 +258,7 @@ export function parseConfig(
       secondsPerFrame: replayV?.posNumber('secondsPerFrame') ?? DEFAULT_REPLAY_SECONDS_PER_FRAME,
       maxHeight: replayV?.posInt('maxHeight') ?? DEFAULT_REPLAY_MAX_HEIGHT,
     },
+    paramDiscovery: parseParamDiscovery(v.string('paramDiscovery'), errors),
     screenGlobs: v.stringArray('screenGlobs') ?? ['src/**/*.vue'],
     ignoreScreenGlobs: v.stringArray('ignoreScreenGlobs') ?? [],
     backendGlobs: v.stringArray('backendGlobs') ?? [],
@@ -386,6 +396,13 @@ function parseRenderCheck(value: string | undefined, errors: string[]): RenderCh
   if (value === 'fail' || value === 'warn' || value === 'off') return value;
   errors.push(`"renderCheck" must be "fail", "warn" or "off", got ${JSON.stringify(value)}`);
   return 'fail';
+}
+
+function parseParamDiscovery(value: string | undefined, errors: string[]): ParamDiscoveryMode {
+  if (value === undefined) return 'links';
+  if (value === 'links' || value === 'off') return value;
+  errors.push(`"paramDiscovery" must be "links" or "off", got ${JSON.stringify(value)}`);
+  return 'links';
 }
 
 function defaultLogin(): LoginConfig {

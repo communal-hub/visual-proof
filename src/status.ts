@@ -34,6 +34,17 @@ export interface ParamSourceStatus {
   at: string;
 }
 
+/** What the latest link-discovery attempt for a route key produced (v0.8); `finish` quotes `error` when the route has no frame. */
+export interface ParamDiscoveryStatus {
+  /** The concrete path it resolved to (kept after a later failure, which sets `error` too). */
+  path?: string;
+  /** The page whose links gave the path. */
+  foundOn?: string;
+  /** Why the latest attempt failed, e.g. `no link matching /invoices/:id on /invoices`; absent after a success. */
+  error?: string;
+  at: string;
+}
+
 /** What the watcher keeps in `status.json`. `finish` adds `lastFinish` to the same file. */
 export interface Status {
   state: DaemonState;
@@ -57,6 +68,10 @@ export interface Status {
   warmup?: WarmupStatus;
   /** Per route key with a `paramSources` entry: the latest outcome. `finish` quotes the error when the route has no frame. */
   paramSources?: Record<string, ParamSourceStatus>;
+  /** Per route key link discovery looked at this session: the latest outcome (v0.8). */
+  paramDiscovery?: Record<string, ParamDiscoveryStatus>;
+  /** Highest `session-params.json` revision the watcher has fully handled (v0.8); `params set` waits for it. */
+  sessionParamsRev?: number;
   /** Written by `finish`, not by the watcher; carried over on every status write so it is never lost. */
   lastFinish?: unknown;
 }

@@ -7,6 +7,7 @@ import { headTree } from '../../src/git.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
 import { sidecarRoute } from '../../src/sidecar.js';
+import { setSessionParams } from '../../src/resolve/session-params.js';
 import { Timeline, type NewFrame } from '../../src/timeline.js';
 import type { FrameStatus } from '../../src/triage.js';
 import { commitAll, git, initRepo, tmpDir, write } from './helpers.js';
@@ -242,15 +243,15 @@ describe('runFinish', () => {
     expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain('- no route for src/orphan/Lonely.vue');
   });
 
-  it('fails a route whose params are unfilled, pointing at routeParams', async () => {
-    configure({ routeParams: {} });
+  it('fails a route whose params are unfilled with the params set command, the tiers tried and the advice', async () => {
+    configure({ routeParams: {}, paramDiscovery: 'off' });
     editAndCommit('src/pages/B.vue');
     editAndCommit('src/pages/A.vue');
     await frame('/a');
     const result = await finish();
     expect(result.ok).toBe(false);
     expect(result.failures).toEqual([
-      'cannot capture /b/:id: no routeParams entry for /b/:id (params: :id) (add routeParams)',
+      "cannot capture /b/:id: params unfilled. Tried: session: none set; routeParams: no entry; routeParamsFile: not configured; paramSources: not configured; discovery: off (paramDiscovery: \"off\"). Fix: npx visual-proof params set '/b/:id' id=<value>. If no record exists, create one first (e.g. with the app's factories or seeders) and use its id.",
     ]);
     expect(result.routes.map((r) => r.route)).toEqual(['/a']);
   });
@@ -278,7 +279,8 @@ describe('runFinish', () => {
       editAndCommit('src/pages/B.vue');
       const result = await finish();
       expect(result.ok).toBe(false);
-      expect(result.failures).toEqual(['cannot capture /b/:id: paramSources /api/b failed: HTTP 500 (add routeParams)']);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures[0]).toMatch(/^cannot capture \/b\/:id: params unfilled\. Tried: .*paramSources \/api\/b failed: HTTP 500; discovery: .*Fix: npx visual-proof params set '\/b\/:id' id=<value>\./);
     });
 
     it('with no recorded error and no frame it is the ordinary "no frame at HEAD"', async () => {
@@ -318,7 +320,7 @@ describe('runFinish', () => {
       configure({ routeParams: {}, paramSources: {} });
       await frame('/b/1', 'clean', { routeKey: '/b/:id', tree: 'a'.repeat(40) });
       editAndCommit('server/data.json', '{"v":2}\n');
-      expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: no routeParams entry/);
+      expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: params unfilled\./);
     });
   });
 
@@ -336,7 +338,7 @@ describe('runFinish', () => {
     configure({ routeParams: {}, routeParamsFile: '.visual-proof/params.json' });
     editAndCommit('src/pages/B.vue');
     await frame('/b/7');
-    expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: no routeParams entry/);
+    expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: params unfilled\. Tried: .*routeParamsFile: file not found/);
 
     write(repo, '.visual-proof/params.json', JSON.stringify({ '/b/:id': '/b/7' }));
     expect(await finish()).toMatchObject({ ok: true, failures: [] });
@@ -635,6 +637,183 @@ describe('remedy hints', () => {
     const result = await finish();
     expect(result.failures).toEqual(['/a final frame is error: error reason']);
     expect(result.hints).toEqual([]);
+  });
+});
+
+describe('dynamic route params (v0.8)', () => {
+  const sessionFile = (): string => path.join(dirs.statusDir, 'session-params.json');
+  const writeStatus = (extra: Record<string, unknown> = {}): void => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'stopped', sessionId: 's-test', ...extra }));
+  };
+  const setSession = (routeKey: string, routePath: string): void => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    setSessionParams(sessionFile(), routeKey, { path: routePath, params: {}, at: new Date().toISOString() });
+  };
+  const at = new Date().toISOString();
+
+  describe('a route the watcher fills by link discovery', () => {
+    it('is expected by key, proven by the frame the watcher took, and reports where the id came from', async () => {
+      configure({ routeParams: {} });
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/77', 'clean', { routeKey: '/b/:id', paramsFrom: 'discovered', paramsFoundOn: '/b' });
+      const result = await finish();
+      expect(result).toMatchObject({ ok: true, failures: [], unfilled: [] });
+      expect(result.routes.map((r) => [r.routeKey, r.route, r.paramsFrom, r.paramsFoundOn])).toEqual([['/b/:id', '/b/77', 'discovered', '/b']]);
+      expect(result.seedCandidates).toEqual([{ routeKey: '/b/:id', route: '/b/77', params: { id: '77' }, paramsFrom: 'discovered', foundOn: '/b' }]);
+      expect(result.notes).toContain('/b/77: params found by link discovery on /b');
+      expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain('- /b/77: params found by link discovery on /b');
+    });
+
+    it('fails with the discovery reason, the exact command, and the structured form in the result', async () => {
+      configure({ routeParams: {} });
+      writeStatus({ paramDiscovery: { '/b/:id': { error: 'no link matching /b/:id on /b', at } } });
+      editAndCommit('src/pages/B.vue');
+      const result = await finish();
+      expect(result.ok).toBe(false);
+      expect(result.failures).toEqual([
+        "cannot capture /b/:id: params unfilled. Tried: session: none set; routeParams: no entry; routeParamsFile: not configured; paramSources: not configured; discovery: no link matching /b/:id on /b. Fix: npx visual-proof params set '/b/:id' id=<value>. If no record exists, create one first (e.g. with the app's factories or seeders) and use its id.",
+      ]);
+      expect(result.unfilled).toEqual([
+        {
+          routeKey: '/b/:id',
+          params: ['id'],
+          command: "npx visual-proof params set '/b/:id' id=<value>",
+          advice: "If no record exists, create one first (e.g. with the app's factories or seeders) and use its id.",
+          tiers: [
+            { tier: 'session', tried: true, reason: 'none set' },
+            { tier: 'routeParams', tried: true, reason: 'no entry' },
+            { tier: 'routeParamsFile', tried: false, reason: 'not configured' },
+            { tier: 'paramSources', tried: false, reason: 'not configured' },
+            { tier: 'discovery', tried: true, reason: 'no link matching /b/:id on /b' },
+          ],
+        },
+      ]);
+      const block = fs.readFileSync(result.proofBlockPath, 'utf8');
+      expect(block).toContain("npx visual-proof params set '/b/:id' id=<value>");
+      expect(block).toContain('discovery: no link matching /b/:id on /b');
+    });
+
+    it('says discovery was not attempted when the watcher is not running, and points at starting it', async () => {
+      configure({ routeParams: {} });
+      editAndCommit('src/pages/B.vue');
+      const result = await finish();
+      expect(result.failures[0]).toContain('discovery: not attempted (the watcher is not running)');
+      expect(result.hints.join(' ')).toContain('run visual-proof start');
+    });
+
+    it('says plain "not attempted" when a live watcher has not tried the route', async () => {
+      configure({ routeParams: {} });
+      writeStatus({ state: 'ready', pid: process.pid });
+      editAndCommit('src/pages/B.vue');
+      const result = await finish();
+      expect(result.failures[0]).toContain('discovery: not attempted. Fix:');
+    });
+
+    it('fails immediately, without waiting for a frame, when discovery is off', async () => {
+      configure({ routeParams: {}, paramDiscovery: 'off' });
+      editAndCommit('src/pages/B.vue');
+      const result = await finish();
+      expect(result.failures[0]).toContain('discovery: off (paramDiscovery: "off")');
+      expect(result.unfilled[0]!.tiers.at(-1)).toMatchObject({ tier: 'discovery', tried: false });
+    });
+
+    it('still fails a backend change that re-adds a captured param route nobody can fill', async () => {
+      configure({ routeParams: {}, paramDiscovery: 'off' });
+      await frame('/b/1', 'clean', { routeKey: '/b/:id', tree: 'a'.repeat(40) });
+      editAndCommit('server/data.json', '{"v":2}\n');
+      const result = await finish();
+      expect(result.failures[0]).toMatch(/^cannot capture \/b\/:id: params unfilled\./);
+      expect(result.unfilled.map((u) => u.routeKey)).toEqual(['/b/:id']);
+    });
+
+    it('expects a captured param route by key after a backend change when discovery is on', async () => {
+      configure({ routeParams: {} });
+      await frame('/b/1', 'clean', { routeKey: '/b/:id', tree: 'a'.repeat(40) });
+      editAndCommit('server/data.json', '{"v":2}\n');
+      await frame('/b/9', 'clean', { routeKey: '/b/:id', trigger: 'backend', paramsFrom: 'discovered', paramsFoundOn: '/b' });
+      const result = await finish();
+      expect(result).toMatchObject({ ok: true, failures: [] });
+      expect(result.routes.map((r) => [r.route, r.via, r.paramsFrom])).toEqual([['/b/9', 'backend', 'discovered']]);
+    });
+  });
+
+  describe('session params', () => {
+    it('fill a route no other tier can, and the proof says so', async () => {
+      configure({ routeParams: {}, paramDiscovery: 'off' });
+      setSession('/b/:id', '/b/9');
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/9', 'clean', { routeKey: '/b/:id', trigger: 'params', paramsFrom: 'session' });
+      const result = await finish();
+      expect(result).toMatchObject({ ok: true, failures: [], unfilled: [] });
+      expect(result.routes.map((r) => [r.routeKey, r.route, r.paramsFrom])).toEqual([['/b/:id', '/b/9', 'session']]);
+      expect(result.seedCandidates).toEqual([{ routeKey: '/b/:id', route: '/b/9', params: { id: '9' }, paramsFrom: 'session' }]);
+      expect(result.notes).toContain('/b/9: params set with visual-proof params set');
+    });
+
+    it('outrank routeParams: finish expects the session path, not the configured one', async () => {
+      configure({ routeParams: { '/b/:id': '/b/1' } });
+      setSession('/b/:id', '/b/2');
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/1', 'clean', { routeKey: '/b/:id', paramsFrom: 'config' });
+      expect((await finish()).failures).toEqual(['no frame at HEAD for /b/2']);
+      await frame('/b/2', 'clean', { routeKey: '/b/:id', trigger: 'params', paramsFrom: 'session' });
+      const result = await finish();
+      expect(result.ok).toBe(true);
+      expect(result.routes.map((r) => r.route)).toEqual(['/b/2']);
+    });
+
+    it('turn an unfilled failure into a pass once set, with no watcher status to go on', async () => {
+      configure({ routeParams: {} });
+      editAndCommit('src/pages/B.vue');
+      expect((await finish()).failures[0]).toMatch(/^cannot capture \/b\/:id: params unfilled\./);
+      setSession('/b/:id', '/b/5');
+      await frame('/b/5', 'clean', { routeKey: '/b/:id', trigger: 'params', paramsFrom: 'session' });
+      expect(await finish()).toMatchObject({ ok: true, failures: [] });
+    });
+
+    it('a broken session file is a note, and the other tiers still apply', async () => {
+      configure({ routeParams: { '/b/:id': '/b/1' } });
+      fs.mkdirSync(dirs.statusDir, { recursive: true });
+      fs.writeFileSync(sessionFile(), '{ nope');
+      editAndCommit('src/pages/B.vue');
+      await frame('/b/1', 'clean', { routeKey: '/b/:id' });
+      const result = await finish();
+      expect(result.ok).toBe(true);
+      expect(result.notes.some((n) => n.startsWith('session params file is not valid JSON') && n.endsWith('ignoring session params'))).toBe(true);
+    });
+  });
+
+  it('labels config and seed-file routes by tier, and keeps them out of the seed candidates', async () => {
+    configure({ routeParams: { '/b/:id': '/b/1' }, routeParamsFile: '.vp/params.json' });
+    write(repo, '.vp/params.json', JSON.stringify({ '/b/:id': '/b/2' }));
+    editAndCommit('src/pages/B.vue');
+    await frame('/b/2', 'clean', { routeKey: '/b/:id' }); // a frame without paramsFrom (older version): the tier comes from the config
+    const result = await finish();
+    expect(result.routes.map((r) => r.paramsFrom)).toEqual(['file']);
+    expect(result.seedCandidates).toEqual([]);
+    expect(result.notes.some((n) => n.includes('link discovery') || n.includes('params set'))).toBe(false);
+  });
+
+  it('gives a route without params no provenance at all', async () => {
+    editAndCommit('src/pages/A.vue');
+    await frame('/a');
+    const result = await finish();
+    expect(result.routes[0]).not.toHaveProperty('paramsFrom');
+    expect(result).toMatchObject({ unfilled: [], seedCandidates: [] });
+  });
+
+  it('--json carries unfilled and seedCandidates', async () => {
+    configure({ routeParams: {}, paramDiscovery: 'off' });
+    editAndCommit('src/pages/B.vue');
+    let stdout = '';
+    const configPath = path.join(repo, 'visual-proof.config.json');
+    fs.writeFileSync(configPath, JSON.stringify({ appUrl: 'http://localhost:1', screenGlobs: ['src/**/*.vue'], paramDiscovery: 'off', staticRoutes: { 'src/pages/B.vue': ['/b/:id'] } }));
+    const code = await finishCommand({ configPath, hook: false, json: true, env, out: (t) => (stdout += t), err: () => {} });
+    expect(code).toBe(1);
+    const result = JSON.parse(stdout);
+    expect(result.seedCandidates).toEqual([]);
+    expect(result.unfilled).toEqual([expect.objectContaining({ routeKey: '/b/:id', params: ['id'], command: "npx visual-proof params set '/b/:id' id=<value>" })]);
   });
 });
 

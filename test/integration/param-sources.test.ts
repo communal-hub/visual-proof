@@ -57,7 +57,8 @@ describe('paramSources against the fixture (/api/invoices -> /manage/invoices/:i
   });
 
   it('a failing source skips the route; finish says "cannot capture" with the source error', async () => {
-    h = await createHarness({ configFile: CONFIG_FILE, config: { paramSources: { [KEY]: { url: '/api/invoices/99', pick: 'id' } } } });
+    // Discovery would rescue the route from the fixture's list page (see param-discovery.test.ts), so switch it off here.
+    h = await createHarness({ configFile: CONFIG_FILE, config: { paramDiscovery: 'off', paramSources: { [KEY]: { url: '/api/invoices/99', pick: 'id' } } } });
     await h.start();
     h.edit(DETAIL, setHeading('Source is broken'));
     await h.waitForEvent('batch', 15_000);
@@ -69,12 +70,14 @@ describe('paramSources against the fixture (/api/invoices -> /manage/invoices/:i
     h.commitAll('broken source');
     const result = await h.finish();
     expect(result.ok).toBe(false);
-    expect(result.failures).toEqual([`cannot capture ${KEY}: paramSources /api/invoices/99 failed: HTTP 404 (add routeParams)`]);
+    expect(result.failures).toEqual([
+      `cannot capture ${KEY}: params unfilled. Tried: session: none set; routeParams: no entry; routeParamsFile: not configured; paramSources /api/invoices/99 failed: HTTP 404; discovery: off (paramDiscovery: "off"). Fix: npx visual-proof params set '${KEY}' id=<value>. If no record exists, create one first (e.g. with the app's factories or seeders) and use its id.`,
+    ]);
     expect(fs.readFileSync(result.proofBlockPath, 'utf8')).toContain('paramSources /api/invoices/99 failed: HTTP 404');
   });
 
   it('a pick that finds nothing, and a body that is not JSON, are reasons too', async () => {
-    h = await createHarness({ configFile: CONFIG_FILE, config: { paramSources: { [KEY]: { url: '/api/invoices', pick: 'data.0.id' } } } });
+    h = await createHarness({ configFile: CONFIG_FILE, config: { paramDiscovery: 'off', paramSources: { [KEY]: { url: '/api/invoices', pick: 'data.0.id' } } } });
     await h.start();
     h.edit(DETAIL, setHeading('Wrong pick'));
     await h.waitForEvent('batch', 15_000);
@@ -82,7 +85,7 @@ describe('paramSources against the fixture (/api/invoices -> /manage/invoices/:i
     await h.stopWatch();
 
     // A source that answers 200 with something that is not JSON (here a module served by Vite).
-    const other = await createHarness({ configFile: CONFIG_FILE, config: { paramSources: { [KEY]: { url: '/src/main.js', pick: '0.id' } } } });
+    const other = await createHarness({ configFile: CONFIG_FILE, config: { paramDiscovery: 'off', paramSources: { [KEY]: { url: '/src/main.js', pick: '0.id' } } } });
     try {
       await other.start();
       other.edit(DETAIL, setHeading('Not json'));

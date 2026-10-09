@@ -40,7 +40,7 @@ describe('doctor against the vite-vue fixture', () => {
       freshness: { tier: 'marker', status: 'ok' },
       login: { tier: 'http-hook', status: 'ok' },
       routes: { tier: 'import-graph', status: 'ok' },
-      paramTiers: { tier: 'none', status: 'ok', detail: '1 route(s) with params: config 1, seed-file 0, list-endpoint 0, uncovered 0' },
+      paramTiers: { tier: 'discovery', status: 'ok', detail: '4 route(s) with params: session 0, config 1, seed-file 0, list-endpoint 0, discovery 3, uncovered 0; paramDiscovery: links' },
     });
     expect(greenOnDisk).toEqual(green);
   });

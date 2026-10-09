@@ -260,6 +260,25 @@ describe('capture-quality fields (v0.3)', () => {
     });
   });
 
+  describe('paramDiscovery (v0.8)', () => {
+    it('defaults to "links"', () => {
+      expect(parse({}).paramDiscovery).toBe('links');
+    });
+
+    it('accepts "links" and "off"', () => {
+      expect(parse({ paramDiscovery: 'links' }).paramDiscovery).toBe('links');
+      expect(parse({ paramDiscovery: 'off' }).paramDiscovery).toBe('off');
+    });
+
+    it.each([['sometimes'], [true], [1], [''], [null]])('rejects %j', (value) => {
+      expect(() => parse({ paramDiscovery: value })).toThrow(/"paramDiscovery" must be (a non-empty string|"links" or "off")/);
+    });
+
+    it('names the offending value and keeps the other errors', () => {
+      expect(() => parse({ paramDiscovery: 'sometimes', maxFrames: -1 })).toThrow(/"paramDiscovery" must be "links" or "off", got "sometimes"[\s\S]*"maxFrames"/);
+    });
+  });
+
   describe('flake controls and settle (v0.4)', () => {
     it('defaults: no fixed time, no masks, the tracker block list, 250 ms idle (capped at 5 s)', () => {
       const config = parse({});

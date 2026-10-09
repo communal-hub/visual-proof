@@ -24,7 +24,7 @@
       "tier": "fs-watch",
       "status": "ok",
       "required": true,
-      "detail": "19 screen file(s), 1 backend file(s) match the globs"
+      "detail": "25 screen file(s), 1 backend file(s) match the globs"
     },
     "barrier": {
       "tier": "vite-hmr",
@@ -48,7 +48,7 @@
       "tier": "import-graph",
       "status": "ok",
       "required": false,
-      "detail": "10 route(s), 16 file(s) mapped, 0 unresolved"
+      "detail": "16 route(s), 22 file(s) mapped, 0 unresolved"
     },
     "params": {
       "tier": "config",
@@ -57,10 +57,10 @@
       "detail": "1 entry"
     },
     "paramTiers": {
-      "tier": "none",
+      "tier": "discovery",
       "status": "ok",
       "required": false,
-      "detail": "1 route(s) with params: config 1, seed-file 0, list-endpoint 0, uncovered 0"
+      "detail": "4 route(s) with params: session 0, config 1, seed-file 0, list-endpoint 0, discovery 3, uncovered 0; paramDiscovery: links"
     },
     "renderCheck": {
       "tier": "fail",

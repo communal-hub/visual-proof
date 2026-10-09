@@ -22,11 +22,13 @@ describe('parseArgs', () => {
     expect(parseArgs(['watch', '--config=b.json']).configPath).toBe('b.json');
   });
 
-  it('parses --json for finish and doctor only', () => {
+  it('parses --json for finish, doctor and params list only', () => {
     expect(parseArgs(['finish', '--json'])).toMatchObject({ command: 'finish', json: true });
     expect(parseArgs(['doctor', '--json'])).toMatchObject({ command: 'doctor', json: true });
     expect(parseArgs(['doctor'])).toMatchObject({ json: false });
-    expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish and doctor/);
+    expect(parseArgs(['params', 'list', '--json'])).toMatchObject({ command: 'params', paramsAction: 'list', json: true });
+    expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish, doctor and params list/);
+    expect(() => parseArgs(['params', 'clear', '--json'])).toThrow(/only valid with the finish, doctor and params list/);
   });
 
   it('parses --normalize for doctor --json only', () => {
@@ -47,13 +49,56 @@ describe('parseArgs', () => {
 
   it.each([
     [['finish', '--wait'], /--wait is only valid with the status command/],
-    [['status', '--timeout', '5'], /--timeout is only valid with status --wait or ready/],
+    [['status', '--timeout', '5'], /--timeout is only valid with status --wait, ready or params set/],
+    [['params', 'list', '--timeout', '5'], /--timeout is only valid with status --wait, ready or params set/],
     [['status', '--wait', '--timeout'], /--timeout requires a positive number/],
     [['status', '--wait', '--timeout', 'soon'], /--timeout requires a positive number/],
     [['status', '--wait', '--timeout', '0'], /--timeout requires a positive number/],
   ])('rejects %j', (argv, message) => {
     expect(() => parseArgs(argv)).toThrow(UsageError);
     expect(() => parseArgs(argv)).toThrow(message);
+  });
+
+  describe('params', () => {
+    it('parses set, list and clear with their arguments', () => {
+      expect(parseArgs(['params', 'set', '/invoices/:id', 'id=5'])).toMatchObject({
+        command: 'params',
+        paramsAction: 'set',
+        paramsArgs: ['/invoices/:id', 'id=5'],
+      });
+      expect(parseArgs(['params', 'set', '/a/:x/:y', 'x=1', 'y=2', '--config', 'c.json'])).toMatchObject({ paramsArgs: ['/a/:x/:y', 'x=1', 'y=2'], configPath: 'c.json' });
+      expect(parseArgs(['params', 'list'])).toMatchObject({ paramsAction: 'list', paramsArgs: [] });
+      expect(parseArgs(['params', 'clear'])).toMatchObject({ paramsAction: 'clear', paramsArgs: [] });
+      expect(parseArgs(['params', 'clear', '/invoices/:id'])).toMatchObject({ paramsAction: 'clear', paramsArgs: ['/invoices/:id'] });
+    });
+
+    it('keeps values that look odd as arguments', () => {
+      expect(parseArgs(['params', 'set', '/u/:id(\\d+)', 'id=-5']).paramsArgs).toEqual(['/u/:id(\\d+)', 'id=-5']);
+    });
+
+    it('takes --timeout for set only, and --json for list only', () => {
+      expect(parseArgs(['params', 'set', '/a/:id', 'id=1', '--timeout', '5'])).toMatchObject({ timeoutSec: 5 });
+      expect(() => parseArgs(['params', 'clear', '--timeout', '5'])).toThrow(/--timeout is only valid/);
+      expect(() => parseArgs(['params', 'set', '/a/:id', 'id=1', '--json'])).toThrow(/--json is only valid/);
+    });
+
+    it.each([
+      [['params'], /params needs an action: set, list or clear/],
+      [['params', 'frobnicate'], /unknown params action: frobnicate/],
+      [['params', 'set'], /params set needs a route key and at least one param=value/],
+      [['params', 'set', '/invoices/:id'], /params set needs a route key and at least one param=value/],
+      [['params', 'list', '/x'], /params list takes no arguments/],
+      [['params', 'clear', '/x', '/y'], /params clear takes at most one route key/],
+      [['finish', 'set'], /unexpected argument: set/],
+    ])('rejects %j', (argv, message) => {
+      expect(() => parseArgs(argv)).toThrow(UsageError);
+      expect(() => parseArgs(argv)).toThrow(message);
+    });
+
+    it('does not insist on arguments when asking for help', () => {
+      expect(parseArgs(['params', '--help']).help).toBe(true);
+      expect(parseArgs(['params', 'set', '--help']).help).toBe(true);
+    });
   });
 
   it('parses finish --hook', () => {
@@ -138,6 +183,59 @@ describe('main', () => {
     expect(err.trimEnd().split('\n')).toHaveLength(1);
     expect(err).toContain('"appUrl"');
     expect(err).toContain('"maxFrames"');
+  });
+
+  describe('params', () => {
+    let repo: string;
+    let env: NodeJS.ProcessEnv;
+    beforeEach(() => {
+      repo = tmpDir();
+      env = { VISUAL_PROOF_STATUS_DIR: path.join(tmpDir(), 'status') };
+      fs.writeFileSync(path.join(repo, 'router.js'), "export default [{ path: '/invoices/:id', component: Invoice }]\n");
+      fs.writeFileSync(path.join(repo, 'c.json'), JSON.stringify({ appUrl: 'http://localhost:1', routeFiles: ['router.js'] }));
+    });
+    const config = (): string[] => ['--config', path.join(repo, 'c.json')];
+
+    it('is in the help, with its exit codes and the files it writes', async () => {
+      await main(['--help'], {});
+      expect(out).toContain('params set <routeKey> key=value');
+      expect(out).toContain('params list');
+      expect(out).toContain('params clear');
+      expect(out).toContain('session-params.json');
+      expect(out).toContain('exit 2: unknown route key');
+    });
+
+    it('exits 2 on a usage error and prints the help', async () => {
+      expect(await main(['params'], env)).toBe(2);
+      expect(err).toContain('params needs an action');
+      err = '';
+      expect(await main(['params', 'set', '/invoices/:id'], env)).toBe(2);
+      expect(err).toContain('params set needs a route key and at least one param=value');
+    });
+
+    it('exits 2 for an unknown route key, 3 for an invalid config, 0 once it works', async () => {
+      expect(await main(['params', 'set', '/nope/:id', 'id=1', ...config()], env)).toBe(2);
+      expect(err).toContain('closest route keys: /invoices/:id');
+
+      err = '';
+      expect(await main(['params', 'set', '/invoices/:id', 'id=1', '--config', path.join(repo, 'missing.json')], env)).toBe(3);
+      expect(err).toMatch(/^visual-proof params set: config file not found/);
+
+      err = '';
+      expect(await main(['params', 'set', '/invoices/:id', 'id=1', ...config()], env)).toBe(0);
+      expect(out).toContain('session params set: /invoices/:id -> /invoices/1');
+      expect(err).toContain('no watcher is running');
+    });
+
+    it('lists and clears', async () => {
+      await main(['params', 'set', '/invoices/:id', 'id=9', ...config()], env);
+      out = '';
+      expect(await main(['params', 'list', '--json'], env)).toBe(0);
+      expect(JSON.parse(out).session).toEqual([expect.objectContaining({ routeKey: '/invoices/:id', path: '/invoices/9' })]);
+      out = '';
+      expect(await main(['params', 'clear'], env)).toBe(0);
+      expect(out).toBe('cleared session params for /invoices/:id\n');
+    });
   });
 
   it('stop reports stopped when nothing is running', async () => {

@@ -4,5 +4,13 @@
     { "id": 2, "number": "INV-002", "status": "pending", "total": 340 },
     { "id": 3, "number": "INV-003", "status": "overdue", "total": 75.25 }
   ],
-  "flags": { "showDetails": false }
+  "flags": { "showDetails": false },
+  "projects": [
+    { "id": 7, "name": "Apollo" },
+    { "id": 8, "name": "Gemini" }
+  ],
+  "clubs": [
+    { "id": 1, "name": "Harbor FC", "teams": [{ "id": 10, "name": "U12" }, { "id": 11, "name": "U14" }] },
+    { "id": 2, "name": "Ridge SC", "teams": [{ "id": 20, "name": "U10" }] }
+  ]
 }

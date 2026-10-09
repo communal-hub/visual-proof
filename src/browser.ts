@@ -75,6 +75,18 @@ export interface JsonResponse {
   error?: string;
 }
 
+/** What loading a page and reading its `a[href]` produced (`Capturer.collectLinks`, link discovery). */
+export interface LinkPage {
+  ok: boolean;
+  /** Absolute `href`s of every `a[href]`, in DOM order. */
+  hrefs: string[];
+  /** Where the page ended up after redirects (a login redirect shows here). */
+  finalUrl?: string;
+  error?: string;
+  /** Time to load and settle the page. */
+  ms: number;
+}
+
 /** What `watch` needs from a browser; lets tests inject a fake. */
 export interface Capturer {
   /** Best-effort early login so the first capture is not slower than the rest. */
@@ -95,6 +107,11 @@ export interface Capturer {
    * failed). Optional: capturers without it skip sidecars.
    */
   runScenario?(plan: ScenarioPlan): Promise<ScenarioResult>;
+  /**
+   * Load `url` in a fresh page of the logged-in context, wait for it to settle like a capture does, and return its
+   * `a[href]` in DOM order (no screenshot). Optional: capturers without it cannot discover route params.
+   */
+  collectLinks?(url: string): Promise<LinkPage>;
   close(): Promise<void>;
 }
 
@@ -306,6 +323,47 @@ export class Browser implements Capturer {
       }
     } catch (err) {
       return { status: 0, error: (err as Error).message.split('\n')[0] ?? 'request failed' };
+    }
+  }
+
+  async collectLinks(url: string): Promise<LinkPage> {
+    const started = Date.now();
+    const context = await this.ensureContext();
+    try {
+      await this.ensureLoggedIn();
+    } catch (err) {
+      this.log(`collectLinks ${url}: ${(err as Error).message}`);
+    }
+    const load = async (): Promise<{ loaded: Loaded; finalUrl: string }> => {
+      const loaded = await this.loadPage(context, url);
+      return { loaded, finalUrl: loaded.page.url() };
+    };
+    let { loaded, finalUrl } = await load();
+    const authReason = this.config.login.type === 'http-hook' ? authProblem(url, { httpStatus: loaded.httpStatus, finalUrl }) : null;
+    if (authReason) {
+      // Session expired or was never accepted: log in again and look once more.
+      this.log(`collectLinks ${url}: ${authReason}; logging in again`);
+      this.pages.delete(loaded.page);
+      await loaded.page.close().catch(() => {});
+      this.loggedIn = false;
+      try {
+        await this.ensureLoggedIn();
+      } catch (err) {
+        this.log(`collectLinks ${url}: ${(err as Error).message}`);
+      }
+      ({ loaded, finalUrl } = await load());
+    }
+    try {
+      if (!loaded.navOk) return { ok: false, hrefs: [], finalUrl, error: 'navigation failed', ms: Date.now() - started };
+      if (loaded.httpStatus !== null && loaded.httpStatus >= 400) {
+        return { ok: false, hrefs: [], finalUrl, error: `HTTP ${loaded.httpStatus}`, ms: Date.now() - started };
+      }
+      const hrefs = (await loaded.page.evaluate(LINKS_SCRIPT).catch(() => null)) as string[] | null;
+      if (hrefs === null) return { ok: false, hrefs: [], finalUrl, error: 'reading the links failed (the page navigated away)', ms: Date.now() - started };
+      return { ok: true, hrefs, finalUrl: loaded.page.url(), ms: Date.now() - started };
+    } finally {
+      this.pages.delete(loaded.page);
+      await loaded.page.close().catch(() => {});
     }
   }
 
@@ -1020,6 +1078,9 @@ async function settle(page: Page): Promise<boolean> {
     .then(() => true)
     .catch(() => false);
 }
+
+/** Absolute `href` of every `a[href]`, in DOM order (the `href` property resolves relative links and honours `<base>`). */
+const LINKS_SCRIPT = `Array.from(document.querySelectorAll('a[href]')).map((a) => a.href).filter((href) => typeof href === 'string' && href !== '')`;
 
 interface Dom {
   appRootPresent: boolean;

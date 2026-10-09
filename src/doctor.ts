@@ -14,6 +14,9 @@ import { probeFfmpeg, type FfmpegInfo } from './replay.js';
 import { fillRoute, type JsonResponse } from './resolve/param-sources.js';
 import { loadRouteParams } from './resolve/route-params.js';
 import { findSidecarFiles, formatSidecarError, loadSidecar, validateSidecar } from './sidecar.js';
+// v0.8 dynamic params hooks: session params and the discovery tier in the paramTiers row.
+import { nearestParent } from './resolve/route-pattern.js';
+import { readSessionParams } from './resolve/session-params.js';
 import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
@@ -131,7 +134,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
     cfg ? checkBarrier(cfg, probes, t.barrierMs ?? BARRIER_MS) : skipped('config is invalid'),
     cfg ? checkLogin(cfg, probes, t.loginMs ?? LOGIN_MS) : skipped('config is invalid'),
     cfg ? checkRoutes(cfg, probes, t.routesMs ?? ROUTES_MS) : skipped('config is invalid'),
-    cfg ? checkParamTiers(cfg, probes, t.routesMs ?? ROUTES_MS, t.paramsMs ?? PARAMS_MS) : skipped('config is invalid'),
+    cfg ? checkParamTiers(cfg, dirs, probes, t.routesMs ?? ROUTES_MS, t.paramsMs ?? PARAMS_MS) : skipped('config is invalid'),
     cfg ? checkDecisions(cfg, probes, opts.env ?? process.env, t.decisionsMs ?? DECISIONS_MS, opts.probeDecisions === true) : skipped('config is invalid'),
     cfg ? checkReplay(cfg, probes, opts.env ?? process.env) : skipped('config is invalid'),
   ]);
@@ -295,12 +298,13 @@ function checkParams(config: Config): Capability {
 }
 
 /**
- * How many routes with params each tier covers: `routeParams`, the seed file, or a `paramSources` list endpoint
- * (earlier tiers win). Each configured source is probed once, as the logged-in user, when the app answers.
- * Informational, never required.
+ * How many routes with params each tier covers: session params, the seed file, `routeParams`, a `paramSources`
+ * list endpoint, or link discovery from the parent route (earlier tiers win). Each configured source is probed once,
+ * as the logged-in user, when the app answers. Informational, never required.
  */
-async function checkParamTiers(config: Config, probes: Probes, graphMs: number, probeMs: number): Promise<Capability> {
+async function checkParamTiers(config: Config, dirs: Dirs, probes: Probes, graphMs: number, probeMs: number): Promise<Capability> {
   const seed = loadRouteParams(config);
+  const session = readSessionParams(statusFiles(dirs).sessionParams);
   const sourceKeys = Object.keys(config.paramSources);
 
   const routeKeys = new Set<string>();
@@ -315,21 +319,29 @@ async function checkParamTiers(config: Config, probes: Probes, graphMs: number, 
   const paramRoutes = [...routeKeys].filter((key) => routeParamNames(key).length > 0).sort();
 
   const fileKeys = new Set(seed.fileKeys);
-  const counts = { config: 0, 'seed-file': 0, 'list-endpoint': 0, uncovered: 0 };
+  const counts = { session: 0, config: 0, 'seed-file': 0, 'list-endpoint': 0, discovery: 0, uncovered: 0 };
   const uncovered: string[] = [];
   for (const key of paramRoutes) {
-    if (fileKeys.has(key)) counts['seed-file']++;
+    if (Object.hasOwn(session.routes, key)) counts.session++;
+    else if (fileKeys.has(key)) counts['seed-file']++;
     else if (Object.hasOwn(config.routeParams, key)) counts.config++;
     else if (Object.hasOwn(config.paramSources, key)) counts['list-endpoint']++;
+    // Discovery can only try a route that has a parent route to load; whether it finds a link is only known at capture time.
+    else if (config.paramDiscovery === 'links' && nearestParent(key, routeKeys) !== null) counts.discovery++;
     else {
       counts.uncovered++;
       uncovered.push(key);
     }
   }
   const parts = [
-    `${paramRoutes.length} route(s) with params: config ${counts.config}, seed-file ${counts['seed-file']}, list-endpoint ${counts['list-endpoint']}, uncovered ${counts.uncovered}`,
+    `${paramRoutes.length} route(s) with params: session ${counts.session}, config ${counts.config}, seed-file ${counts['seed-file']}, list-endpoint ${counts['list-endpoint']}, discovery ${counts.discovery}, uncovered ${counts.uncovered}`,
+    `paramDiscovery: ${config.paramDiscovery}`,
   ];
   let warn = counts.uncovered > 0;
+  if (session.error) {
+    warn = true;
+    parts.push(session.error);
+  }
   if (uncovered.length > 0) parts.push(`uncovered: ${uncovered.join(', ')}`);
   const stray = sourceKeys.filter((key) => !paramRoutes.includes(key));
   if (stray.length > 0 && paramRoutes.length > 0) {
@@ -369,7 +381,7 @@ async function checkParamTiers(config: Config, probes: Probes, graphMs: number, 
   }
 
   return {
-    tier: sourceKeys.length > 0 ? 'list-endpoint' : 'none',
+    tier: sourceKeys.length > 0 ? 'list-endpoint' : config.paramDiscovery === 'links' ? 'discovery' : 'none',
     status: warn ? 'warn' : 'ok',
     required: false,
     detail: parts.join('; '),
