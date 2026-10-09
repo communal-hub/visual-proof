@@ -365,6 +365,49 @@ describe('paramTiers', () => {
     expect(probed).toBe(false);
   });
 
+  describe('session params and link discovery (v0.8)', () => {
+    // /a, /b: have a parent route (/). /x/:id has no parent route in the table.
+    const tableKeys = ['/', '/a/:id', '/b/:id', '/c/:id', '/x/:id'];
+    const tableGraph = (routes: string[]): Probes['buildGraph'] => async () => ({
+      ...graph(0),
+      routes: routes.map((path) => ({ path, routeFile: 'src/router.js', component: null, layouts: [], dynamic: false })),
+    });
+
+    it('counts a session param first, then discovery for routes with a parent route, else uncovered', async () => {
+      write(dirs.statusDir, 'session-params.json', JSON.stringify({ version: 1, rev: 1, routes: { '/a/:id': { path: '/a/1', params: { id: '1' }, at: 'now' } } }));
+      const report = await doctor(configure({ routeParams: { '/b/:id': '/b/1' } }), { probes: { buildGraph: tableGraph(['/a/:id', '/b/:id', '/c/:id', '/orphan/:id']) } });
+      // '/' is not in the table here, so /c/:id and /orphan/:id have no parent: uncovered.
+      expect(report.capabilities.paramTiers.detail).toContain('4 route(s) with params: session 1, config 1, seed-file 0, list-endpoint 0, discovery 0, uncovered 2');
+      expect(report.capabilities.paramTiers).toMatchObject({ status: 'warn', tier: 'discovery' });
+
+      const withRoot = await doctor(configure({ routeParams: { '/b/:id': '/b/1' } }), { probes: { buildGraph: tableGraph(tableKeys) } });
+      expect(withRoot.capabilities.paramTiers.detail).toContain('4 route(s) with params: session 1, config 1, seed-file 0, list-endpoint 0, discovery 2, uncovered 0; paramDiscovery: links');
+      expect(withRoot.capabilities.paramTiers.status).toBe('ok');
+    });
+
+    it('with paramDiscovery "off" the uncovered routes are warned about and the tier is none', async () => {
+      const report = await doctor(configure({ paramDiscovery: 'off' }), { probes: { buildGraph: tableGraph(tableKeys) } });
+      expect(report.capabilities.paramTiers).toMatchObject({ tier: 'none', status: 'warn' });
+      expect(report.capabilities.paramTiers.detail).toContain('discovery 0, uncovered 4; paramDiscovery: off');
+      expect(report.capabilities.paramTiers.detail).toContain('uncovered: /a/:id, /b/:id, /c/:id, /x/:id');
+    });
+
+    it('a broken session file is a warning', async () => {
+      write(dirs.statusDir, 'session-params.json', '{ nope');
+      const report = await doctor(configure(), { probes: { buildGraph: tableGraph(tableKeys) } });
+      expect(report.capabilities.paramTiers.status).toBe('warn');
+      expect(report.capabilities.paramTiers.detail).toContain('session params file is not valid JSON');
+    });
+
+    it('a list endpoint outranks discovery in the count', async () => {
+      const report = await doctor(configure({ paramSources: { '/a/:id': { url: '/api/a', pick: '0.id' } } }), {
+        probes: { buildGraph: tableGraph(tableKeys), getJson: async () => [{ status: 200, json: [{ id: 1 }] }] },
+      });
+      expect(report.capabilities.paramTiers).toMatchObject({ tier: 'list-endpoint' });
+      expect(report.capabilities.paramTiers.detail).toContain('list-endpoint 1, discovery 3, uncovered 0');
+    });
+  });
+
   it('probes every source once, in one call, with the source urls', async () => {
     const calls: string[][] = [];
     await doctor(

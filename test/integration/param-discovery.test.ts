@@ -225,3 +225,21 @@ describe('params set against a running watcher', () => {
     expect(readJson(harnessFiles(h).sessionParams)).toMatchObject({ rev: 1, routes: { [INVOICE]: { path: '/manage/invoices/3', params: { id: '3' } } } });
   });
 });
+
+describe('sidecar goto with a route key', () => {
+  it('fills the key through link discovery, and through session params once they are set', async () => {
+    h = await createHarness({ config: NO_PARAMS });
+    await h.start();
+    const file = h.writeSidecar('team', `goto ${TEAM}\nstill team-page`);
+    const discovered = await h.waitForFrame((e) => e.frame.route === `sidecar:${file}#team-page`, 40_000, { from: 0 });
+    expect(discovered.frame.status).toBe('clean');
+    expect(discovered.signals.text).toContain('U12'); // /manage/clubs/1/teams/10, found through /manage/clubs and /manage/clubs/1/teams
+
+    // The agent points the route at another team; the scenario follows on its next replay.
+    expect((await h.cli('params', 'set', TEAM, 'clubId=2', 'teamId=20')).code).toBe(0);
+    const from = h.frames.length;
+    h.writeSidecar('team', `goto ${TEAM}\nstill team-page\n`); // touch the scenario so it replays
+    const replayed = await h.waitForFrame((e) => e.frame.route === `sidecar:${file}#team-page` && e.signals.text.includes('U10'), 30_000, { from });
+    expect(replayed.frame.status).toBe('clean');
+  });
+});
