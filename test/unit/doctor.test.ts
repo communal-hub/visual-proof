@@ -328,7 +328,7 @@ describe('paramTiers', () => {
   });
   const seedFile = '.visual-proof/params.json';
 
-  it('counts the routes with params each tier covers: config, seed-file, list-endpoint, uncovered', async () => {
+  it('counts the routes with params each tier covers: session, config, seed-file, list-endpoint, discovery, uncovered', async () => {
     write(repo, seedFile, JSON.stringify({ '/b/:id': '/b/9' }));
     const report = await doctor(
       configure({
@@ -339,13 +339,14 @@ describe('paramTiers', () => {
       { probes: { buildGraph: withKeys(), getJson: async () => [{ status: 200, json: [{ id: 5 }] }] } },
     );
     expect(report.capabilities.paramTiers).toMatchObject({ tier: 'list-endpoint', status: 'warn', required: false });
-    expect(report.capabilities.paramTiers.detail).toContain('4 route(s) with params: config 1, seed-file 1, list-endpoint 1, uncovered 1');
+    expect(report.capabilities.paramTiers.detail).toContain('4 route(s) with params: session 0, config 1, seed-file 1, list-endpoint 1, discovery 0, uncovered 1');
+    expect(report.capabilities.paramTiers.detail).toContain('paramDiscovery: links');
     expect(report.capabilities.paramTiers.detail).toContain('uncovered: /d/:id');
     expect(report.capabilities.paramTiers.detail).toContain('probe /api/c -> /c/5');
     expect(report.ok).toBe(true);
   });
 
-  it('is ok and tier none when every param route is covered and no source is configured, without probing', async () => {
+  it('is ok and tier discovery when every param route is covered and no source is configured, without probing', async () => {
     let probed = false;
     const report = await doctor(
       configure({ routeParams: { '/a/:id': '/a/1', '/b/:id': '/b/1', '/c/:id': '/c/1', '/d/:id': '/d/1' } }),
@@ -359,8 +360,8 @@ describe('paramTiers', () => {
         },
       },
     );
-    expect(report.capabilities.paramTiers).toMatchObject({ tier: 'none', status: 'ok' });
-    expect(report.capabilities.paramTiers.detail).toBe('4 route(s) with params: config 4, seed-file 0, list-endpoint 0, uncovered 0');
+    expect(report.capabilities.paramTiers).toMatchObject({ tier: 'discovery', status: 'ok' });
+    expect(report.capabilities.paramTiers.detail).toBe('4 route(s) with params: session 0, config 4, seed-file 0, list-endpoint 0, discovery 0, uncovered 0; paramDiscovery: links');
     expect(probed).toBe(false);
   });
 

@@ -8,7 +8,6 @@ import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { Carrier } from './carry.js';
 import { buildReplay, type ReplayResult } from './replay.js';
-import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
 import {
   FAILED_STILL,
@@ -21,7 +20,7 @@ import {
 } from './sidecar.js';
 import { readStatusFile, watcherPid, writeFileAtomic, type Status } from './status.js';
 import { describeError } from './text.js';
-import { Timeline, type Frame } from './timeline.js';
+import { Timeline, type Frame, type ParamsFrom } from './timeline.js';
 import type { FrameStatus } from './triage.js';
 // A4 decisions hooks (v0.6): everything else lives in src/decisions/**.
 import type { ClaimReport } from './decisions/claim.js';
@@ -38,6 +37,9 @@ import {
 } from './decisions/finish.js';
 import type { ImageCheck } from './decisions/image-check.js';
 import { DecisionRuntime } from './decisions/runtime.js';
+// v0.8 dynamic params hooks: tiers, provenance and the unfilled-route message live in src/resolve/param-tiers.ts.
+import { explainUnfilled, loadLayeredParams, seedCandidates, unfilledMessage, type LayeredParams, type SeedCandidate, type UnfilledRoute } from './resolve/param-tiers.js';
+import { hasParams } from './resolve/route-pattern.js';
 
 export interface FinishOptions {
   env?: NodeJS.ProcessEnv;
@@ -76,6 +78,10 @@ export interface RouteProof {
   imageCheck?: ImageCheck;
   /** A4: the caption shown under the still (chosen by the text model, else the first template). */
   caption?: string;
+  /** v0.8: which tier filled the route's params (session, config, file, source, discovered); absent for a route without params. */
+  paramsFrom?: ParamsFrom;
+  /** v0.8: with `paramsFrom: "discovered"`, the page whose links gave the id. */
+  paramsFoundOn?: string;
 }
 
 export interface FinishResult {
@@ -101,6 +107,10 @@ export interface FinishResult {
   decisions?: DecisionsSummary;
   /** A4: the advisory claim check; absent when there was no claim or it was skipped. */
   claim?: ClaimReport;
+  /** v0.8: routes that stayed unfilled, each with the exact `params set` command and what every tier did. Empty when none. */
+  unfilled: UnfilledRoute[];
+  /** v0.8: routes filled by session params or link discovery; candidates for the app's seeder. Empty when none. */
+  seedCandidates: SeedCandidate[];
 }
 
 /** `/manage/invoices/1` -> `manage-invoices-1`; the root route is `root`. Only `[A-Za-z0-9._-]` survive. */
@@ -140,6 +150,8 @@ interface State {
   /** A4 decisions: the summary footer and the advisory claim check, set once the decision phase is over. */
   decisions?: DecisionsSummary;
   claim?: ClaimReport;
+  /** v0.8: routes left unfilled (see {@link FinishResult.unfilled}). */
+  unfilled: UnfilledRoute[];
 }
 
 /**
@@ -164,6 +176,7 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
     noScreenChanges: false,
     truncated: false,
     closed: false,
+    unfilled: [],
   };
   const runtime = new DecisionRuntime({
     config: config.decisions,
@@ -254,9 +267,11 @@ async function gather(
   const timeline = new Timeline(dirs.scratchDir, config.maxFrames);
   const expected = new Map<string, RouteProof>();
 
-  const seed = loadRouteParams(config);
-  if (seed.error) state.notes.push(`${seed.error}; using routeParams from the config only`);
-  for (const warning of seed.warnings) state.notes.push(warning);
+  const seed = loadLayeredParams(config, statusFiles(dirs).sessionParams); // v0.8: session params over the seed file over routeParams
+  if (seed.seed.error) state.notes.push(`${seed.seed.error}; using routeParams from the config only`);
+  for (const warning of seed.seed.warnings) state.notes.push(warning);
+  if (seed.session.error) state.notes.push(`${seed.session.error}; ignoring session params`);
+  for (const warning of seed.session.warnings) state.notes.push(warning);
   if (runtime.missingKey) state.notes.push(runtime.missingKeyNote);
   let resolution = resolveRoutes(screenFiles, graph, { ...config, routeParams: seed.params });
   // A4 hook: the same pruned route set the watcher captured (its decision is cached in the status dir).
@@ -283,12 +298,12 @@ async function gather(
   }
   // A changed screen that cannot be tied to a capturable route is unproven, which is a failure, not a note.
   for (const skip of resolution.skipped) {
-    if (config.paramSources[skip.routeKey]) {
-      // The watcher fills this one from a list endpoint; its frame (or the source error) tells what happened.
+    if (watcherFills(config, skip.routeKey)) {
+      // The watcher fills this one from a list endpoint or the links of its parent page; its frame (or why not) tells what happened.
       expected.set(skip.routeKey, { route: skip.routeKey, routeKey: skip.routeKey, sourceFiles: skip.sourceFiles, via: 'screen', reasons: [] });
       continue;
     }
-    state.failures.push(`cannot capture ${skip.routeKey}: ${skip.reason} (add routeParams)`);
+    failUnfilled(config, dirs, state, seed, skip.routeKey, status);
   }
   for (const file of graphFailed ? [] : resolution.unmapped) {
     // (with no graph every file is unmapped; the graph failure above already says why)
@@ -313,8 +328,8 @@ async function gather(
         continue;
       }
       const concrete = concretePath(routeKey, seed.params);
-      if (!concrete.ok && !config.paramSources[routeKey]) {
-        state.failures.push(`cannot capture ${routeKey}: ${concrete.reason} (add routeParams)`);
+      if (!concrete.ok && !watcherFills(config, routeKey)) {
+        failUnfilled(config, dirs, state, seed, routeKey, status);
         continue;
       }
       expected.set(routeKey, {
@@ -407,12 +422,21 @@ async function gather(
       continue;
     }
     if (!frame) {
-      const sourceError = route.route === route.routeKey ? status?.paramSources?.[route.routeKey]?.error : undefined;
-      if (sourceError) state.failures.push(`cannot capture ${route.routeKey}: ${sourceError} (add routeParams)`);
-      else state.failures.push(`no frame at HEAD for ${route.route}${staleNote}`);
+      if (route.route === route.routeKey && hasParams(route.routeKey)) {
+        // Expected by key: the watcher was to fill it from a list endpoint or by discovery. A configured source that
+        // neither it nor discovery has complained about yet is just "not captured" (the v0.4 behaviour).
+        const complained = status?.paramSources?.[route.routeKey]?.error !== undefined || status?.paramDiscovery?.[route.routeKey]?.error !== undefined;
+        if (config.paramSources[route.routeKey] && !complained) state.failures.push(`no frame at HEAD for ${route.route}${staleNote}`);
+        else failUnfilled(config, dirs, state, seed, route.routeKey, status);
+      } else {
+        state.failures.push(`no frame at HEAD for ${route.route}${staleNote}`);
+      }
       continue;
     }
-    if (route.route === route.routeKey) route.route = frame.route; // filled from a list endpoint: the frame knows the id
+    if (route.route === route.routeKey) route.route = frame.route; // filled from a list endpoint or by discovery: the frame knows the id
+    const origin = hasParams(route.routeKey) ? (frame.paramsFrom ?? seed.origin[route.routeKey]) : undefined;
+    if (origin) route.paramsFrom = origin;
+    if (frame.paramsFoundOn) route.paramsFoundOn = frame.paramsFoundOn;
     route.status = frame.status;
     route.reasons = frame.reasons;
     route.frameId = frame.id;
@@ -452,9 +476,37 @@ async function gather(
     }
   }
 
+  noteProvenance(state, list);
   checkRendered(config, state, list, headlines);
   if (!state.closed && !state.truncated) await decide(config, dirs, state, runtime, graph, timeline, headlines);
   if (!state.closed && state.failures.length === 0 && list.length > 0) await addReplay(config, dirs, opts, state, timeline, status?.sessionId, shortTree, deadline, now);
+}
+
+// ---- dynamic params (v0.8) ----------------------------------------------------
+
+/** The watcher, not `finish`, fills this route's params: from a list endpoint, or by discovery. */
+function watcherFills(config: Config, routeKey: string): boolean {
+  return Object.hasOwn(config.paramSources, routeKey) || config.paramDiscovery === 'links';
+}
+
+/** A route stayed unfilled: one failure that says what every tier did and exactly how to fix it, plus the structured form. */
+function failUnfilled(config: Config, dirs: Dirs, state: State, layered: LayeredParams, routeKey: string, status: Partial<Status> | null): void {
+  if (state.unfilled.some((u) => u.routeKey === routeKey)) return;
+  const live = status !== null && status.state !== 'stopped' && status.state !== 'error' && watcherPid(dirs, status) !== null;
+  const unfilled = explainUnfilled({ routeKey, config, layered, status, watcherLive: live });
+  state.unfilled.push(unfilled);
+  state.failures.push(unfilledMessage(unfilled));
+}
+
+/** A short note for routes whose params the agent set or the watcher discovered; the other tiers need no comment. */
+function noteProvenance(state: State, list: RouteProof[]): void {
+  for (const route of list) {
+    if (route.paramsFrom === 'discovered') {
+      state.notes.push(`${route.route}: params found by link discovery${route.paramsFoundOn ? ` on ${route.paramsFoundOn}` : ''}`);
+    } else if (route.paramsFrom === 'session') {
+      state.notes.push(`${route.route}: params set with visual-proof params set`);
+    }
+  }
 }
 
 /** A4 hook: image check, claim verdict and captions for the clean headline frames, within the decision budget. */
@@ -597,7 +649,7 @@ async function addHints(config: Config, dirs: Dirs, state: State): Promise<void>
   const hints: string[] = [];
   const status = readStatusFile(statusFiles(dirs).status);
   const live = status !== null && status.state !== 'stopped' && status.state !== 'error' && watcherPid(dirs, status) !== null;
-  const noFrame = state.failures.some((f) => f.startsWith('no frame at HEAD for ') || /: no frame at HEAD( \(|$)/.test(f));
+  const noFrame = state.failures.some((f) => f.startsWith('no frame at HEAD for ') || /: no frame at HEAD( \(|$)/.test(f)) || state.unfilled.length > 0;
 
   if (noFrame && !live) {
     hints.push('the watcher is not running, so nothing was captured while you edited: run visual-proof start');
@@ -740,6 +792,8 @@ function finalize(dirs: Dirs, state: State): FinishResult {
     summary,
     ...(state.decisions ? { decisions: state.decisions } : {}),
     ...(state.claim ? { claim: state.claim } : {}),
+    unfilled: state.unfilled,
+    seedCandidates: seedCandidates(state.routes.filter((r) => r.status !== undefined)),
   };
 }
 
@@ -770,6 +824,7 @@ export function errorResult(dirs: Dirs, failure: string, hints: string[] = []): 
     noScreenChanges: false,
     truncated: false,
     closed: true,
+    unfilled: [],
   };
   const result = finalize(dirs, state);
   result.summary = `visual-proof: finish error: ${failure}, see ${result.proofBlockPath}`;
