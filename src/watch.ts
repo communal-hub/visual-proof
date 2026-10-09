@@ -25,6 +25,7 @@ import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
 import { type DaemonState, type Status, type WarmupRouteStatus } from './status.js';
 import { triage } from './triage.js';
+import { probeFfmpeg } from './replay.js';
 // A4 decisions hooks (v0.6): everything else lives in src/decisions/**.
 import { type DecisionsApi } from './decisions/client.js';
 import { DecisionRuntime } from './decisions/runtime.js';
@@ -192,6 +193,8 @@ class Watcher {
   private readonly sidecarsRun = new Set<string>();
   /** The sidecar problems last logged, so an unchanged bad file does not log on every batch. */
   private readonly sidecarProblems = new Map<string, string>();
+  /** v0.9: whether scenarios are recorded as motion clips (replay.motion on and an ffmpeg that can encode them). */
+  private motion: Promise<boolean> | null = null;
 
   constructor(
     private readonly config: Config,
@@ -655,6 +658,8 @@ class Watcher {
         pageText?: string;
         /** Sidecar stills only. */
         steps?: FrameStep[];
+        /** Sidecar stills of a recorded run (v0.9). */
+        clip?: string;
       }> = [];
       let captureFailed = false;
       for (const target of targets.values()) {
@@ -676,8 +681,12 @@ class Watcher {
           this.log(`sidecar ${file} skipped: this capturer cannot run scenarios`);
           continue;
         }
+        const recording = (await this.motionEnabled()) ? this.timeline.newClip() : undefined;
+        const plan: ScenarioPlan = recording ? { ...job.plan, record: { dir: recording.dir, holdMs: Math.round(this.config.replay.secondsPerFrame * 1000) } } : job.plan;
         try {
-          const result = await this.capturer!.runScenario(job.plan);
+          const result = await this.capturer!.runScenario(plan);
+          const clip = recording && result.clip ? recording.clip : undefined;
+          if (recording && !clip) this.timeline.dropClip(recording.clip);
           for (const still of result.stills) {
             const route = sidecarRoute(file, still.name);
             captured.push({
@@ -689,14 +698,17 @@ class Watcher {
               timing: still.timing,
               pageText: still.pageText,
               steps: still.steps,
+              clip,
             });
           }
           ranScenarios.push(file);
           this.log(
             `sidecar ${file}: ${result.stills.filter((x) => !x.failed).length} still(s) in ${result.ms} ms` +
+              (result.clip ? `; clip of ${result.clip.seconds} s (${result.clip.frames} frames)` : '') +
               (result.failure ? `; failed at line ${result.failure.line} ${result.failure.text}: ${result.failure.reason}` : ''),
           );
         } catch (err) {
+          if (recording) this.timeline.dropClip(recording.clip);
           captureFailed = true;
           this.fail(new Error(`sidecar ${file} failed: ${(err as Error).message}`));
         }
@@ -714,6 +726,7 @@ class Watcher {
             ? `working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})`
             : `${eventsDuring} file event(s) arrived during capture (tree unchanged: ${after.slice(0, 8)})`;
         this.log(`discarded ${captured.length} frame(s): ${why}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
+        for (const clip of new Set(captured.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
         const routes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
         this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
         if (requeue) {
@@ -725,7 +738,7 @@ class Watcher {
         return;
       }
 
-      for (const { target, at, png, signals, renderedFiles, timing, pageText, steps } of captured) {
+      for (const { target, at, png, signals, renderedFiles, timing, pageText, steps, clip } of captured) {
         const verdict = triage(signals);
         const frame = this.timeline.append(
           {
@@ -741,6 +754,7 @@ class Watcher {
             renderedFiles,
             ...(timing ? { timing: { ...timing, ...(target.discoveryMs !== undefined ? { discoveryMs: target.discoveryMs } : {}) } } : {}),
             ...(steps ? { steps } : {}),
+            ...(clip ? { clip } : {}),
             ...(target.paramsFrom ? { paramsFrom: target.paramsFrom } : {}),
             ...(target.foundOn ? { paramsFoundOn: target.foundOn } : {}),
           },
@@ -774,6 +788,23 @@ class Watcher {
   }
 
   // ---- sidecars ------------------------------------------------------------
+
+  /** Probed once: recording is pointless without an ffmpeg that can turn the clips into the replay. */
+  private motionEnabled(): Promise<boolean> {
+    const { replay } = this.config;
+    this.motion ??=
+      replay.enabled && replay.motion
+        ? probeFfmpeg(this.opts.env ?? process.env).then(
+            (info) => {
+              const ok = info.found && info.x264;
+              if (!ok) this.log(`motion clips off: ${info.found ? 'this ffmpeg has no libx264 encoder' : (info.reason ?? 'ffmpeg not found')}; the replay shows stills`);
+              return ok;
+            },
+            () => false,
+          )
+        : Promise.resolve(false);
+    return this.motion;
+  }
 
   /**
    * The scenarios to replay for this batch: the sidecar files that changed; those with a `goto` on a route that a
