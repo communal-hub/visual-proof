@@ -76,6 +76,26 @@ function fixtureBackend() {
         if (req.method === 'GET' && pathname === '/api/invoices') {
           return send(res, 200, readData().invoices)
         }
+        // v0.8 discovery fixtures: a list that navigates by click handler (projects) and a nested list (clubs -> teams).
+        if (req.method === 'GET' && pathname === '/api/projects') {
+          return send(res, 200, readData().projects ?? [])
+        }
+        const project = /^\/api\/projects\/([^/]+)$/.exec(pathname)
+        if (req.method === 'GET' && project) {
+          const found = (readData().projects ?? []).find((p) => String(p.id) === project[1])
+          return found ? send(res, 200, found) : send(res, 404, { error: 'not found' })
+        }
+        if (req.method === 'GET' && pathname === '/api/clubs') {
+          return send(res, 200, (readData().clubs ?? []).map(({ teams, ...club }) => club))
+        }
+        const teams = /^\/api\/clubs\/([^/]+)\/teams(?:\/([^/]+))?$/.exec(pathname)
+        if (req.method === 'GET' && teams) {
+          const club = (readData().clubs ?? []).find((c) => String(c.id) === teams[1])
+          if (!club) return send(res, 404, { error: 'not found' })
+          if (!teams[2]) return send(res, 200, club.teams)
+          const team = club.teams.find((t) => String(t.id) === teams[2])
+          return team ? send(res, 200, { ...team, club: club.name }) : send(res, 404, { error: 'not found' })
+        }
         const one = /^\/api\/invoices\/([^/]+)$/.exec(pathname)
         if (req.method === 'GET' && one) {
           const invoice = readData().invoices.find((i) => String(i.id) === one[1])

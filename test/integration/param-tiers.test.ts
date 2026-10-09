@@ -19,7 +19,7 @@ describe('doctor with paramSources', () => {
     const report = await runDoctor(h.config, { dirs: h.dirs });
     expect(report.capabilities.paramTiers).toMatchObject({ tier: 'list-endpoint', status: 'ok', required: false });
     expect(report.capabilities.paramTiers.detail).toBe(
-      `1 route(s) with params: config 0, seed-file 0, list-endpoint 1, uncovered 0; probe /api/invoices -> /manage/invoices/1`,
+      `4 route(s) with params: session 0, config 0, seed-file 0, list-endpoint 1, discovery 3, uncovered 0; paramDiscovery: links; probe /api/invoices -> /manage/invoices/1`,
     );
     expect(report.capabilities.params).toMatchObject({ tier: 'none' });
     expect(JSON.parse(fs.readFileSync(path.join(h.dirs.statusDir, 'doctor.json'), 'utf8')).capabilities.paramTiers.detail).toContain('list-endpoint 1');
