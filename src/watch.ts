@@ -17,6 +17,11 @@ import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
 import { type DaemonState, type Status, type WarmupRouteStatus } from './status.js';
 import { triage } from './triage.js';
+// A4 decisions hooks (v0.6): everything else lives in src/decisions/**.
+import { type DecisionsApi } from './decisions/client.js';
+import { DecisionRuntime } from './decisions/runtime.js';
+import { writeTextSidecar } from './decisions/sidecar.js';
+import { pruneForWatch } from './decisions/watch.js';
 
 export type { DaemonState, Status };
 
@@ -51,6 +56,8 @@ export interface WatchOptions {
   debounceMs?: number;
   /** How many times a batch whose tree changed mid-capture is re-queued before it is dropped. Default 2. */
   maxRequeues?: number;
+  /** Replaces the OpenRouter Decisions client (tests). */
+  decisionsClient?: DecisionsApi;
 }
 
 export interface FrameEvent {
@@ -108,6 +115,8 @@ class Watcher {
   private readonly isRouteFile: (file: string) => boolean;
   /** Route params from list endpoints (the third tier); fetches through the capturer's logged-in context. */
   private readonly paramSources: ParamSourceResolver;
+  /** A4 decisions: route pruning for high fan-out files (cached in the status dir; `finish` reads the same cache). */
+  private readonly decisions: DecisionRuntime;
 
   private capturer: Capturer | null = null;
   private barrier: BarrierSource | null = null;
@@ -138,6 +147,13 @@ class Watcher {
     this.sessionId = opts.sessionId ?? `s-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
     this.timeline = new Timeline(this.dirs.scratchDir, config.maxFrames);
     this.isRouteFile = picomatch(config.routeFiles, { dot: true });
+    this.decisions = new DecisionRuntime({
+      config: config.decisions,
+      env: opts.env ?? process.env,
+      configDir: config.repoDir,
+      client: opts.decisionsClient,
+      log: (m) => this.log(m),
+    });
     this.paramSources = new ParamSourceResolver(config.paramSources, async (urlPath) => {
       if (!this.capturer?.getJson) throw new Error('this capturer cannot fetch JSON');
       return this.capturer.getJson(urlPath);
@@ -550,13 +566,14 @@ class Watcher {
         signals: CaptureSignals;
         renderedFiles: string[] | null;
         timing?: CaptureTiming;
+        pageText?: string;
       }> = [];
       let captureFailed = false;
       for (const target of targets.values()) {
         if (this.stopping) return;
         try {
           const result = await this.capturer!.capture(target.url);
-          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null, timing: result.timing });
+          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null, timing: result.timing, pageText: result.pageText });
         } catch (err) {
           captureFailed = true;
           this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
@@ -584,7 +601,7 @@ class Watcher {
         return;
       }
 
-      for (const { target, at, png, signals, renderedFiles, timing } of captured) {
+      for (const { target, at, png, signals, renderedFiles, timing, pageText } of captured) {
         const verdict = triage(signals);
         const frame = this.timeline.append(
           {
@@ -602,6 +619,10 @@ class Watcher {
           },
           png,
         );
+        // A4: the page text for the claim check lives next to the PNG, not in index.jsonl.
+        if (pageText !== undefined && this.config.decisions.verdict && this.config.decisions.enabled !== false) {
+          writeTextSidecar(this.timeline.pngPath(frame), pageText);
+        }
         this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url });
         this.status.frames++;
         this.status.lastCaptureAt = at;
@@ -666,7 +687,16 @@ class Watcher {
       this.graphStale = true;
     }
 
-    const resolution = resolveRoutes(files, graph, { ...this.config, routeParams: params });
+    // A4 hook: a file that fans out to many routes is pruned to the likely ones (decision cached for `finish`).
+    const resolution = await pruneForWatch(
+      this.config,
+      this.decisions,
+      this.dirs.statusDir,
+      files,
+      resolveRoutes(files, graph, { ...this.config, routeParams: params }),
+      graph,
+      this.status.anchor,
+    );
     for (const file of resolution.unmapped) this.log(`no route for ${file}`);
     for (const skip of resolution.skipped) this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
     const targets: Target[] = resolution.routes.map((r) => ({

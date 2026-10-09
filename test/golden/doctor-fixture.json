@@ -67,6 +67,12 @@
       "status": "ok",
       "required": false,
       "detail": "finish fails when a changed .vue file never rendered on its routes"
+    },
+    "decisions": {
+      "tier": "off",
+      "status": "ok",
+      "required": false,
+      "detail": "off (decisions.enabled is false)"
     }
   }
 }

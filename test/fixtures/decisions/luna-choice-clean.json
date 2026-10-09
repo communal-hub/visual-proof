@@ -1,0 +1,1 @@
+{"model":"openai/gpt-6-luna-decisions-20261006","answers":{"frame":{"type":"choice","choice":"clean","probabilities":{"clean":0.99,"loading":0,"error":0,"blank":0.01},"confidence":0.99}},"usage":{"input_tokens":1188,"output_tokens":0,"cost":0.0001188},"id":"gen-dec-fixture-2","provider":"OpenAI"}

@@ -31,6 +31,10 @@ const greenProbes = (): Probes => ({
   login: async () => ({ status: 204 }),
   buildGraph: async () => graph(3, 5, 1),
   getJson: async (_config, paths) => paths.map(() => ({ status: 200, json: [] })),
+  appUp: async () => false,
+  probeDecisions: async () => {
+    throw new Error('no probe in this test');
+  },
 });
 
 function configure(extra: Record<string, unknown> = {}): Config {
@@ -70,7 +74,7 @@ describe('runDoctor', () => {
   it('reports every capability, writes doctor.json, and is ok when all probes pass', async () => {
     const report = await doctor(configure());
     expect(report.ok).toBe(true);
-    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'paramTiers', 'renderCheck']);
+    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'paramTiers', 'renderCheck', 'decisions']);
     expect(report.capabilities).toMatchObject({
       config: { tier: 'valid', status: 'ok' },
       git: { tier: 'repo', status: 'ok' },
@@ -449,11 +453,92 @@ describe('paramTiers', () => {
   });
 });
 
+describe('decisions', () => {
+  const probe = (over: Partial<{ triage: { ok: boolean; ms: number; resolved?: string; error?: string }; text: { ok: boolean; ms: number; resolved?: string; error?: string } }> = {}) => ({
+    triage: { model: 'openai/gpt-6-luna-decisions-20261006', ok: true, ms: 230, resolved: 'openai/gpt-6-luna-decisions-20261006', ...over.triage },
+    text: { model: 'typesafe/jev-1.13', ok: true, ms: 160, resolved: 'typesafe/jev-1.13-20260917', ...over.text },
+  });
+  const KEY = { OPENROUTER_API_KEY: 'sk-test' };
+
+  it('without a key it says heuristics only, and makes no probe', async () => {
+    let probed = 0;
+    const report = await doctor(configure(), {
+      env: {},
+      probes: { appUp: async () => true, probeDecisions: async () => (probed++, probe()) },
+    });
+    expect(probed).toBe(0);
+    expect(report.capabilities.decisions).toMatchObject({ tier: 'heuristics-only', status: 'warn', required: false });
+    expect(report.capabilities.decisions.detail).toContain('OPENROUTER_API_KEY is not set');
+    expect(report.capabilities.decisions.detail).toContain('DOM heuristics only');
+    expect(report.ok).toBe(true);
+  });
+
+  it('with a key but the app down it does not probe (doctor stays offline), and says how to', async () => {
+    let probed = 0;
+    const report = await doctor(configure(), { env: KEY, probes: { appUp: async () => false, probeDecisions: async () => (probed++, probe()) } });
+    expect(probed).toBe(0);
+    expect(report.capabilities.decisions).toMatchObject({ tier: 'key-present', status: 'ok' });
+    expect(report.capabilities.decisions.detail).toContain('models not probed (run doctor --probe-decisions, or start the app)');
+    expect(report.capabilities.decisions.detail).toContain('triage warn, prune above 6 keep 4');
+  });
+
+  it('with the app up it probes each model once and reports the resolved ids and latencies', async () => {
+    let probed = 0;
+    const report = await doctor(configure(), { env: KEY, probes: { appUp: async () => true, probeDecisions: async () => (probed++, probe()) } });
+    expect(probed).toBe(1);
+    expect(report.capabilities.decisions).toMatchObject({ tier: 'openrouter', status: 'ok' });
+    expect(report.capabilities.decisions.detail).toContain('triage openai/gpt-6-luna-decisions-20261006 ok (230 ms)');
+    expect(report.capabilities.decisions.detail).toContain('text typesafe/jev-1.13 -> typesafe/jev-1.13-20260917 ok (160 ms)');
+  });
+
+  it('--probe-decisions probes even when the app is down; a failing model makes the row degraded, never a failed doctor', async () => {
+    const report = await doctor(configure(), {
+      env: KEY,
+      probeDecisions: true,
+      probes: { appUp: async () => false, probeDecisions: async () => probe({ text: { ok: false, ms: 20, error: 'HTTP 400: Model typesafe/jev-9 does not exist', resolved: undefined } }) },
+    });
+    expect(report.capabilities.decisions).toMatchObject({ tier: 'degraded', status: 'warn' });
+    expect(report.capabilities.decisions.detail).toContain('text typesafe/jev-1.13 FAILED: HTTP 400: Model typesafe/jev-9 does not exist');
+    expect(report.ok).toBe(true);
+
+    const threw = await doctor(configure(), { env: KEY, probeDecisions: true, probes: { probeDecisions: async () => Promise.reject(new Error('socket hang up')) } });
+    expect(threw.capabilities.decisions).toMatchObject({ tier: 'degraded', status: 'warn' });
+    expect(threw.capabilities.decisions.detail).toContain('socket hang up');
+  });
+
+  it('bounds a probe that never answers', async () => {
+    const t0 = Date.now();
+    const report = await doctor(configure(), {
+      env: KEY,
+      probeDecisions: true,
+      timeouts: { decisionsMs: 50 },
+      probes: { probeDecisions: () => new Promise(() => {}) },
+    });
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(report.capabilities.decisions.tier).toBe('degraded');
+  });
+
+  it('finds the key in a .env next to the config; enabled:false is off whatever the key', async () => {
+    write(repo, '.env', 'OPENROUTER_API_KEY=sk-from-file\n');
+    const fromFile = await doctor(configure(), { env: {}, probes: { appUp: async () => false } });
+    expect(fromFile.capabilities.decisions.tier).toBe('key-present');
+    expect(fromFile.capabilities.decisions.detail).toContain('.env next to the config');
+
+    const off = await doctor(configure({ decisions: { enabled: false } }), { env: KEY, probeDecisions: true });
+    expect(off.capabilities.decisions).toMatchObject({ tier: 'off', status: 'ok' });
+  });
+
+  it('is skipped for an invalid config', async () => {
+    const report = await doctor(new ConfigError('bad'));
+    expect(report.capabilities.decisions.status).toBe('skipped');
+  });
+});
+
 describe('formatReport and doctorCommand', () => {
   it('prints one aligned row per capability', async () => {
     const text = formatReport(await doctor(configure({ screenGlobs: ['nothing/**'] })));
     const lines = text.trimEnd().split('\n');
-    expect(lines).toHaveLength(12);
+    expect(lines).toHaveLength(13);
     expect(lines[0]).toMatch(/^capability\s+tier\s+status\s+detail$/);
     expect(lines.find((l) => l.startsWith('trigger'))).toMatch(/^trigger\s+fs-watch\s+MISSING\s+no files match/);
     // Columns line up: every row's tier column starts at the same offset.

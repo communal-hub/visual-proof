@@ -1,6 +1,6 @@
 {
   "name": "visual-proof",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Visual proof capture for agent tasks",
   "license": "MIT",
   "type": "module",
@@ -20,7 +20,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
-    "test:integration": "vitest run test/integration test/corpus",
+    "test:integration": "vitest run test/integration test/corpus test/live",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {

@@ -41,6 +41,10 @@ describe('Browser.capture', () => {
     expect(result.signals.appRootChildCount).toBeGreaterThan(0);
     expect(result.signals.text).toContain('INV-001');
     expect(result.signals.text.length).toBeLessThanOrEqual(2048);
+    // A4: the longer page text (up to 8 KB) rides on the result for the sidecar, not in the signals.
+    expect(result.pageText).toContain('INV-001');
+    expect(result.pageText!.length).toBeLessThanOrEqual(8192);
+    expect(result.signals).not.toHaveProperty('fullText');
     expect(triage(result.signals).status).toBe('clean');
     expect(openPages()).toBe(0);
   });

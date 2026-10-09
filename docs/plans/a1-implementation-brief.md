@@ -45,6 +45,7 @@ src/
   anchor.ts         persistent diff anchor (anchors.json in the status dir)
   ready.ts          `status --wait` / `ready`: block until the watcher is ready
   rendered.ts       in-page Vue component-tree walker and `__file` normalisation (render check)
+  decisions/        A4: OpenRouter Decisions client, image check, prune, claim verdict, captions, budget, sidecar (see "Decisions (v0.6)")
   trigger/
     vite-hmr.ts     freshness barrier: HMR websocket client
     fs-watch.ts     trigger: screen + backend globs
@@ -115,7 +116,9 @@ File: `visual-proof.config.json` in the app repo root (path overridable with `--
   "allowHosts": ["browser.sentry.io"],          // exempt from blockHosts; default []
   "maxFrames": 200,
   "finishBudgetMs": 25000,
-  "baseRef": "main"
+  "baseRef": "main",
+  "decisions": { "enabled": true, "models": { "triage": "openai/gpt-6-luna-decisions-20261006", "text": "typesafe/jev-1.13" }, "triage": "warn", "prune": { "above": 6, "keep": 4 }, "verdict": true, "captions": true, "budgetMs": 10000 }, // A4, see "Decisions (v0.6)"
+  "claimFile": "docs/claim.md"                  // default <statusDir>/claim.md
 }
 ```
 
@@ -153,6 +156,23 @@ Third tier after `routeParams` and `routeParamsFile`, in `src/resolve/param-sour
 - Default choice (fixture, warm, 5 samples each, `test/integration/settle-bench.test.ts`): median save-to-still 955 ms at 500, 708 ms at 250, 598 ms at 150; zero non-clean captures at any of them in the save-to-still runs and in 54 sweep captures each (every fixture route, alone and four at a time). 250 became the default after three full test runs with no non-clean frame; 150 was not adopted (largest saving, thinnest margin for apps with request gaps). Apps whose requests chain with gaps above the window should raise it.
 - `CaptureResult.timing` / frame record `timing: { settleMs, screenshotMs }`: `settleMs` = from `load` to a settled, read page (network idle, fonts, two frames, DOM read, including any re-settle after the page navigated itself); `screenshotMs` = from the settled page to the PNG (rendered-component walk, page preparation, masks, the screenshot). Absent on frames from earlier versions and from capturers that do not report it.
 
+### Decisions (v0.6, A4)
+
+Model calls at bounded decision points through OpenRouter's Decisions API, in `src/decisions/**`. Never navigation; no free text.
+
+- **API (spike, live):** `POST https://openrouter.ai/api/alpha/decisions`, `Authorization: Bearer <key>`, body `{ model, state, questions: { <id>: { type, instructions, criteria } } }` -> `{ model, answers: { <id>: ... }, usage: { input_tokens, output_tokens, cost } }`. `criteria` is validated per type before the model is looked up: `choice` = record choice -> description (required); `score` = array of anchors (required); `noul` = optional `{ true, false }` record. A `noul` answer is `{ noul: p }`, p = probability of yes; a `choice` answer has `choice`, `probabilities`, `confidence`. Unknown model: 400 `Model <id> does not exist`. Model ids: `typesafe/jev-1.13` resolves to the dated `typesafe/jev-1.13-20260917` (the response `model`; bare `typesafe/jev` and `typesafe/jev-router` do not exist); `openai/gpt-6-luna-decisions-20261006` is the pinned image model (`openai/gpt-6-luna-decisions` resolves to it). Neither appears in `/api/v1/models`. Images: `state: [{ type: "image_url", image_url: { url: "data:image/png;base64,..." } }]`, about 1.2k input tokens (1,174 to 1,254) and $0.00012 per 1280x800 still, 250 to 500 ms warm; any other encoding is read as text.
+- **Multi-image (spike):** with four images in one request and one question per image ("look only at image N"), Luna answered every image correctly in both orders, but confidence dropped from 1.0 (single image) to 0.53 to 0.99, so a right error answer could fall below the 0.7 threshold. Design: one image per request, concurrently (cap 6).
+- **Client** (`client.ts`): key from `OPENROUTER_API_KEY` or `OPENROUTER_API_KEY=` in `<configDir>/.env`; 8 s timeout per attempt; one retry on 429/5xx with `retry-after` (seconds or date, capped at 3 s) else 400 to 700 ms; an `AbortSignal` cancels a request and its back-off; typed results `{ ok: true, answers, model, requestedModel, usage, ms } | { ok: false, kind: no-key|timeout|aborted|http|network|invalid, error, status?, ms }`; `stats` accumulates `requests` (a retry is not a request), `retries`, `failed`, `ms`, `cost`, `inputTokens`. Error text never contains the key.
+- **Config:** `decisions` (all optional): `enabled` (default: on when a key exists; `false` never makes a request; `true` without a key adds the note `decisions are enabled but OPENROUTER_API_KEY is not set ...`), `models.triage` / `models.text`, `triage` `fail|warn|off` (default `warn`), `prune` `{ above: 6, keep: 4 }` or `false`, `verdict` (true), `captions` (true), `budgetMs` (10000). Unknown keys are errors. `claimFile` (relative to the config dir; default `<statusDir>/claim.md`).
+- **Image check** (`image-check.ts`): for each clean headline frame, one `choice` `frame` over `clean|loading|error|blank` (criteria in code). Non-clean with `confidence` (else the chosen probability) >= 0.7: `triage: fail` -> failure `<route> looks <label> to the image check (<confidence, 2 decimals>)`; `warn` -> the same text as a note. Request failure, budget, unknown label or `usage.input_tokens > 2000` (wrong encoding; logged `decisions: ERROR ...` in `watcher.log`) -> `unknown`, noted as `image check unknown for <routes>: <why>`, never a failure. `RouteProof.imageCheck = { label, confidence, action: none|fail|warn, model?, ms, note? }`; the status line gains ` · image check: <label> (<confidence>)`.
+- **Pruning** (`prune.ts`, hooks `pruneForWatch` in `watch.ts` `resolveScreen` and `pruneForFinish` in `finish.ts` before the expected set is built): per changed screen file whose route-key fan-out (graph + `staticRoutes`, including param-skipped keys) exceeds `prune.above`: state `{ file, diff (trimmed to 6000 chars; the file content when git has no diff), routes: [{ key, components: [layouts..., page, file] }] }`, one `noul` per route ("Does this change visibly affect what <key> renders?"), kept = routes the file is directly (page component or layout) + top `keep` by probability (ties by route key) + any >= 0.5. A route is dropped only when every changed file that reaches it dropped it. Decisions are cached in `<statusDir>/decisions-cache.json` keyed by (file, sha1 of the working-tree content), valid only for the same sorted route-key list; read by both the watcher and `finish`, and honored when decisions are off. A failed, partial, late or no-client decision prunes nothing and is not cached. Watch bounds the request to min(`budgetMs`, 5 s). Notes: `pruned N of M route(s) for <file>: <key> <p>, ... (kept ...); decision by <model>[ (cached)]`.
+- **Claim verdict** (`claim.ts`): criteria = bullet (`-*+`) or numbered (`1.` `1)`) lines (max 12, 300 chars each), else the whole text as one. State `{ claim: [criteria], pages: [{ route, visibleText, renderedFiles }] }` (page text trimmed so all pages together stay under about 24k chars); one `noul` per criterion: >= 0.7 `satisfied`, < 0.3 `not visible`, else `partial`; overall in code: all satisfied -> `satisfied`, all not visible -> `not visible`, else `partial` (an unanswered criterion counts as partial). Advice only: `FinishResult.claim = { source, criteria: [{ text, probability, result }], verdict, routes, role, model?, note? }`; role = `login.email` or `anonymous`. Proof block section `**Claim check (advisory)**` ending with `Advisory — reviewer decides.` Missing claim file: note `claim check skipped: no claim at <path> ...`.
+- **Page text sidecar:** capture keeps up to 8192 characters of the app root's whitespace-collapsed `innerText` (`CaptureResult.pageText`; `signals.text` stays at 2048) and the watcher writes `scratch/frames/<id>.text.json` = `{ version: 1, text }` next to the PNG (only when `decisions.verdict` and `enabled !== false`); never in `index.jsonl`. Orphans (PNG evicted) are swept on each write.
+- **Captions** (`captions.ts`): 3 to 5 candidates in code per headline (route title from the route file's `title`/`meta.title` after its `path:` literal, else the path; changed file basenames; change kind from the diff: `.vue` sections `style|template|script`, else by extension `style|template|script|data|content`); one batched `choice` request over all frames; the first template is the fallback. Shown as an italic line between the still and its status line (`RouteProof.caption`).
+- **Budget and accounting** (`runtime.ts`, `budget.ts`): `budgetMs` is shared by every decision phase of a finish (prune before the daemon wait, then image + claim + captions together, concurrently); the clock only runs inside phases and never past finish's own deadline - 250 ms; work unfinished at the deadline is cancelled and noted (`decisions: unfinished work was skipped at the <n> ms budget`). `FinishResult.decisions = { requests, ms, cost, inputTokens, failed }` and the proof block ends with `decisions: N requests, M ms, $cost` (only when decisions were active). Target: one image request per headline plus at most 3 text requests (prune on a cache miss, claim, captions).
+- **doctor:** capability `decisions` (never required; after `renderCheck`): tier `off` (`enabled: false`), `heuristics-only` (no key; status `warn`), `key-present` (not probed), `openrouter` (both models probed ok), `degraded` (a probe failed or timed out; `warn`). Models are probed (one tiny request each, 5 s total) only with `doctor --probe-decisions` or when `appUrl` answers HTTP (1.5 s check); detail names the key source, each model as `<id> -> <resolved id> ok (<ms> ms)` and the mode summary.
+- **Tests:** the suite strips `OPENROUTER_API_KEY` (`test/setup.ts`); the integration harness writes `decisions: { enabled: false }`; `test/live/**` is gated on a key (`VP_LIVE_OPENROUTER_API_KEY` or the worktree `.env`).
+
 ### Warm-up
 
 Runs in `start()` after the trigger is live and before `state` becomes `ready`; `status.json` keeps `state: "starting"` throughout, with `warmup: { state: "running", routes: [] }`.
@@ -189,7 +209,8 @@ Env overrides: `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `V
 - `watcher.log`: one line per event, ISO timestamp first.
 - `doctor.json`: resolved tier per capability.
 - `proof-block.md`: written by `finish` on every outcome (a failure block when finish could not run: bad config, not a git repo, internal error), atomically (tmp + rename).
-- `scratch/index.jsonl` + `scratch/frames/<id>.png`.
+- `decisions-cache.json`: route pruning decisions (A4), shared by the watcher and `finish`.
+- `scratch/index.jsonl` + `scratch/frames/<id>.png` (+ `<id>.text.json` page text sidecar, A4).
 
 ## Frame record (one JSON line in index.jsonl)
 
@@ -255,7 +276,7 @@ stdout of `finish` is the proof block path on every branch, including `no screen
 | `stop` | status JSON | 0; 4 if the daemon cannot be signalled |
 | `watch` | log lines when a TTY | 0 after SIGINT/SIGTERM; 3 config/setup |
 | `finish` | proof block path (`--json`: the result; `--hook`: one summary line) | 0, 1, 3, 4 (`--hook`: always 0) |
-| `doctor` | table (one row per capability, including `paramTiers` and `renderCheck`: the mode) ending `details: <doctor.json path>` (`--json`: the report; `--json --normalize`: the report with timestamp, dirs, ports, hashes, timings and versions replaced, see below) | 0; 1 when the browser or the trigger is missing; 4 internal |
+| `doctor` | table (one row per capability, including `paramTiers`, `renderCheck` and `decisions`; `--probe-decisions` probes the models) ending `details: <doctor.json path>` (`--json`: the report; `--json --normalize`: the report with timestamp, dirs, ports, hashes, timings and versions replaced, see below) | 0; 1 when the browser or the trigger is missing; 4 internal |
 | usage error | | 2 |
 
 ### `doctor --json --normalize`
