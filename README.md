@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) and the v0.7 interaction work (sidecar scenarios, replay video). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) and the v0.8 dynamic route params (session params, link discovery). Vite apps only; Chromium only.
 
 ## Install
 
@@ -58,6 +58,7 @@ Only `appUrl` is required.
 | `routeParams` | `{}` | concrete URL for a parametrised route |
 | `routeParamsFile` | none | JSON file of route params the app writes at runtime (e.g. a seeder), relative to the config dir; see below |
 | `paramSources` | `{}` | route key to `{ url, pick }`: fill a route's params from a list endpoint when nothing above has them; see below |
+| `paramDiscovery` | `"links"` | `links` or `off`: last tier for a route with params nothing else fills; take an id from a link on its parent page; see "Dynamic route params" |
 | `sidecars` | `[".visual-proof/sidecars/*.vp"]` | globs (relative to the config dir) of sidecar scenario files; see "Sidecar scenarios" |
 | `roles` | `{}` | role name to login email, for `login <role>` in a sidecar (`login default` is `login.email`) |
 | `replay` | `{ "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600 }` | the replay video `finish` builds when ffmpeg is on PATH; see "Replay video" |
@@ -137,12 +138,101 @@ fills, the watcher asks the app for a real id.
   that is not a string or number) skips that route. The reason is logged as
   `warning: paramSources /api/invoices failed: HTTP 500 (route /manage/invoices/:id)` and kept in
   `status.json` under `paramSources`. If the route then has no frame at HEAD, `finish` fails with the
-  usual `cannot capture <route key>: ... (add routeParams)` line carrying that reason; with a frame
-  at HEAD it proves that frame, whichever id it used.
+  `cannot capture <route key>: params unfilled. Tried: ...` failure (see "Dynamic route params") carrying that
+  reason; with a frame at HEAD it proves that frame, whichever id it used. A failing source no longer ends the
+  search: link discovery gets its turn.
 - `doctor` has a `paramTiers` row (never required): how many routes with params each tier covers
-  (`config`, `seed-file`, `list-endpoint`, `uncovered`), and one bounded probe of each source, as the
+  (`session`, `config`, `seed-file`, `list-endpoint`, `discovery`, `uncovered`), and one bounded probe of each source, as the
   logged-in user, when the app answers (`probe /api/invoices -> /manage/invoices/1`). With the app
   down it says the sources were not probed.
+
+## Dynamic route params (v0.8)
+
+A route like `/invoices/:id` is captured only with an id. The sources, first match wins:
+
+1. **session params**, set by the agent with `params set` (below);
+2. `routeParamsFile`, written by app seeders (it has always overridden `routeParams`);
+3. `routeParams`, in the config;
+4. `paramSources`, a list endpoint;
+5. **link discovery**, new in v0.8 and on by default (`paramDiscovery: "links"`).
+
+When none fills a route, `finish` fails and says what to do. Nothing in the shared config needs editing for a one-off.
+
+### Session params: `params set | list | clear`
+
+```sh
+npx visual-proof params set '/invoices/:id' id=42
+npx visual-proof params set '/clubs/:clubId/teams/:teamId' clubId=1 teamId=10
+npx visual-proof params list [--json]
+npx visual-proof params clear ['/invoices/:id']
+```
+
+- `set` validates the route key against the route table (the import graph of `routeFiles` plus the
+  `staticRoutes` values) and the values against the pattern. Exit 2 for an unknown key (the message names the
+  closest keys, and the route key a concrete path fits), for missing params, for extra ones, for a value that does
+  not fit (`:id(\d+)` with `abc`, a `/` in a plain param), a malformed `param=value`, or a repeated param.
+  Optional params (`:slug?`) may be left out; a repeatable one (`:path+`) takes `a/b`.
+- The values are stored in `session-params.json` in the status dir (`{ version, rev, routes: { <key>: { path, params,
+  at } } }`). It is never committed, outranks every other source, and stays until `params clear` (a restarted watcher
+  keeps using it, but does not capture it by itself).
+- **With the watcher running, `set` captures the route at once**, at the current tree, even when no changed file
+  leads to it, so the agent can fix an unfilled-params failure and rerun `finish`. Mechanism: the watcher watches
+  `session-params.json`; on a change it queues the routes whose entry changed as a batch (frame `trigger: "params"`),
+  marks itself `pending`, and acknowledges the file revision in `status.json` as `sessionParamsRev` once the batch is
+  handled. `set` waits for that acknowledgement (up to `--timeout <s>`, default 20), then prints
+  `captured /invoices/42: clean (frame f-000012, tree abcd1234)`. Exit 1 when the frame is not clean or no capture
+  was confirmed in time (the params stay stored); exit 0 with a note on stderr when no watcher is running.
+- `list` prints the session params, the ids discovery found this watcher session (from `param-discovery.json`),
+  and the **seed candidates**: routes filled by `session` or `discovered`, the records the app's seeder could create
+  so no param step is needed. `--json`: `{ session: [{ routeKey, path, params, at }], discovered: [{ routeKey, path,
+  foundOn, at }], seedCandidates: [{ routeKey, route, params, paramsFrom, foundOn? }], files, problems }`.
+
+### Link discovery
+
+For a route nothing else fills, the watcher finds the nearest parent route that is in the route table
+(`/invoices/:id` -> `/invoices`, `/clubs/:clubId/teams/:teamId` -> `/clubs/:clubId/teams`), loads it in the
+logged-in browser with a fresh page and the normal settle logic, and reads every `a[href]` in DOM order. The first
+href that is same-origin, normalised to a path (query, hash, trailing slash and the app's base path dropped) and
+fits the route's pattern wins.
+
+- Patterns follow Vue Router: custom regex (`:id(\d+)`), optional (`?`), repeatable (`+`, `*`), params next to
+  static text. A route key in the route file may write the backslash as `\\d` (it is decoded). A pattern the
+  parser cannot read is not discovered.
+- A candidate that is really a more specific route is skipped: `/invoices/create` is not an invoice.
+- A parent with params of its own is filled through the same tiers, recursively (so discovery can go through
+  `/clubs` -> `/clubs/1/teams` -> `/clubs/1/teams/10`), up to 3 ancestors deep.
+- Results are cached per watcher session and dropped by a backend change, like `paramSources`, since a re-seed may
+  change the ids. Failures are not cached. The cache is mirrored to `param-discovery.json` (`{ sessionId, routes: {
+  <key>: { path, foundOn, at } } }`); the latest outcome per key, including the reason it failed, is in `status.json`
+  under `paramDiscovery`.
+- Time is bounded by the capture timeouts (30 s navigation, `settle.maxWaitMs`). The frame's `timing` gains
+  `discoveryMs`.
+- It finds nothing when the list is empty, when rows navigate by click handler (no `href`), or when the route has
+  no parent route; the route then stays unfilled. Hash-mode routers (`/#/invoices/1`) are not supported.
+- `paramDiscovery: "off"` switches it off; any other value than `links` or `off` is a config error.
+
+Sidecar `goto <route key>` steps use the same chain, session params and discovery included.
+
+### An unfilled route
+
+`finish` fails with one line that names the command, the advice and what each source did:
+
+```
+cannot capture /manage/projects/:id: params unfilled. Tried: session: none set; routeParams: no entry; routeParamsFile: not configured; paramSources: not configured; discovery: no link matching /manage/projects/:id on /manage/projects. Fix: npx visual-proof params set '/manage/projects/:id' id=<value>. If no record exists, create one first (e.g. with the app's factories or seeders) and use its id.
+```
+
+`finish --json` carries the same in `unfilled: [{ routeKey, params, command, advice, tiers: [{ tier, tried, reason }] }]`.
+Without a recorded discovery attempt the discovery reason is `not attempted` (or `not attempted (the watcher is not
+running)`); with `paramDiscovery: "off"` it is `off (paramDiscovery: "off")`.
+
+### Provenance and seed candidates
+
+Every frame of a route with params records `paramsFrom`: `session`, `config`, `file`, `source` or `discovered` (and
+`paramsFoundOn`, the page whose link gave the id, for `discovered`). `finish` copies both onto each route
+(`routes[].paramsFrom`, `routes[].paramsFoundOn`), adds `seedCandidates` (the `session` and `discovered` routes, with
+the param values) to its result, and puts one short note in the proof block for each such route
+(`/manage/invoices/1: params found by link discovery on /manage/invoices`, or
+`...: params set with visual-proof params set`).
 
 ## Capture quality
 
@@ -351,12 +441,13 @@ npx visual-proof start      # start the watcher (reattaches if running); prints 
 npx visual-proof status     # status JSON; a dead watcher is reported as stale
 npx visual-proof status --wait [--timeout <s>]   # block until ready (alias: npx visual-proof ready)
 npx visual-proof finish     # after committing: write the proof block, print its path
+npx visual-proof params set '<routeKey>' key=value ...   # use these route params now (captures at once); also: params list, params clear
 npx visual-proof stop
 npx visual-proof watch      # run the watcher in the foreground
 ```
 
-Options: `--config <path>`, `--json` (finish, doctor), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
-time-capped, always exits 0), `--wait` and `--timeout <s>` (status). Run
+Options: `--config <path>`, `--json` (finish, doctor, params list), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
+time-capped, always exits 0), `--wait` and `--timeout <s>` (status; params set). Run
 `npx visual-proof --help` for details.
 
 `doctor --json --normalize` prints the report with everything that varies between runs and machines
@@ -376,7 +467,7 @@ the status JSON.
 | Exit | Meaning |
 | --- | --- |
 | 0 | ok (`finish`: every changed screen has a clean frame at HEAD, or none changed) |
-| 1 | `finish`: proof failures; `doctor`: browser or trigger missing; `status --wait` / `ready`: not ready |
+| 1 | `finish`: proof failures; `params set`: the capture was not clean or not confirmed; `doctor`: browser or trigger missing; `status --wait` / `ready`: not ready |
 | 2 | usage error |
 | 3 | setup or config error (invalid config, not a git repo, watcher cannot start) |
 | 4 | internal error |
@@ -406,6 +497,7 @@ In the status dir:
 - `anchors.json` (the diff anchor per repo root and branch; survives daemon restarts, entries expire after 24 h)
 - `watcher.log` (one line per event)
 - `doctor.json` (last doctor report)
+- `session-params.json` (route params set with `params set`; never committed) and `param-discovery.json` (ids link discovery found this watcher session)
 - `decisions-cache.json` (route pruning decisions per file content, shared by the watcher and `finish`)
 - `proof-block.md` (written by `finish` on every outcome)
 - `scratch/index.jsonl` (one frame record per line, with `timing`) and `scratch/frames/<id>.png`
