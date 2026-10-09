@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) and the v0.8 dynamic route params (session params, link discovery). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) and the v0.9 motion replay (sidecar scenarios recorded as they run). Vite apps only; Chromium only.
 
 ## Install
 
@@ -61,7 +61,7 @@ Only `appUrl` is required.
 | `paramDiscovery` | `"links"` | `links` or `off`: last tier for a route with params nothing else fills; take an id from a link on its parent page; see "Dynamic route params" |
 | `sidecars` | `[".visual-proof/sidecars/*.vp"]` | globs (relative to the config dir) of sidecar scenario files; see "Sidecar scenarios" |
 | `roles` | `{}` | role name to login email, for `login <role>` in a sidecar (`login default` is `login.email`) |
-| `replay` | `{ "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600 }` | the replay video `finish` builds when ffmpeg is on PATH; see "Replay video" |
+| `replay` | `{ "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600, "motion": true }` | the replay video `finish` builds when ffmpeg is on PATH; `motion` records sidecar scenarios as clips for it; see "Replay video" |
 | `screenGlobs` | `src/**/*.vue` | files whose changes trigger a capture |
 | `ignoreScreenGlobs` | `[]` | files that match `screenGlobs` but are not screens |
 | `backendGlobs` | `[]` | backend files; a change re-captures routes already captured this session (as does a screen file with no route) |
@@ -349,6 +349,36 @@ It only ever adds a note, never a failure: `replay skipped: ffmpeg not found`; `
 `finishBudgetMs` (ffmpeg is killed when it overruns); `replay failed: <ffmpeg's last line>`. It is built only
 when the proof has no failures. `replay.enabled: false` turns it off. `doctor` has a `sidecars` row (scenarios
 found, parse errors) and a `replay` row (ffmpeg found, version, drawtext).
+
+### Motion clips (v0.9)
+
+With `replay.motion` (on by default) the watcher records every sidecar scenario as it runs, and the replay shows
+the flow itself instead of only the stills it ends in: a drawn cursor glides to what each `click` and `fill`
+targets, a ring marks the click, `fill` values are typed a character at a time, and the page reacts as it would
+for a person. Each `still` holds for `replay.secondsPerFrame`, and the clip ends on one more hold. Route
+captures have no interaction to show and stay stills between the clips.
+
+How it is recorded: Chromium's screencast of the scenario's own page, in the warm context (the login, blocked
+hosts and `fixedTime` are unchanged). The page drops `reducedMotion` so the app's own transitions show. What the
+stills hide stays hidden for the whole clip (dev overlays), and `maskSelectors` that are plain CSS get the same
+magenta box (Playwright-only ones such as `text=...` cannot be applied there; the watcher logs them once). While
+a still is taken (overlays hidden, scrollers grown, the full-page screenshot) the frames are dropped and that
+time is cut from the clip, so the viewer never sees the page being prepared. Stills never show the cursor.
+
+What changes in the run: the pacing (glides, typing, a short pause after each action, about a second per step),
+and how a `fill` gets its value: the field is focused and typed into, and when typing does not end in the value
+(masked or date inputs) a plain fill finishes it, so the page ends where a fill would leave it. `click` is still
+Playwright's click, after the glide.
+
+Clips live in the scratch dir (`clips/<id>/`: the JPEGs and a `manifest.json`), are pointed to by the stills of
+the run (`clip` on the frame), and go when the last frame using them is evicted. At `finish` each clip and each
+run of stills is encoded at 25 fps on a viewport-sized canvas (tall stills are scaled to fit), captioned with the
+step being run (`sidecar <scenario> / <step>`) when `drawtext` works, and the parts are joined without
+re-encoding. A run's clip is shown where its first still was; when clips would add up to more than 120 s the
+newest win and older runs show as stills. The proof block line says how many: `· 14 frame(s), 21.3 s, 2 motion
+clip(s)`. When the motion encode would not fit the finish budget the replay is built from stills, with the note
+`replay shows stills only: ...`. Without an ffmpeg that has libx264 the watcher does not record at all (it logs
+`motion clips off: ...`). `replay.motion: false` brings back the stills-only replay and the unpaced runs.
 
 ## Rendered-component check
 

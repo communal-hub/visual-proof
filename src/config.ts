@@ -67,6 +67,11 @@ export interface ReplayConfig {
   secondsPerFrame: number;
   /** Cap on the canvas height (CSS px); the width is the viewport width. */
   maxHeight: number;
+  /**
+   * v0.9: record sidecar scenarios as they run (a cursor gliding to what it clicks, typed fills) and show those clips
+   * in the replay instead of their stills. Needs ffmpeg with libx264, like the replay itself.
+   */
+  motion: boolean;
 }
 
 /** How a route key gets its params from a list endpoint (see `paramSources`). */
@@ -257,6 +262,7 @@ export function parseConfig(
       maxFrames: replayV?.posInt('maxFrames') ?? DEFAULT_REPLAY_MAX_FRAMES,
       secondsPerFrame: replayV?.posNumber('secondsPerFrame') ?? DEFAULT_REPLAY_SECONDS_PER_FRAME,
       maxHeight: replayV?.posInt('maxHeight') ?? DEFAULT_REPLAY_MAX_HEIGHT,
+      motion: replayV?.boolean('motion') ?? true,
     },
     paramDiscovery: parseParamDiscovery(v.string('paramDiscovery'), errors),
     screenGlobs: v.stringArray('screenGlobs') ?? ['src/**/*.vue'],

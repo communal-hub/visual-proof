@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Config } from './config.js';
+import { readClip, resampleClip, type ClipManifest } from './motion.js';
 import { parseSidecarRoute, sidecarName } from './sidecar.js';
 import type { Frame } from './timeline.js';
 
@@ -15,6 +16,10 @@ import type { Frame } from './timeline.js';
 export const CAPTION_BAR = 36;
 /** Output frame rate. Stills are static, so a low rate keeps the encode quick and the file small. */
 export const REPLAY_FPS = 10;
+/** Output frame rate when the replay has motion clips (v0.9): smooth enough for a gliding cursor. */
+export const MOTION_FPS = 25;
+/** At most this much motion (ms) goes into one replay; older clips beyond it show as their stills. */
+export const MAX_MOTION_MS = 120_000;
 
 export interface FfmpegInfo {
   found: boolean;
@@ -212,10 +217,19 @@ export function replayCanvas(sizes: Array<{ width: number; height: number } | nu
   return { width: even(viewport.width), height: even(Math.min(tallest, maxHeight)) };
 }
 
+/** A caption text file and the seconds of output it shows for. */
+export interface CaptionWindow {
+  file: string;
+  from: number;
+  to: number;
+}
+
 export interface FilterScriptInput {
   canvas: Canvas;
   /** One caption text file per frame, in order; omit to build without the caption bar. */
   captions?: string[];
+  /** Captions by time instead of per frame (motion clips); used when `captions` is absent. */
+  windows?: CaptionWindow[];
   /** Seconds each frame is shown (captions switch at the midpoints between frame timestamps). */
   secondsPerFrame?: number;
   fontfile?: string;
@@ -225,25 +239,26 @@ export interface FilterScriptInput {
  * The video filter chain: scale each frame to fit the canvas (never enlarging past it), pad it onto the canvas
  * top-aligned, then draw the caption bar and each frame's caption while it is on screen.
  */
-export function filterScript({ canvas, captions, fontfile, secondsPerFrame = 1 }: FilterScriptInput): string {
+export function filterScript({ canvas, captions, windows, fontfile, secondsPerFrame = 1 }: FilterScriptInput): string {
   const { width, height } = canvas;
-  const total = captions ? height + CAPTION_BAR : height;
+  // Frame i arrives at t = i * secondsPerFrame (one source frame per image, repeated later by the output rate);
+  // the half-frame margins keep a timestamp rounding either way from showing two captions or none.
+  const timed = captions
+    ? captions.map((file, i) => ({ file, from: (i - 0.5) * secondsPerFrame, to: (i + 0.5) * secondsPerFrame }))
+    : windows;
+  const total = timed ? height + CAPTION_BAR : height;
   const chain = [
     `scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos`,
     `pad=${width}:${total}:(ow-iw)/2:0:color=0x202020`,
   ];
-  if (captions) {
+  if (timed) {
     chain.push(`drawbox=x=0:y=${height}:w=${width}:h=${CAPTION_BAR}:color=0x101418:t=fill`);
-    captions.forEach((file, i) => {
+    for (const { file, from, to } of timed) {
       const font = fontfile ? `fontfile=${escapeFilterValue(fontfile)}:` : '';
-      // Frame i arrives at t = i * secondsPerFrame (one source frame per image, repeated later by the output rate);
-      // the half-frame margins keep a timestamp rounding either way from showing two captions or none.
-      const from = ((i - 0.5) * secondsPerFrame).toFixed(4);
-      const to = ((i + 0.5) * secondsPerFrame).toFixed(4);
       chain.push(
-        `drawtext=${font}textfile=${escapeFilterValue(file)}:expansion=none:fontcolor=white:fontsize=16:x=12:y=${height}+(${CAPTION_BAR}-text_h)/2:enable='gte(t,${from})*lt(t,${to})'`,
+        `drawtext=${font}textfile=${escapeFilterValue(file)}:expansion=none:fontcolor=white:fontsize=16:x=12:y=${height}+(${CAPTION_BAR}-text_h)/2:enable='gte(t,${from.toFixed(4)})*lt(t,${to.toFixed(4)})'`,
       );
-    });
+    }
   }
   // No fps filter: a frame size change reinitialises the graph and drops the frame the filter was holding.
   // The output rate (-r) does the repeating instead.
@@ -261,6 +276,8 @@ export interface ReplayResult {
   seconds: number;
   /** False when ffmpeg could not draw captions. */
   captions: boolean;
+  /** Motion clips in the video (v0.9); 0 when it is stills only. */
+  clips: number;
   /** How long ffmpeg ran. */
   ms: number;
 }
@@ -270,6 +287,8 @@ export interface BuildReplayOptions {
   frames: Frame[];
   /** Absolute path of a frame's PNG. */
   pngPath: (frame: Frame) => string;
+  /** Absolute path of a frame's motion clip directory, if it has one (v0.9). */
+  clipDir?: (frame: Frame) => string | undefined;
   config: Pick<Config, 'viewport' | 'replay'>;
   artifactDir: string;
   /** Throwaway files (the numbered image links and the captions) go here, in their own directory. */
@@ -304,12 +323,26 @@ export async function buildReplay(options: BuildReplayOptions): Promise<BuildRep
     const frames = selectReplayFrames(options.frames, (f) => fs.existsSync(options.pngPath(f)), replay.maxFrames);
     if (frames.length === 0) return { notes: ['replay skipped: no frames with a screenshot in this session'] };
 
-    const needMs = estimateMs(frames.length);
-    if (options.remainingMs < needMs) {
-      return { notes: [`replay skipped: ${Math.max(0, Math.round(options.remainingMs))} ms of the finish budget left, about ${needMs} ms needed for ${frames.length} frame(s)`] };
+    const captionsOk = info.drawtext;
+    if (replay.motion && options.clipDir) {
+      const segments = planSegments(frames, clipLoader(options.clipDir), MAX_MOTION_MS);
+      if (segments.some((s) => s.kind === 'clip')) {
+        const motionMs = estimateMotionMs(segments, replay.secondsPerFrame);
+        if (options.remainingMs >= motionMs) {
+          if (!captionsOk) notes.push(`replay built without captions: ${info.reason ?? 'drawtext is unavailable'}`);
+          const outcome = await buildMotion(options, info, segments, frames.length, captionsOk);
+          return { ...outcome, notes: [...notes, ...outcome.notes] };
+        }
+        notes.push(`replay shows stills only: about ${motionMs} ms needed for its motion clips, ${Math.max(0, Math.round(options.remainingMs))} ms of the finish budget left`);
+      }
     }
 
-    const captions = info.drawtext;
+    const needMs = estimateMs(frames.length);
+    if (options.remainingMs < needMs) {
+      return { notes: [...notes, `replay skipped: ${Math.max(0, Math.round(options.remainingMs))} ms of the finish budget left, about ${needMs} ms needed for ${frames.length} frame(s)`] };
+    }
+
+    const captions = captionsOk;
     if (!captions) notes.push(`replay built without captions: ${info.reason ?? 'drawtext is unavailable'}`);
 
     const work = path.join(options.scratchDir, `replay-${process.pid}-${Date.now().toString(36)}`);
@@ -366,7 +399,7 @@ export async function buildReplay(options: BuildReplayOptions): Promise<BuildRep
       fs.mkdirSync(options.artifactDir, { recursive: true });
       fs.copyFileSync(part, out);
       return {
-        result: { path: out, frames: frames.length, seconds: totalSeconds, captions, ms },
+        result: { path: out, frames: frames.length, seconds: totalSeconds, captions, clips: 0, ms },
         notes,
       };
     } finally {
@@ -376,4 +409,208 @@ export async function buildReplay(options: BuildReplayOptions): Promise<BuildRep
     notes.push(`replay failed: ${(err as Error).message.split('\n')[0]}`);
     return { notes };
   }
+}
+
+// ---- motion clips (v0.9) -------------------------------------------------------------
+
+/** A stretch of the replay: consecutive stills, or one recorded scenario run in place of its stills. */
+export type ReplaySegment =
+  | { kind: 'stills'; frames: Frame[] }
+  | { kind: 'clip'; dir: string; manifest: ClipManifest; frames: Frame[] };
+
+type ClipOf = (frame: Frame) => { dir: string; manifest: ClipManifest } | null;
+
+/** Reads each clip's manifest once. */
+function clipLoader(clipDir: (frame: Frame) => string | undefined): ClipOf {
+  const cache = new Map<string, ClipManifest | null>();
+  return (frame) => {
+    const dir = clipDir(frame);
+    if (!dir) return null;
+    if (!cache.has(dir)) cache.set(dir, readClip(dir));
+    const manifest = cache.get(dir);
+    return manifest ? { dir, manifest } : null;
+  };
+}
+
+/**
+ * The replay in order: a recorded run replaces its stills, shown where its first still was; everything else stays a
+ * still. The newest clips win when together they would run past `maxMotionMs` (one clip is always allowed); the
+ * stills of the older ones show as stills.
+ */
+export function planSegments(frames: Frame[], clipOf: ClipOf, maxMotionMs: number): ReplaySegment[] {
+  const clips = new Map<string, { dir: string; manifest: ClipManifest; last: number }>();
+  frames.forEach((frame, i) => {
+    const clip = clipOf(frame);
+    if (clip) clips.set(clip.dir, { ...clip, last: i });
+  });
+  const used = new Set<string>();
+  let budget = maxMotionMs;
+  for (const clip of [...clips.values()].sort((a, b) => b.last - a.last)) {
+    if (used.size > 0 && clip.manifest.duration > budget) continue;
+    used.add(clip.dir);
+    budget -= clip.manifest.duration;
+  }
+
+  const segments: ReplaySegment[] = [];
+  const emitted = new Map<string, Extract<ReplaySegment, { kind: 'clip' }>>();
+  for (const frame of frames) {
+    const clip = clipOf(frame);
+    if (clip && used.has(clip.dir)) {
+      const seen = emitted.get(clip.dir);
+      if (seen) {
+        seen.frames.push(frame);
+        continue;
+      }
+      const segment = { kind: 'clip' as const, dir: clip.dir, manifest: clip.manifest, frames: [frame] };
+      emitted.set(clip.dir, segment);
+      segments.push(segment);
+      continue;
+    }
+    const last = segments.at(-1);
+    if (last?.kind === 'stills') last.frames.push(frame);
+    else segments.push({ kind: 'stills', frames: [frame] });
+  }
+  return segments;
+}
+
+/** Rough cost of a motion replay: a startup per segment plus a little per output frame, and the final join. */
+export function estimateMotionMs(segments: ReplaySegment[], secondsPerFrame: number): number {
+  let outputFrames = 0;
+  for (const segment of segments) {
+    const seconds = segment.kind === 'clip' ? segment.manifest.duration / 1000 : segment.frames.length * secondsPerFrame;
+    outputFrames += Math.round(seconds * MOTION_FPS);
+  }
+  return 400 + segments.length * 350 + outputFrames * 6;
+}
+
+/** The caption bar text of a clip caption: the scenario and the step, in characters any font has. */
+export function clipCaptionText(text: string): string {
+  return `sidecar ${text}`.replace(/[^\x20-\x7e]/g, '?');
+}
+
+/** Caption windows (seconds) from the captions of consecutive ticks at `fps`. */
+export function tickWindows(captions: number[], fps: number): Array<{ caption: number; from: number; to: number }> {
+  const windows: Array<{ caption: number; from: number; to: number }> = [];
+  captions.forEach((caption, k) => {
+    const last = windows.at(-1);
+    if (last && last.caption === caption) last.to = (k + 0.5) / fps;
+    else windows.push({ caption, from: (k - 0.5) / fps, to: (k + 0.5) / fps });
+  });
+  return windows.filter((w) => w.caption >= 0);
+}
+
+const ENCODE_ARGS = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-r', String(MOTION_FPS), '-video_track_timescale', String(MOTION_FPS * 512)];
+
+/**
+ * Encode every segment on the viewport canvas at {@link MOTION_FPS} (stills scaled to fit), then join them without
+ * re-encoding. Same canvas, rate and encoder settings for every part is what lets the join copy the streams.
+ */
+async function buildMotion(options: BuildReplayOptions, info: FfmpegInfo, segments: ReplaySegment[], frameCount: number, captions: boolean): Promise<BuildReplayOutcome> {
+  const notes: string[] = [];
+  const env = options.env ?? process.env;
+  const { replay, viewport } = options.config;
+  const canvas: Canvas = { width: even(viewport.width), height: even(viewport.height) };
+  const deadline = Date.now() + options.remainingMs;
+  const left = (): number => deadline - Date.now() - 250;
+
+  const work = path.join(options.scratchDir, `replay-${process.pid}-${Date.now().toString(36)}`);
+  fs.mkdirSync(work, { recursive: true });
+  const out = path.join(options.artifactDir, `replay-${options.shortTree}.mp4`);
+  const started = Date.now();
+  let totalSeconds = 0;
+  try {
+    const parts: string[] = [];
+    for (const [n, segment] of segments.entries()) {
+      const dir = path.join(work, `seg-${n}`);
+      fs.mkdirSync(dir);
+      const part = path.join(work, `seg-${n}.mp4`);
+      let input: string[];
+      let filter: string;
+      let seconds: number;
+      if (segment.kind === 'stills') {
+        segment.frames.forEach((frame, i) => link(options.pngPath(frame), path.join(dir, `${String(i).padStart(5, '0')}.png`)));
+        const captionFiles = captions
+          ? segment.frames.map((frame, i) => {
+              const file = path.join(dir, `caption-${i}.txt`);
+              fs.writeFileSync(file, captionText(frame));
+              return file;
+            })
+          : undefined;
+        seconds = Math.round(segment.frames.length * replay.secondsPerFrame * 1000) / 1000;
+        input = ['-framerate', `1/${replay.secondsPerFrame}`, '-i', path.join(dir, '%05d.png')];
+        filter = filterScript({ canvas, captions: captionFiles, fontfile: info.fontfile, secondsPerFrame: replay.secondsPerFrame });
+      } else {
+        const ticks = resampleClip(segment.manifest, MOTION_FPS);
+        ticks.forEach((tick, k) => link(path.join(segment.dir, tick.file), path.join(dir, `${String(k).padStart(5, '0')}.jpg`)));
+        const windows = captions
+          ? tickWindows(
+              ticks.map((t) => t.caption),
+              MOTION_FPS,
+            ).map((w, i) => {
+              const file = path.join(dir, `caption-${i}.txt`);
+              fs.writeFileSync(file, clipCaptionText(segment.manifest.captions[w.caption]!.text));
+              return { file, from: w.from, to: w.to };
+            })
+          : undefined;
+        // Without captions there is no bar here either: every part must have the same height.
+        seconds = ticks.length / MOTION_FPS;
+        input = ['-framerate', String(MOTION_FPS), '-i', path.join(dir, '%05d.jpg')];
+        filter = filterScript({ canvas, windows, fontfile: info.fontfile });
+      }
+      if (left() <= 0) return { notes: [...notes, `replay skipped: ffmpeg did not finish within the ${Math.round(options.remainingMs)} ms of finish budget left`] };
+      const result = await run(
+        'ffmpeg',
+        ['-hide_banner', '-loglevel', 'error', '-y', ...input, '-vf', filter, ...ENCODE_ARGS, '-t', String(seconds), part],
+        { env, timeoutMs: Math.max(500, left()) },
+      );
+      const failed = encodeFailure(result, part, options.remainingMs);
+      if (failed) return { notes: [...notes, failed] };
+      parts.push(part);
+      totalSeconds += seconds;
+    }
+
+    const list = path.join(work, 'parts.txt');
+    fs.writeFileSync(list, parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'\n`).join(''));
+    const joined = path.join(work, 'out.mp4');
+    const result = await run(
+      'ffmpeg',
+      ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', joined],
+      { env, timeoutMs: Math.max(500, left()) },
+    );
+    const failed = encodeFailure(result, joined, options.remainingMs);
+    if (failed) return { notes: [...notes, failed] };
+    fs.mkdirSync(options.artifactDir, { recursive: true });
+    fs.copyFileSync(joined, out);
+    return {
+      result: {
+        path: out,
+        frames: frameCount,
+        seconds: Math.round(totalSeconds * 1000) / 1000,
+        captions,
+        clips: segments.filter((s) => s.kind === 'clip').length,
+        ms: Date.now() - started,
+      },
+      notes,
+    };
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
+function link(target: string, at: string): void {
+  try {
+    fs.symlinkSync(target, at);
+  } catch {
+    fs.copyFileSync(target, at);
+  }
+}
+
+/** The note for an ffmpeg run that did not produce `file`, or null when it did. */
+function encodeFailure(result: RunResult, file: string, budgetMs: number): string | null {
+  if (result.error === 'timeout') return `replay skipped: ffmpeg did not finish within the ${Math.round(budgetMs)} ms of finish budget left`;
+  if (result.code !== 0 || !fs.existsSync(file)) {
+    const why = result.stderr.trim().split('\n').filter(Boolean).at(-1) ?? result.error ?? `exit ${result.code}`;
+    return `replay failed: ${why}`;
+  }
+  return null;
 }

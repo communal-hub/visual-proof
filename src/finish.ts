@@ -577,6 +577,7 @@ async function addReplay(
   const outcome = await buildReplay({
     frames: timeline.list({ sessionId: session }),
     pngPath: (frame) => timeline.pngPath(frame),
+    clipDir: (frame) => timeline.clipPath(frame),
     config,
     artifactDir: dirs.artifactDir,
     scratchDir: dirs.scratchDir,
@@ -877,7 +878,8 @@ function renderProofBlock(state: State): string {
 
   if (state.replay) {
     // A plain markdown link to an absolute path, like the stills, so the PR tool can rewrite it.
-    lines.push('', `[Replay](${linkTarget(state.replay.path)}) · ${state.replay.frames} frame(s), ${state.replay.seconds} s`);
+    const motion = state.replay.clips > 0 ? `, ${state.replay.clips} motion clip(s)` : '';
+    lines.push('', `[Replay](${linkTarget(state.replay.path)}) · ${state.replay.frames} frame(s), ${state.replay.seconds} s${motion}`);
   }
 
   if (state.notes.length > 0) {
