@@ -4,7 +4,7 @@ import { API_KEY_ENV } from './client.js';
 export const DEFAULT_TRIAGE_MODEL = 'openai/gpt-6-luna-decisions-20261006';
 /** The text model (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the answer reports which). */
 export const DEFAULT_TEXT_MODEL = 'typesafe/jev-1.13';
-export const DEFAULT_BUDGET_MS = 10_000;
+export const DEFAULT_BUDGET_MS = 20_000;
 export const DEFAULT_PRUNE_ABOVE = 6;
 export const DEFAULT_PRUNE_KEEP = 4;
 

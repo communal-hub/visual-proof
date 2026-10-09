@@ -153,6 +153,7 @@ async function claimTask(input: FinishDecisionsInput, budget: DecisionBudget, ou
   }
   const pages: ClaimPage[] = headlines.map((h) => ({
     route: h.route,
+    png: h.png,
     visibleText: readTextSidecar(h.png) ?? '',
     renderedFiles: h.renderedFiles,
   }));
@@ -160,7 +161,7 @@ async function claimTask(input: FinishDecisionsInput, budget: DecisionBudget, ou
   if (noText.length > 0) out.notes.push(`claim check: no page text was captured for ${noText.join(', ')} (frames from an older capture)`);
   out.claim = await checkClaim(
     { source: shown, claim: claim.text, pages, role: config.login.type === 'http-hook' && config.login.email ? config.login.email : 'anonymous' },
-    { client: runtime.client!, model: config.decisions.models.text, budget, log: runtime.log },
+    { client: runtime.client!, model: config.decisions.models.triage, budget, log: runtime.log },
   );
   if (out.claim.note) out.notes.push(`claim check: ${out.claim.note}`);
 }
@@ -236,8 +237,9 @@ export function renderClaimSection(claim: ClaimReport): string[] {
   lines.push('', `Overall: ${claim.verdict}`, '');
   for (const c of claim.criteria) {
     const odds = c.probability === null ? 'no answer' : `${c.result}, ${c.probability.toFixed(2)}`;
-    lines.push(`- ${c.text}: ${odds}`);
+    lines.push(`- ${escapeCaption(c.text)}: ${odds}${c.reason ? ` — ${escapeCaption(c.reason)}` : ''}`);
   }
+  if (claim.note) lines.push('', `Note: ${escapeCaption(claim.note)}`);
   lines.push('', 'Advisory — reviewer decides.');
   return lines;
 }

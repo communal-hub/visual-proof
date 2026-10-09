@@ -11,6 +11,8 @@ import type {
   NoulAnswer,
 } from '../../src/decisions/client.js';
 
+export const CLEAN_PNG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures/stills/clean.png');
+
 export const FIXTURES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures/decisions');
 
 /** A recorded Decisions API response body (the real shape, captured live). */

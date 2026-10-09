@@ -1,17 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseConfig, type Config } from '../../src/config.js';
 import { writeTextSidecar } from '../../src/decisions/sidecar.js';
 import { pruneForWatch } from '../../src/decisions/watch.js';
 import { DecisionRuntime } from '../../src/decisions/runtime.js';
-import { runFinish, type FinishResult } from '../../src/finish.js';
+import { finishCommand, runFinish, type FinishResult } from '../../src/finish.js';
 import { headTree } from '../../src/git.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
 import { resolveRoutes } from '../../src/resolve/routes.js';
 import { Timeline } from '../../src/timeline.js';
-import { FakeClient, choice, hang, noul, okResult } from './decisions-helpers.js';
+import { CLEAN_PNG, FakeClient, choice, hang, noul, okResult } from './decisions-helpers.js';
 import { commitAll, git, initRepo, tmpDir, write } from './helpers.js';
 
 let repo: string;
@@ -50,7 +50,7 @@ async function frame(route: string, text = `page text of ${route}`, routeKey = r
   const tree = (await headTree(repo))!;
   const f = timeline.append(
     { sessionId: 's-test', route, routeKey, at: new Date(1_000_000 + seq++).toISOString(), treeHash: tree, trigger: 'screen', status: 'clean', reasons: [], renderedFiles: null },
-    Buffer.from(`png:${route}:${seq}`),
+    fs.readFileSync(route == "/a" ? path.join(path.dirname(CLEAN_PNG), "error.png") : CLEAN_PNG),
   );
   if (text) writeTextSidecar(timeline.pngPath(f), text);
 }
@@ -119,7 +119,7 @@ describe('image check at finish', () => {
     await frame('/');
     const client = new FakeClient((req) => {
       const first = (req.state as Array<{ image_url: { url: string } }>)[0]!.image_url.url;
-      const isA = Buffer.from(first.split(',')[1]!, 'base64').toString().startsWith('png:/a');
+      const isA = Buffer.from(first.split(',')[1]!, 'base64').equals(fs.readFileSync(path.join(path.dirname(CLEAN_PNG), 'error.png')));
       return okResult({ frame: isA ? choice('error', 0.95) : choice('clean', 0.99) });
     });
     const result = await finish(client);
@@ -162,7 +162,7 @@ describe('image check at finish', () => {
     expect(result.routes[0]!.imageCheck).toBeUndefined();
   });
 
-  it('the wrong-encoding guard: an image request reporting more than 2000 input tokens is unknown, noted and never fails finish', async () => {
+  it('the wrong-encoding guard: an image request reporting wildly inflated input tokens is unknown, noted and never fails finish', async () => {
     configure({ enabled: true, triage: 'fail', verdict: false, captions: false });
     edit('src/pages/A.vue');
     await frame('/a');
@@ -184,6 +184,36 @@ describe('image check at finish', () => {
 });
 
 describe('claim verdict, captions and accounting at finish', () => {
+  it('prints ready-to-paste claim markdown in normal finish output, with JSON and hook formats preserved', async () => {
+    configure({ enabled: true, captions: false, triage: 'off' }, { staticRoutes: { 'src/pages/A.vue': ['/a'] }, replay: { enabled: false } });
+    edit('src/pages/A.vue');
+    await frame('/a');
+    write(dirs.statusDir, 'claim.md', '- The page shows scanned members\n');
+    const configPath = path.join(repo, 'visual-proof.config.json');
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({
+      model: config.decisions.models.triage, answers: { c0: noul(0.02), reason0: choice('empty_state') },
+      usage: { input_tokens: 1200, output_tokens: 0, cost: 0.00012 },
+    }), { status: 200 }));
+    const env = { OPENROUTER_API_KEY: 'test-key', VISUAL_PROOF_STATUS_DIR: dirs.statusDir, VISUAL_PROOF_ARTIFACT_DIR: dirs.artifactDir, VISUAL_PROOF_SCRATCH_DIR: dirs.scratchDir };
+    try {
+      let stdout = '';
+      const context = { configPath, env, out: (t: string) => { stdout += t; }, err: () => {} };
+      expect(await finishCommand({ ...context, hook: false })).toBe(0);
+      expect(stdout).toContain('**Claim check (advisory)**');
+      expect(stdout).toContain('Overall: not visible');
+      expect(stdout).toContain('empty state contradicts');
+      expect(stdout).toContain('Advisory — reviewer decides.');
+      stdout = '';
+      await finishCommand({ ...context, hook: false, json: true });
+      expect(JSON.parse(stdout).claim.verdict).toBe('not visible');
+      stdout = '';
+      await finishCommand({ ...context, hook: true });
+      expect(stdout.trim().split('\n')).toHaveLength(1);
+      expect(stdout).not.toContain('**Claim check');
+    } finally { fetchMock.mockRestore(); }
+  });
+
   it('writes the advisory claim section, a caption under each still and the decisions footer; at most 3 text requests', async () => {
     configure({ enabled: true });
     edit('src/pages/A.vue');
@@ -196,12 +226,12 @@ describe('claim verdict, captions and accounting at finish', () => {
     const result = await finish(client);
     expect(result.ok).toBe(true);
 
-    // 2 images + 1 verdict + 1 captions = 4 requests; 2 text requests.
-    expect(client.imageCalls).toHaveLength(2);
+    // 2 triage images + 1 vision verdict + 1 text captions = 4 requests.
+    expect(client.imageCalls).toHaveLength(3);
     expect(client.textCalls.length).toBeLessThanOrEqual(3);
-    expect(client.textCalls).toHaveLength(2);
+    expect(client.textCalls).toHaveLength(1);
     expect(result.decisions).toMatchObject({ requests: 4, failed: 0 });
-    expect(result.decisions!.cost).toBeCloseTo(2 * 0.0001188 + 2 * 0.00002, 9);
+    expect(result.decisions!.cost).toBeCloseTo(3 * 0.0001188 + 0.00002, 9);
 
     const block = fs.readFileSync(result.proofBlockPath, 'utf8');
     expect(block).toMatch(/\*\*Claim check \(advisory\)\*\*/);
@@ -220,7 +250,10 @@ describe('claim verdict, captions and accounting at finish', () => {
     expect(block).toContain(`_${result.routes[0]!.caption!.replace(/[\\`*_[\]<>]/g, (c) => `\\${c}`)}_`);
 
     // The claim and what the model saw: the sidecar text, not index.jsonl.
-    const claimState = client.textCalls.find((c) => 'claim' in (c.state as object))!.state as { pages: Array<{ route: string; visibleText: string }> };
+    const claimCall = client.calls.find((c) => 'reason0' in c.questions)!;
+    expect(claimCall.model).toBe(config.decisions.models.triage);
+    expect((claimCall.state as Array<{ type?: string }>).filter((p) => p.type === 'image_url')).toHaveLength(2);
+    const claimState = JSON.parse((claimCall.state as string[])[0]!) as { pages: Array<{ route: string; visibleText: string }> };
     expect(claimState.pages.find((p) => p.route === '/a')!.visibleText).toBe('Alpha page total 12');
     expect(fs.readFileSync(path.join(dirs.scratchDir, 'index.jsonl'), 'utf8')).not.toContain('Alpha page total');
     expect(result.claim!.verdict).toBe('satisfied');

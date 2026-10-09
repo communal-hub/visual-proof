@@ -3,14 +3,14 @@ import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { DecisionBudget } from '../../src/decisions/budget.js';
 import { checkClaim, claimPath, classify, overallVerdict, readClaim, splitCriteria } from '../../src/decisions/claim.js';
-import { FakeClient, hang, noul, okResult } from './decisions-helpers.js';
+import { CLEAN_PNG, FakeClient, choice, hang, noul, okResult } from './decisions-helpers.js';
 import { tmpDir } from './helpers.js';
 
 const PAGES = [
-  { route: '/reports', visibleText: 'Reports Total billed: 535.75', renderedFiles: ['src/pages/Reports.vue'] },
-  { route: '/manage/invoices/1', visibleText: 'Invoice INV-001 paid', renderedFiles: null },
+  { png: CLEAN_PNG, route: '/reports', visibleText: 'Reports Total billed: 535.75', renderedFiles: ['src/pages/Reports.vue'] },
+  { png: CLEAN_PNG, route: '/manage/invoices/1', visibleText: 'Invoice INV-001 paid', renderedFiles: null },
 ];
-const opts = (client: FakeClient, budgetMs = 5000) => ({ client, model: 'jev', budget: new DecisionBudget(budgetMs) });
+const opts = (client: FakeClient, budgetMs = 5000) => ({ client, model: 'luna', budget: new DecisionBudget(budgetMs) });
 
 describe('splitCriteria', () => {
   it('takes bullet and numbered lines as criteria', () => {
@@ -73,13 +73,16 @@ describe('checkClaim', () => {
     );
     expect(client.calls).toHaveLength(1);
     const call = client.calls[0]!;
-    expect(call.model).toBe('jev');
-    const state = call.state as { claim: string[]; pages: Array<{ route: string; visibleText: string; renderedFiles: string[] | null }> };
+    expect(call.model).toBe('luna');
+    const parts = call.state as Array<{ type?: string; image_url?: { url: string } }>;
+    expect(parts.filter((p) => p.type === 'image_url')).toHaveLength(2);
+    expect(parts.find((p) => p.type === 'image_url')!.image_url!.url).toBe(`data:image/png;base64,${fs.readFileSync(CLEAN_PNG).toString('base64')}`);
+    const state = JSON.parse((call.state as string[])[0]!) as { claim: string[]; pages: Array<{ route: string; visibleText: string; renderedFiles: string[] | null }> };
     expect(state.claim).toEqual(['The reports page shows a total', 'The badge is green', 'A dark mode toggle exists']);
     expect(state.pages.map((p) => p.route)).toEqual(['/reports', '/manage/invoices/1']);
     expect(state.pages[0]!.visibleText).toBe('Reports Total billed: 535.75');
     expect(state.pages[0]!.renderedFiles).toEqual(['src/pages/Reports.vue']);
-    expect(Object.values(call.questions).map((q) => q.type)).toEqual(['noul', 'noul', 'noul']);
+    expect(Object.values(call.questions).map((q) => q.type)).toEqual(['noul', 'choice', 'noul', 'choice', 'noul', 'choice']);
     expect(call.questions.c1!.instructions).toContain('The badge is green');
 
     expect(report.criteria.map((c) => [c.result, c.probability])).toEqual([
@@ -92,12 +95,31 @@ describe('checkClaim', () => {
 
   it('keeps the model\'s window in mind: page text is trimmed per page', async () => {
     const client = new FakeClient(() => okResult({ c0: noul(0.9) }));
-    const big = Array.from({ length: 5 }, (_, i) => ({ route: `/r${i}`, visibleText: 'x'.repeat(8192), renderedFiles: null }));
+    const big = Array.from({ length: 60 }, (_, i) => ({ png: CLEAN_PNG, route: `/r${i}`, visibleText: '漢😀'.repeat(8192), renderedFiles: null }));
     await checkClaim({ source: 's', claim: 'one', pages: big, role: 'anonymous' }, opts(client));
-    const pages = (client.calls[0]!.state as { pages: Array<{ visibleText: string }> }).pages;
-    const total = pages.reduce((n, p) => n + p.visibleText.length, 0);
-    expect(total).toBeLessThan(30_000);
+    const pages = (JSON.parse((client.calls[0]!.state as string[])[0]!) as { pages: Array<{ visibleText: string }> }).pages;
+    const total = pages.reduce((n, p) => n + Buffer.byteLength(p.visibleText), 0);
+    expect(total).toBeLessThanOrEqual(24_000);
     expect(pages.every((p) => p.visibleText.length < 8192)).toBe(true);
+  });
+
+  it('reports a contradictory empty state as not visible with a reason, while a claim about the empty state can pass', async () => {
+    const client = new FakeClient((req) => {
+      expect(req.questions.c0!.instructions).toContain('empty state');
+      expect(req.questions.reason0!.instructions).toContain('no other page');
+      return okResult({ c0: noul(0.85), reason0: choice('empty_state', 0.95), c1: noul(0.95), reason1: choice('visible', 1) });
+    });
+    const report = await checkClaim({ source: 'claim.md', claim: '- Scanned members are listed with a remove icon\n- The page shows the empty state', pages: [{ ...PAGES[0]!, visibleText: 'No one currently scanned in' }], role: 'r' }, opts(client));
+    expect(report.criteria[0]).toMatchObject({ result: 'not visible', probability: 0.29, reason: expect.stringContaining('empty state contradicts') });
+    expect(report.criteria[1]).toMatchObject({ result: 'satisfied', probability: 0.95 });
+    expect(report.verdict).toBe('partial');
+  });
+
+  it('does not fall back to text when a screenshot cannot be read', async () => {
+    const client = new FakeClient(() => okResult({ c0: noul(0.99) }));
+    const report = await checkClaim({ source: 's', claim: '- a', pages: [{ ...PAGES[0]!, png: '/missing.png' }], role: 'r' }, opts(client));
+    expect(report).toMatchObject({ verdict: 'unknown', note: expect.stringContaining('cannot read screenshot') });
+    expect(client.calls).toHaveLength(0);
   });
 
   it('a criterion without an answer stops the overall verdict from claiming "satisfied"', async () => {

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import sharp from 'sharp';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DecisionBudget } from '../../src/decisions/budget.js';
@@ -11,13 +12,13 @@ import {
   describeImageCheck,
   imageCheckMessage,
 } from '../../src/decisions/image-check.js';
-import { FakeClient, choice, hang, okResult } from './decisions-helpers.js';
+import { CLEAN_PNG, FakeClient, choice, hang, okResult } from './decisions-helpers.js';
 import { tmpDir } from './helpers.js';
 
 const dir = tmpDir('vp-img-');
 const png = (name: string): string => {
   const file = path.join(dir, `${name}.png`);
-  fs.writeFileSync(file, Buffer.from(`png-bytes-${name}`));
+  fs.copyFileSync(CLEAN_PNG, file);
   return file;
 };
 const opts = (client: FakeClient, mode: 'fail' | 'warn' = 'warn', budgetMs = 5000) => ({
@@ -33,7 +34,7 @@ describe('image check', () => {
     await checkImages([{ png: png('a'), name: '/a' }], opts(client));
     const call = client.calls[0]!;
     expect(call.model).toBe('luna');
-    expect(call.state).toEqual([{ type: 'image_url', image_url: { url: `data:image/png;base64,${Buffer.from('png-bytes-a').toString('base64')}` } }]);
+    expect(call.state).toEqual([{ type: 'image_url', image_url: { url: `data:image/png;base64,${fs.readFileSync(CLEAN_PNG).toString('base64')}` } }]);
     expect(Object.keys(call.questions)).toEqual(['frame']);
     expect(call.questions.frame!.type).toBe('choice');
     expect(Object.keys(call.questions.frame!.criteria as object)).toEqual(['clean', 'loading', 'error', 'blank']);
@@ -66,7 +67,29 @@ describe('image check', () => {
     expect(check).toMatchObject({ label: 'error', confidence: 0.8, action: 'fail' });
   });
 
-  it('treats an answer from a request that read the image as text (input tokens over 2000) as unknown, and logs loudly', async () => {
+  it('checks a 1280x2420 full-page still using readable top detail and resized page context, even at 3.2k tokens', async () => {
+    const tall = path.join(dir, 'tall.png');
+    await sharp({ create: { width: 1280, height: 2420, channels: 3, background: '#ffffff' } }).png().toFile(tall);
+    const client = new FakeClient(() => okResult({ frame: choice('clean', 1) }, { inputTokens: 3200 }));
+    const [check] = await checkImages([{ png: tall, name: '/tall' }], opts(client));
+    expect(check).toMatchObject({ label: 'clean', action: 'none' });
+    const parts = (client.calls[0]!.state as Array<{ type?: string; image_url?: { url: string } }>).filter((p) => p.type === 'image_url');
+    expect(parts).toHaveLength(2);
+    const dimensions = await Promise.all(parts.map((p) => sharp(Buffer.from(p.image_url!.url.split(',')[1]!, 'base64')).metadata()));
+    expect(dimensions[0]).toMatchObject({ width: 1280, height: 800 });
+    expect(dimensions[1]).toMatchObject({ height: 1600 });
+    expect(dimensions[1]!.width).toBeLessThan(1280);
+  });
+
+  it('rejects a corrupt screenshot before a model call', async () => {
+    const broken = path.join(dir, 'broken.png');
+    fs.writeFileSync(broken, 'not a PNG');
+    const client = new FakeClient(() => okResult({ frame: choice('clean') }));
+    expect((await checkImages([{ png: broken, name: '/broken' }], opts(client)))[0]!.label).toBe('unknown');
+    expect(client.calls).toHaveLength(0);
+  });
+
+  it('treats an answer from a request that read the image as text (wildly inflated input tokens) as unknown, and logs loudly', async () => {
     const client = new FakeClient(() => okResult({ frame: choice('error', 0.95) }, { inputTokens: 17_233 }));
     const logs: string[] = [];
     const [check] = await checkImages([{ png: png('g'), name: '/g' }], { ...opts(client, 'fail'), log: (m) => logs.push(m) });
@@ -74,7 +97,7 @@ describe('image check', () => {
     expect(check!.note).toContain('17233 input tokens');
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('ERROR');
-    // The boundary: exactly 2000 is fine.
+    // The boundary: exactly the guard is fine.
     const edge = new FakeClient(() => okResult({ frame: choice('error', 0.95) }, { inputTokens: IMAGE_TOKEN_GUARD }));
     expect((await checkImages([{ png: png('e'), name: '/e' }], opts(edge, 'fail')))[0]!.action).toBe('fail');
   });

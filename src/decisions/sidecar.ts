@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { truncateUtf8 } from '../text.js';
 
-/** Characters of app-root text kept per frame for the claim check. */
+/** UTF-8 bytes of visible page text (including overlays) kept per frame for the claim check. */
 export const SIDECAR_TEXT_LIMIT = 8192;
 
 const SUFFIX = '.text.json';
@@ -12,14 +13,14 @@ export function textSidecarPath(pngPath: string): string {
 }
 
 /**
- * Keep the app root's visible text next to the frame's PNG (not in `index.jsonl`, which is read on every append).
+ * Keep visible page text next to the frame's PNG (not in `index.jsonl`, which is read on every append).
  * Best effort: a frame without a sidecar only means the claim check has no text for it.
  */
 export function writeTextSidecar(pngPath: string, text: string): void {
   const file = textSidecarPath(pngPath);
   const tmp = `${file}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, text: text.slice(0, SIDECAR_TEXT_LIMIT) })}\n`);
+    fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, text: truncateUtf8(text, SIDECAR_TEXT_LIMIT) })}\n`);
     fs.renameSync(tmp, file);
   } catch {
     fs.rmSync(tmp, { force: true });

@@ -948,7 +948,7 @@ export function recordFinish(
 export interface FinishCommandContext {
   configPath?: string;
   hook: boolean;
-  /** Print the {@link FinishResult} as JSON on stdout instead of the proof block path. */
+  /** Print the {@link FinishResult} as JSON instead of the proof block path and claim markdown. */
   json?: boolean;
   env: NodeJS.ProcessEnv;
   cwd?: string;
@@ -990,7 +990,10 @@ export async function finishCommand(ctx: FinishCommandContext): Promise<number> 
     return EXIT.OK;
   }
   if (ctx.json) out(`${JSON.stringify(result, null, 2)}\n`);
-  else out(`${result.proofBlockPath}\n`);
+  else {
+    out(`${result.proofBlockPath}\n`);
+    if (result.claim) out(`\n${renderClaimSection(result.claim).join('\n')}\n`);
+  }
   if (result.noScreenChanges) err(`visual-proof finish: no screen changes (diffed ${describeRange(result.range)})\n`);
   for (const failure of result.failures) err(`visual-proof finish: ${failure}\n`);
   for (const hint of result.hints) err(`visual-proof finish: hint: ${hint}\n`);

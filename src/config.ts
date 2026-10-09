@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import type { ConsoleConfig } from './console.js';
 import { parseDecisions, type DecisionsConfig } from './decisions/config.js';
 
 export const CONFIG_FILE_NAME = 'visual-proof.config.json';
@@ -131,6 +132,8 @@ export interface Config {
   backendGlobs: string[];
   login: LoginConfig;
   appRoot: string;
+  /** Ignore known console noise in captures and sidecar scenarios. Page exceptions remain failures. */
+  console: ConsoleConfig;
   spinnerSelectors: string[];
   /**
    * Routes (route keys or concrete paths) visited before the watcher reports `ready`, so Vite compiles and
@@ -270,6 +273,7 @@ export function parseConfig(
     backendGlobs: v.stringArray('backendGlobs') ?? [],
     login,
     appRoot: v.string('appRoot') ?? '#app',
+    console: parseConsole(v.object('console'), errors),
     spinnerSelectors: v.stringArray('spinnerSelectors') ?? ['.spinner', '[aria-busy=true]'],
     warmupRoutes: v.stringArray('warmupRoutes'),
     warmupBudgetMs: v.posInt('warmupBudgetMs') ?? DEFAULT_WARMUP_BUDGET_MS,
@@ -302,6 +306,33 @@ export function parseConfig(
 function hideSelectors(configured: string[] | undefined, replace: boolean): string[] {
   const extra = configured ?? [];
   return [...new Set(replace ? extra : [...DEFAULT_HIDE_SELECTORS, ...extra])];
+}
+
+function parseConsole(raw: Record<string, unknown> | undefined, errors: string[]): ConsoleConfig {
+  const v = new Validator(raw ?? {}, errors, 'console.');
+  const out: ConsoleConfig = { ignore: [], ignoreThirdPartyCsp: v.boolean('ignoreThirdPartyCsp') ?? true };
+  if (raw?.ignore === undefined) return out;
+  if (!Array.isArray(raw.ignore)) {
+    errors.push('"console.ignore" must be an array of { message, sourceUrl? } regex rules');
+    return out;
+  }
+  raw.ignore.forEach((rule, i) => {
+    if (!isRecord(rule)) {
+      errors.push(`"console.ignore[${i}]" must be an object { message, sourceUrl? }`);
+      return;
+    }
+    const entry = new Validator(rule, errors, `console.ignore[${i}].`);
+    const message = entry.string('message');
+    const sourceUrl = entry.string('sourceUrl');
+    if (rule.message === undefined) errors.push(`"console.ignore[${i}].message" is required`);
+    for (const key of ['message', 'sourceUrl'] as const) {
+      const value = rule[key];
+      if (typeof value !== 'string') continue;
+      try { new RegExp(value); } catch { errors.push(`"console.ignore[${i}].${key}" must be a valid regex`); }
+    }
+    if (message) out.ignore.push({ message, ...(sourceUrl ? { sourceUrl } : {}) });
+  });
+  return out;
 }
 
 function parseFixedTime(value: string | undefined, errors: string[]): string | undefined {

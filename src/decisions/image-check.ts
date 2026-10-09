@@ -1,13 +1,13 @@
-import fs from 'node:fs';
-import { choiceAnswer, choiceConfidence, imageState, type DecisionsApi } from './client.js';
+import { choiceAnswer, choiceConfidence, type DecisionsApi } from './client.js';
 import type { DecisionBudget } from './budget.js';
+import { prepareImage } from './images.js';
 
 export type ImageLabel = 'clean' | 'loading' | 'error' | 'blank';
 
 /** A non-clean answer at or above this confidence is acted on (fail or note). */
 export const IMAGE_CONFIDENCE_THRESHOLD = 0.7;
-/** A 1280x800 still costs about 1.2k input tokens. Far more means the image was read as text (wrong encoding). */
-export const IMAGE_TOKEN_GUARD = 2000;
+/** Room for viewport detail plus full-page context; only wildly inflated usage is rejected. */
+export const IMAGE_TOKEN_GUARD = 16_000;
 /** Concurrent image requests. */
 export const IMAGE_CONCURRENCY = 6;
 
@@ -78,15 +78,17 @@ async function checkOne(input: ImageCheckInput, options: ImageCheckOptions): Pro
   const unknown = (note: string): ImageCheck => ({ label: 'unknown', confidence: null, action: 'none', ms: Date.now() - started, note });
   if (options.budget.expired()) return unknown('skipped: decision budget exhausted');
 
-  let png: Buffer;
+  let state: unknown[];
   try {
-    png = fs.readFileSync(input.png);
+    const prepared = await options.budget.race(prepareImage(input.png));
+    if (prepared === 'timeout') return unknown('skipped: decision budget exhausted');
+    state = prepared;
   } catch (err) {
-    return unknown(`cannot read ${input.png}: ${(err as NodeJS.ErrnoException).code ?? 'error'}`);
+    return unknown(`cannot read ${input.png}: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}`);
   }
   const call = options.client.decide({
     model: options.model,
-    state: imageState(png),
+    state,
     questions: { frame: { type: 'choice', instructions: IMAGE_INSTRUCTIONS, criteria: IMAGE_CRITERIA } },
     signal: options.budget.signal,
   });
