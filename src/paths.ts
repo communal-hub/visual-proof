@@ -27,6 +27,9 @@ export function statusFiles(dirs: Dirs) {
     log: path.join(dirs.statusDir, 'watcher.log'),
     doctor: path.join(dirs.statusDir, 'doctor.json'),
     proofBlock: path.join(dirs.statusDir, 'proof-block.md'),
+    // v0.8 dynamic params: what the agent set, and what link discovery found this watcher session.
+    sessionParams: path.join(dirs.statusDir, 'session-params.json'),
+    paramDiscovery: path.join(dirs.statusDir, 'param-discovery.json'),
   };
 }
 

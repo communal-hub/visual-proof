@@ -437,10 +437,13 @@ function nearestRouteAncestor(node: ObjectNode): ObjectNode | null {
   return null;
 }
 
-/** The value of a plain string literal (no interpolation), else null. */
+/**
+ * The value of a plain string literal (no interpolation), else null. `\\`, `\'`, `\"` and `\`` escapes are decoded,
+ * which is what a Vue Router custom regex param needs: `'/users/:id(\\d+)'` is the route key `/users/:id(\d+)`.
+ */
 function literal(text: string): string | null {
-  const m = /^(['"`])([^'"`$\\]*)\1$/.exec(text);
-  return m ? m[2]! : null;
+  const m = /^(['"`])((?:[^'"`$\\]|\\[\\'"`])*)\1$/.exec(text);
+  return m ? m[2]!.replace(/\\(['"`\\])/g, '$1') : null;
 }
 
 function joinRoutePath(parent: string | null, own: string): string {
