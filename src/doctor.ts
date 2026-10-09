@@ -10,8 +10,10 @@ import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { normalizeDoctorReport } from './normalize.js';
+import { probeFfmpeg, type FfmpegInfo } from './replay.js';
 import { fillRoute, type JsonResponse } from './resolve/param-sources.js';
 import { loadRouteParams } from './resolve/route-params.js';
+import { findSidecarFiles, formatSidecarError, loadSidecar, validateSidecar } from './sidecar.js';
 import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
@@ -19,7 +21,7 @@ import { ViteHmrClient } from './trigger/vite-hmr.js';
 import { loadApiKey } from './decisions/client.js';
 import { describeDecisions, probeWithKey, type DecisionsProbe } from './decisions/doctor.js';
 
-export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'paramTiers' | 'renderCheck' | 'decisions';
+export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'paramTiers' | 'renderCheck' | 'decisions' | 'sidecars' | 'replay';
 /** `ok`: working at its best tier. `warn`: working at a fallback tier. `missing`: not working. `skipped`: not probed. */
 export type CapabilityStatus = 'ok' | 'warn' | 'missing' | 'skipped';
 
@@ -61,6 +63,8 @@ export interface Probes {
   appUp(config: Config, timeoutMs: number): Promise<boolean>;
   /** One tiny request per decisions model with the key from `env` (or `.env` next to the config). Rejects without a key. */
   probeDecisions(config: Config, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<DecisionsProbe>;
+  /** What ffmpeg (through `env.PATH`) can do: found, version, drawtext. */
+  ffmpeg(env: NodeJS.ProcessEnv): Promise<FfmpegInfo>;
 }
 
 export interface DoctorOptions {
@@ -86,6 +90,8 @@ export const CAPABILITY_ORDER: CapabilityName[] = [
   'paramTiers',
   'renderCheck',
   'decisions',
+  'sidecars',
+  'replay',
 ];
 
 const BROWSER_MS = 8000;
@@ -118,7 +124,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   const skipped = (reason: string): Capability => ({ tier: 'unknown', status: 'skipped', required: false, detail: reason });
   const cfg = invalid ? null : (config as Config);
 
-  const [git, browser, trigger, barrier, login, routes, paramTiers, decisions] = await Promise.all([
+  const [git, browser, trigger, barrier, login, routes, paramTiers, decisions, replay] = await Promise.all([
     checkGit(cfg),
     checkBrowser(probes, t.browserMs ?? BROWSER_MS),
     cfg ? checkTrigger(cfg, dirs) : { tier: 'none', status: 'missing' as const, required: true, detail: 'config is invalid, so the trigger globs are unknown' },
@@ -127,6 +133,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
     cfg ? checkRoutes(cfg, probes, t.routesMs ?? ROUTES_MS) : skipped('config is invalid'),
     cfg ? checkParamTiers(cfg, probes, t.routesMs ?? ROUTES_MS, t.paramsMs ?? PARAMS_MS) : skipped('config is invalid'),
     cfg ? checkDecisions(cfg, probes, opts.env ?? process.env, t.decisionsMs ?? DECISIONS_MS, opts.probeDecisions === true) : skipped('config is invalid'),
+    cfg ? checkReplay(cfg, probes, opts.env ?? process.env) : skipped('config is invalid'),
   ]);
   caps.git = git;
   caps.browser = browser;
@@ -139,6 +146,8 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   caps.paramTiers = paramTiers;
   caps.renderCheck = cfg ? checkRenderCheck(cfg) : skipped('config is invalid');
   caps.decisions = decisions;
+  caps.sidecars = cfg ? checkSidecars(cfg) : skipped('config is invalid');
+  caps.replay = replay;
 
   const ordered = {} as Record<CapabilityName, Capability>;
   for (const name of CAPABILITY_ORDER) ordered[name] = caps[name];
@@ -402,6 +411,51 @@ async function checkDecisions(config: Config, probes: Probes, env: NodeJS.Proces
   return { tier: result.tier, status: result.status, required: false, detail: result.detail };
 }
 
+/** The sidecar scenarios the globs find and whether they parse. Informational, never required. */
+function checkSidecars(config: Config): Capability {
+  const files = findSidecarFiles(config.repoDir, config.sidecars);
+  if (files.length === 0) {
+    return { tier: 'none', status: 'ok', required: false, detail: `no sidecar files match ${JSON.stringify(config.sidecars)}` };
+  }
+  const problems: string[] = [];
+  let stills = 0;
+  for (const file of files) {
+    const sidecar = loadSidecar(config.repoDir, file);
+    stills += sidecar.stills.length;
+    for (const error of validateSidecar(sidecar, config)) problems.push(formatSidecarError(file, error));
+  }
+  const found = `${files.length} scenario(s) found, ${stills} still(s)`;
+  if (problems.length > 0) {
+    const shown = problems.slice(0, 5).join('; ');
+    const more = problems.length > 5 ? ` (+${problems.length - 5} more)` : '';
+    return { tier: 'invalid', status: 'missing', required: false, detail: `${found}; ${problems.length} parse error(s): ${shown}${more}` };
+  }
+  return { tier: 'files', status: 'ok', required: false, detail: `${found}, 0 parse errors` };
+}
+
+/** Whether `finish` can build the replay video: ffmpeg on PATH, its version, and drawtext for captions. Never required. */
+async function checkReplay(config: Config, probes: Probes, env: NodeJS.ProcessEnv): Promise<Capability> {
+  if (!config.replay.enabled) {
+    return { tier: 'off', status: 'ok', required: false, detail: 'replay.enabled is false; finish builds no replay video' };
+  }
+  let info: FfmpegInfo;
+  try {
+    info = await withTimeout(probes.ffmpeg(env), 25_000, 'ffmpeg probe');
+  } catch (err) {
+    return { tier: 'none', status: 'warn', required: false, detail: `could not probe ffmpeg: ${firstLine(err)}` };
+  }
+  if (!info.found) {
+    return { tier: 'none', status: 'warn', required: false, detail: `${info.reason ?? 'ffmpeg not found'}; finish skips the replay video` };
+  }
+  if (!info.x264) {
+    return { tier: 'no-x264', status: 'warn', required: false, detail: `ffmpeg ${info.version}: no libx264 encoder; finish skips the replay video` };
+  }
+  if (!info.drawtext) {
+    return { tier: 'no-captions', status: 'warn', required: false, detail: `ffmpeg ${info.version}: drawtext unavailable (${info.reason ?? 'unknown'}); the replay is built without captions` };
+  }
+  return { tier: 'ffmpeg', status: 'ok', required: false, detail: `ffmpeg ${info.version}, drawtext available${info.fontfile ? ` (font ${info.fontfile})` : ''}` };
+}
+
 function entries(n: number): string {
   return n === 1 ? 'entry' : 'entries';
 }
@@ -459,6 +513,7 @@ const defaultProbes: Probes = {
   },
 
   probeDecisions: (config, env, timeoutMs) => probeWithKey(env, config.repoDir, config.decisions.models, timeoutMs),
+  ffmpeg: (env) => probeFfmpeg(env),
 
   async getJson(config, paths, timeoutMs) {
     const deadline = Date.now() + timeoutMs;

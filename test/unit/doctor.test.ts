@@ -35,6 +35,7 @@ const greenProbes = (): Probes => ({
   probeDecisions: async () => {
     throw new Error('no probe in this test');
   },
+  ffmpeg: async () => ({ found: true, version: '7.1', drawtext: true, x264: true }),
 });
 
 function configure(extra: Record<string, unknown> = {}): Config {
@@ -74,7 +75,7 @@ describe('runDoctor', () => {
   it('reports every capability, writes doctor.json, and is ok when all probes pass', async () => {
     const report = await doctor(configure());
     expect(report.ok).toBe(true);
-    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'paramTiers', 'renderCheck', 'decisions']);
+    expect(Object.keys(report.capabilities)).toEqual(['config', 'git', 'browser', 'trigger', 'barrier', 'freshness', 'login', 'routes', 'params', 'paramTiers', 'renderCheck', 'decisions', 'sidecars', 'replay']);
     expect(report.capabilities).toMatchObject({
       config: { tier: 'valid', status: 'ok' },
       git: { tier: 'repo', status: 'ok' },
@@ -534,11 +535,91 @@ describe('decisions', () => {
   });
 });
 
+describe('sidecars capability', () => {
+  it('is ok with no scenarios', async () => {
+    const report = await doctor(configure());
+    expect(report.capabilities.sidecars).toMatchObject({
+      tier: 'none',
+      status: 'ok',
+      required: false,
+      detail: 'no sidecar files match [".visual-proof/sidecars/*.vp"]',
+    });
+  });
+
+  it('counts scenarios and stills', async () => {
+    write(repo, '.visual-proof/sidecars/a.vp', 'goto /\nstill one\nstill two\n');
+    write(repo, '.visual-proof/sidecars/b.vp', '# b\ngoto /x\nstill b\n');
+    const report = await doctor(configure());
+    expect(report.capabilities.sidecars).toMatchObject({ tier: 'files', status: 'ok', detail: '2 scenario(s) found, 3 still(s), 0 parse errors' });
+  });
+
+  it('reports parse errors with file and line, and unknown roles', async () => {
+    write(repo, '.visual-proof/sidecars/bad.vp', 'goto /\nclik [x]\nlogin ghost\nstill s\n');
+    const report = await doctor(configure({ roles: { finance: 'f@b.test' } }));
+    expect(report.capabilities.sidecars.tier).toBe('invalid');
+    expect(report.capabilities.sidecars.status).toBe('missing');
+    expect(report.capabilities.sidecars.required).toBe(false);
+    expect(report.capabilities.sidecars.detail).toContain('2 parse error(s)');
+    expect(report.capabilities.sidecars.detail).toContain('.visual-proof/sidecars/bad.vp:2: unknown verb "clik"');
+    expect(report.capabilities.sidecars.detail).toContain('bad.vp:3: unknown role "ghost" (known: default, finance');
+    expect(report.ok).toBe(true); // never required
+  });
+
+  it('honours the sidecars globs', async () => {
+    write(repo, 'scenarios/a.vp', 'goto /\nstill one\n');
+    const report = await doctor(configure({ sidecars: ['scenarios/*.vp'] }));
+    expect(report.capabilities.sidecars.detail).toContain('1 scenario(s) found');
+  });
+});
+
+describe('replay capability', () => {
+  it('reports ffmpeg, its version and drawtext', async () => {
+    const report = await doctor(configure());
+    expect(report.capabilities.replay).toMatchObject({ tier: 'ffmpeg', status: 'ok', required: false, detail: 'ffmpeg 7.1, drawtext available' });
+  });
+
+  it('warns when ffmpeg is not found, without failing the run', async () => {
+    const report = await doctor(configure(), { probes: { ffmpeg: async () => ({ found: false, drawtext: false, x264: false, reason: 'ffmpeg not found' }) } });
+    expect(report.capabilities.replay).toMatchObject({ tier: 'none', status: 'warn', required: false });
+    expect(report.capabilities.replay.detail).toContain('ffmpeg not found');
+    expect(report.ok).toBe(true);
+  });
+
+  it('warns when drawtext is unavailable: the replay is built without captions', async () => {
+    const report = await doctor(configure(), {
+      probes: { ffmpeg: async () => ({ found: true, version: '6.0', drawtext: false, x264: true, reason: 'this ffmpeg has no drawtext filter (built without libfreetype)' }) },
+    });
+    expect(report.capabilities.replay).toMatchObject({ tier: 'no-captions', status: 'warn' });
+    expect(report.capabilities.replay.detail).toContain('ffmpeg 6.0');
+    expect(report.capabilities.replay.detail).toContain('without captions');
+  });
+
+  it('warns without libx264', async () => {
+    const report = await doctor(configure(), { probes: { ffmpeg: async () => ({ found: true, version: '6.0', drawtext: true, x264: false }) } });
+    expect(report.capabilities.replay).toMatchObject({ tier: 'no-x264', status: 'warn' });
+  });
+
+  it('does not probe when replay.enabled is false', async () => {
+    let probed = false;
+    const report = await doctor(configure({ replay: { enabled: false } }), {
+      probes: { ffmpeg: async () => { probed = true; return { found: true, drawtext: true, x264: true }; } },
+    });
+    expect(probed).toBe(false);
+    expect(report.capabilities.replay).toMatchObject({ tier: 'off', status: 'ok' });
+  });
+
+  it('a probe that throws is a warning, not a crash', async () => {
+    const report = await doctor(configure(), { probes: { ffmpeg: async () => Promise.reject(new Error('spawn exploded')) } });
+    expect(report.capabilities.replay).toMatchObject({ tier: 'none', status: 'warn' });
+    expect(report.capabilities.replay.detail).toContain('spawn exploded');
+  });
+});
+
 describe('formatReport and doctorCommand', () => {
   it('prints one aligned row per capability', async () => {
     const text = formatReport(await doctor(configure({ screenGlobs: ['nothing/**'] })));
     const lines = text.trimEnd().split('\n');
-    expect(lines).toHaveLength(13);
+    expect(lines).toHaveLength(15);
     expect(lines[0]).toMatch(/^capability\s+tier\s+status\s+detail$/);
     expect(lines.find((l) => l.startsWith('trigger'))).toMatch(/^trigger\s+fs-watch\s+MISSING\s+no files match/);
     // Columns line up: every row's tier column starts at the same offset.

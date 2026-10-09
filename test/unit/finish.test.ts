@@ -6,6 +6,7 @@ import { finishCommand, routeSlug, runFinish, type FinishResult } from '../../sr
 import { headTree } from '../../src/git.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
+import { sidecarRoute } from '../../src/sidecar.js';
 import { Timeline, type NewFrame } from '../../src/timeline.js';
 import type { FrameStatus } from '../../src/triage.js';
 import { commitAll, git, initRepo, tmpDir, write } from './helpers.js';
@@ -43,6 +44,7 @@ function configure(extra: Record<string, unknown> = {}): void {
       backendGlobs: ['server/**'],
       routeParams: { '/b/:id': '/b/1' },
       baseRef: 'main',
+      replay: { enabled: false }, // the replay video has its own tests; the PNGs here are not real images
       ...extra,
     },
     repo,
@@ -897,5 +899,154 @@ describe('render check', () => {
     await frame('/a', 'clean', RENDERED('src/App.vue'), );
     const result = await finish();
     expect(result.failures).toEqual([]);
+  });
+});
+
+describe('sidecar scenarios in finish', () => {
+  const SC = '.visual-proof/sidecars/refund.vp';
+  const GRAPH_SC = graph({ 'src/pages/A.vue': ['/a'], 'src/shared/S.vue': ['/a', '/c'], 'src/pages/Home.vue': ['/'] });
+  const finishSc = (opts: Parameters<typeof runFinish>[1] = {}) => finish({ buildGraph: async () => GRAPH_SC, ...opts });
+  const stillFrame = (still: string, status: FrameStatus = 'clean', extra: Partial<NewFrame> & { tree?: string } = {}) =>
+    frame(sidecarRoute(SC, still), status, { sourceFile: SC, trigger: 'sidecar', steps: [{ line: 1, text: 'goto /a' }], ...extra });
+  const scenario = (body = 'goto /a\nclick [data-test=x]\nstill modal\nstill after\n') => write(repo, SC, body);
+
+  it('a touched sidecar expects every still, which must be clean at HEAD; proof block lists them after route stills', async () => {
+    scenario();
+    editAndCommit('src/pages/A.vue');
+    await frame('/a');
+    await stillFrame('modal');
+    await stillFrame('after');
+    const result = await finishSc();
+    expect(result.failures).toEqual([]);
+    expect(result.routes.map((r) => [r.via, r.route])).toEqual([
+      ['screen', '/a'],
+      ['sidecar', sidecarRoute(SC, 'modal')],
+      ['sidecar', sidecarRoute(SC, 'after')],
+    ]);
+    const block = fs.readFileSync(result.proofBlockPath, 'utf8');
+    expect(block.indexOf('alt="/a"')).toBeLessThan(block.indexOf('alt="sidecar refund / modal"'));
+    expect(block.indexOf('alt="sidecar refund / modal"')).toBeLessThan(block.indexOf('alt="sidecar refund / after"'));
+    const short = result.treeHash!.slice(0, 8);
+    expect(fs.existsSync(path.join(dirs.artifactDir, `sidecar-refund-modal-${short}.png`))).toBe(true);
+  });
+
+  it('a sidecar alone is a proof (no screen change needed)', async () => {
+    scenario('goto /a\nstill modal\n');
+    commitAll(repo, 'add sidecar');
+    await stillFrame('modal');
+    const result = await finishSc();
+    expect(result).toMatchObject({ ok: true, failures: [], noScreenChanges: false });
+    expect(result.routes).toHaveLength(1);
+  });
+
+  it('fails per still: no frame at HEAD, and a final frame that is not clean, quoting the step failure', async () => {
+    scenario();
+    commitAll(repo, 'add sidecar');
+    await stillFrame('modal', 'error', { reasons: ['line 2 click [data-test=x]: selector not found'] });
+    const result = await finishSc();
+    expect(result.ok).toBe(false);
+    expect(result.failures).toEqual([
+      `sidecar ${SC} still modal: final frame is error: line 2 click [data-test=x]: selector not found`,
+      `sidecar ${SC} still after: no frame at HEAD`,
+    ]);
+  });
+
+  it('a frame at another tree is no frame at HEAD', async () => {
+    scenario('goto /a\nstill modal\n');
+    commitAll(repo, 'add sidecar');
+    await stillFrame('modal', 'clean', { tree: 'f'.repeat(40) });
+    expect((await finishSc()).failures).toEqual([`sidecar ${SC} still modal: no frame at HEAD`]);
+  });
+
+  it('a step that failed after the last still fails the scenario, unless a newer run passed', async () => {
+    scenario('goto /a\nstill modal\nclick [x]\n');
+    commitAll(repo, 'add sidecar');
+    await stillFrame('modal');
+    await frame(sidecarRoute(SC, '!failed'), 'error', { sourceFile: SC, trigger: 'sidecar', reasons: ['line 3 click [x]: selector not found'] });
+    expect((await finishSc()).failures).toEqual([`sidecar ${SC}: final frame is error: line 3 click [x]: selector not found`]);
+    await stillFrame('modal'); // a later run got through
+    expect((await finishSc()).failures).toEqual([]);
+  });
+
+  it('parse errors fail with file:line and no frames are needed', async () => {
+    scenario('goto /a\nclik [x]\nstill s\n');
+    commitAll(repo, 'add sidecar');
+    const result = await finishSc();
+    expect(result.failures).toEqual([`sidecar ${SC}:2: unknown verb "clik" (the verbs are goto, click, fill, press, wait, still, login)`]);
+    expect(result.routes).toEqual([]);
+  });
+
+  it('an untouched sidecar becomes expected when a route it visits is expected; one for another route stays out', async () => {
+    scenario('goto /a\nstill modal\n');
+    write(repo, '.visual-proof/sidecars/other.vp', 'goto /\nstill home\n');
+    commitAll(repo, 'sidecars');
+    git(repo, 'branch', '-f', 'main', 'HEAD');
+    editAndCommit('src/pages/A.vue');
+    await frame('/a');
+    await stillFrame('modal');
+    const result = await finishSc();
+    expect(result.failures).toEqual([]);
+    expect(result.routes.map((r) => r.route)).toEqual(['/a', sidecarRoute(SC, 'modal')]);
+    expect(result.notes).toContain(`sidecar ${SC}: visits /a`);
+  });
+
+  it('a sidecar that is not at HEAD (uncommitted or deleted) is not expected', async () => {
+    editAndCommit('src/pages/A.vue');
+    scenario(); // written, not committed
+    await frame('/a');
+    expect((await finishSc()).failures).toEqual([]);
+    expect((await finishSc()).routes.map((r) => r.via)).toEqual(['screen']);
+  });
+
+  it('only a deleted sidecar changed: nothing to prove', async () => {
+    scenario('goto /a\nstill modal\n');
+    commitAll(repo, 'add');
+    git(repo, 'branch', '-f', 'main', 'HEAD');
+    fs.rmSync(path.join(repo, SC));
+    commitAll(repo, 'delete');
+    expect(await finishSc()).toMatchObject({ ok: true, noScreenChanges: true });
+  });
+
+  it('login with an unknown role is a parse-style failure naming the role', async () => {
+    configure({ login: { type: 'http-hook', url: '/l', email: 'a@b.test' }, roles: { finance: 'f@b.test' } });
+    scenario('goto /a\nlogin ghost\nstill s\n');
+    commitAll(repo, 'add sidecar');
+    const result = await finishSc();
+    expect(result.failures).toEqual([`sidecar ${SC}:2: unknown role "ghost" (known: default, finance; add it to "roles")`]);
+  });
+
+  it('backend changes do not treat sidecar frames as routes to re-prove', async () => {
+    scenario('goto /a\nstill modal\n');
+    write(repo, 'server/data.json', '{"n":1}\n');
+    commitAll(repo, 'backend + sidecar');
+    await frame('/a');
+    await stillFrame('modal');
+    const result = await finishSc();
+    expect(result.failures).toEqual([]);
+    expect(result.notes.filter((n) => n.includes('no longer resolves'))).toEqual([]);
+  });
+
+  describe('the render check', () => {
+    const MODAL_GRAPH = graph({ 'src/pages/A.vue': ['/a'], 'src/components/Modal.vue': ['/a'] });
+    it('counts a sidecar still that rendered the changed component', async () => {
+      scenario('goto /a\nstill modal\n');
+      write(repo, 'src/components/Modal.vue', '<template>m</template>\n');
+      commitAll(repo, 'modal + sidecar');
+      await frame('/a', 'clean', { renderedFiles: ['src/pages/A.vue'] });
+      await stillFrame('modal', 'clean', { renderedFiles: ['src/pages/A.vue', 'src/components/Modal.vue'] });
+      const result = await finish({ buildGraph: async () => MODAL_GRAPH });
+      expect(result.failures).toEqual([]);
+      expect(result.notes).toContain(`src/components/Modal.vue rendered in sidecar ${SC} still modal`);
+    });
+
+    it('still fails when neither the route nor any sidecar still rendered it', async () => {
+      scenario('goto /a\nstill modal\n');
+      write(repo, 'src/components/Modal.vue', '<template>m</template>\n');
+      commitAll(repo, 'modal + sidecar');
+      await frame('/a', 'clean', { renderedFiles: ['src/pages/A.vue'] });
+      await stillFrame('modal', 'clean', { renderedFiles: ['src/pages/A.vue'] });
+      const result = await finish({ buildGraph: async () => MODAL_GRAPH });
+      expect(result.failures).toEqual([expect.stringContaining('src/components/Modal.vue never rendered on /a')]);
+    });
   });
 });
