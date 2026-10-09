@@ -1,0 +1,78 @@
+{
+  "claim": {
+    "source": "regression-claim.md",
+    "criteria": [
+      {
+        "text": "The archive-modal page warns that archiving will also archive 3 promotion codes.",
+        "probability": 1,
+        "result": "satisfied",
+        "reason": "The screenshots or visible text show the criterion."
+      },
+      {
+        "text": "The icon-controls page shows an icon-only camera button for uploading a photo.",
+        "probability": 1,
+        "result": "satisfied",
+        "reason": "The screenshots or visible text show the criterion."
+      },
+      {
+        "text": "The icon-controls page shows a green Active badge.",
+        "probability": 1,
+        "result": "satisfied",
+        "reason": "The screenshots or visible text show the criterion."
+      },
+      {
+        "text": "The tall-invoice page visibly shows Invoice total: $535.75 at the bottom.",
+        "probability": 1,
+        "result": "satisfied",
+        "reason": "The screenshots or visible text show the criterion."
+      },
+      {
+        "text": "The empty-scans page lists currently scanned members with a remove button on each row.",
+        "probability": 0,
+        "result": "not visible",
+        "reason": "A visible empty state contradicts the claim; the required content is absent."
+      },
+      {
+        "text": "The empty-scans page shows at least one scanned member.",
+        "probability": 0,
+        "result": "not visible",
+        "reason": "A visible empty state contradicts the claim; the required content is absent."
+      }
+    ],
+    "verdict": "partial",
+    "routes": [
+      "/archive-modal",
+      "/icon-controls",
+      "/tall-invoice",
+      "/empty-scans"
+    ],
+    "role": "anonymous",
+    "model": "openai/gpt-6-luna-decisions-20261006"
+  },
+  "imageChecks": [
+    {
+      "label": "clean",
+      "confidence": 1,
+      "action": "none",
+      "model": "openai/gpt-6-luna-decisions-20261006",
+      "ms": 625
+    },
+    {
+      "label": "clean",
+      "confidence": 1,
+      "action": "none",
+      "model": "openai/gpt-6-luna-decisions-20261006",
+      "ms": 364
+    }
+  ],
+  "stats": {
+    "requests": 3,
+    "failed": 0,
+    "retries": 0,
+    "ms": 1615,
+    "cost": 0.0012739000000000001,
+    "inputTokens": 12739
+  },
+  "budgetMs": 20000,
+  "elapsedMs": 653
+}

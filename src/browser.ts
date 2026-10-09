@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { chromium, type Browser as PwBrowser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import type { Config } from './config.js';
+import { consoleErrorFilter } from './console.js';
 import { SIDECAR_TEXT_LIMIT } from './decisions/sidecar.js';
 import { firstLine } from './text.js';
 import { hostBlocker } from './hosts.js';
@@ -11,11 +12,11 @@ import { FAILED_STILL, roleEmail, type SidecarStep } from './sidecar.js';
 import type { FrameStep } from './timeline.js';
 import type { TriageSignals } from './triage.js';
 
-/** Max characters of app-root text kept on a capture. */
+/** Max characters of visible page text kept on a capture's triage signals. */
 export const TEXT_EXCERPT_LIMIT = 2048;
 
 export interface CaptureSignals extends TriageSignals {
-  /** `innerText` of the app root, trimmed and cut to {@link TEXT_EXCERPT_LIMIT} characters. */
+  /** Visible page text including overlays, trimmed and cut to {@link TEXT_EXCERPT_LIMIT} characters. */
   text: string;
 }
 
@@ -48,7 +49,7 @@ export interface CaptureResult {
   signals: CaptureSignals;
   /** URL the page ended on after redirects and client-side routing. */
   finalUrl: string;
-  /** Up to 8 KB of the app root's visible text (A4 decisions: stored in a sidecar next to the PNG); absent from fakes. */
+  /** Up to 8 KiB of visible page text including overlays (stored next to the PNG); absent from fakes. */
   pageText?: string;
   /** Absent from capturers that do not prepare the page (test fakes). */
   layout?: CaptureLayout;
@@ -180,6 +181,7 @@ export type BrowserConfig = Pick<
   | 'viewport'
   | 'login'
   | 'appRoot'
+  | 'console'
   | 'spinnerSelectors'
   | 'scrollContainer'
   | 'maxCaptureHeight'
@@ -239,6 +241,7 @@ export class Browser implements Capturer {
   private readonly pages = new Set<Page>();
   /** True for request URLs the configured `blockHosts` / `allowHosts` abort. */
   private readonly isBlocked: (url: string) => boolean;
+  private readonly ignoreConsoleError: (message: string, sourceUrl: string) => boolean;
   private blockedCount = 0;
   /** Mask selectors already reported as invalid, so the log says it once. */
   private readonly badMasks = new Set<string>();
@@ -249,6 +252,7 @@ export class Browser implements Capturer {
     private readonly config: BrowserConfig,
     private readonly options: BrowserOptions = {},
   ) {
+    this.ignoreConsoleError = consoleErrorFilter(config.console, config.appUrl);
     this.isBlocked = hostBlocker({
       blockHosts: config.blockHosts,
       allowHosts: config.allowHosts,
@@ -522,6 +526,7 @@ export class Browser implements Capturer {
       if (msg.type() !== 'error') return;
       // Chromium reports a request we aborted ourselves as a failed resource load; that is not the app's error.
       if (/net::ERR_(FAILED|BLOCKED_BY_CLIENT)/.test(msg.text()) && this.isBlocked(msg.location().url)) return;
+      if (this.ignoreConsoleError(msg.text(), msg.location().url)) return;
       watched.consoleErrors.push(msg.text());
     });
     page.on('pageerror', (err) => watched.pageErrors.push(err.message || String(err)));
@@ -1196,7 +1201,7 @@ function emptyDom(): Dom {
 }
 
 /** Null when the page navigated away mid-read (execution context destroyed). */
-async function readDom(
+export async function readDom(
   page: Page,
   appRoot: string,
   spinnerSelectors: string[],
@@ -1208,6 +1213,7 @@ async function readDom(
     const limit = ${TEXT_EXCERPT_LIMIT};
     const fullLimit = ${SIDECAR_TEXT_LIMIT};
     const isVisible = (el) => {
+      if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
       const style = getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
       const rect = el.getBoundingClientRect();
@@ -1227,13 +1233,31 @@ async function readDom(
         // Invalid selector in config: ignore it rather than failing the capture.
       }
     }
-    const text = root instanceof HTMLElement ? root.innerText.replace(/\\s+/g, ' ').trim() : '';
+    // Portals may sit inside a zero-sized body wrapper. Check dialogs independently of that wrapper.
+    const candidates = [...new Set([...document.querySelectorAll('[role="dialog"], [aria-modal="true"], .modal.show'), ...document.body.children])]
+      .filter((el) => el instanceof HTMLElement && !['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(el.tagName)
+        && el !== root && !root?.contains(el) && !el.contains(root) && isVisible(el));
+    const outside = candidates.filter((el) => !candidates.some((other) => other !== el && other.contains(el)));
+    // Put overlays first so a long app page cannot consume their entire text budget.
+    const text = [...outside, ...(root instanceof HTMLElement && isVisible(root) ? [root] : [])]
+      .map((el) => el.innerText.replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' ');
+    const cut = (value, bytes) => {
+      let used = 0;
+      let result = '';
+      const encoder = new TextEncoder();
+      for (const char of value) {
+        used += encoder.encode(char).length;
+        if (used > bytes) break;
+        result += char;
+      }
+      return result;
+    };
     return {
       appRootPresent: root !== null,
       appRootChildCount: root ? root.childElementCount : 0,
       visibleSpinnerCount: spinners,
       text: text.slice(0, limit),
-      fullText: text.slice(0, fullLimit),
+      fullText: cut(text, fullLimit),
     };
   })()`;
   try {

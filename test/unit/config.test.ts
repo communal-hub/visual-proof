@@ -35,6 +35,7 @@ describe('loadConfig', () => {
       backendGlobs: [],
       login: { type: 'none', tokenHeader: 'X-Visual-Proof-Token' },
       appRoot: '#app',
+      console: { ignore: [], ignoreThirdPartyCsp: true },
       spinnerSelectors: ['.spinner', '[aria-busy=true]'],
       maxFrames: 200,
       finishBudgetMs: 25_000,

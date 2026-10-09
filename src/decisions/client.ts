@@ -60,7 +60,7 @@ export interface DecisionUsage {
 export interface DecisionRequest {
   /** Model id as configured; the answer reports the id it resolved to. */
   model: string;
-  /** Text/JSON for a text model, or an array of `image_url` parts for an image model. */
+  /** Text/JSON for a text model, or an array of plain text strings and `image_url` parts for a vision model. */
   state: unknown;
   questions: Record<string, Question>;
   /** Aborts the request (and any retry back-off), e.g. when a decision budget runs out. */

@@ -441,6 +441,26 @@ hosts (a configured `blockHosts` replaces the defaults):
 `allowHosts` carves exceptions out of the list; `"blockHosts": ["*"]` with an `allowHosts` list blocks
 everything but the app and the listed hosts; `"blockHosts": []` blocks nothing.
 
+## Console noise
+
+`console.ignore` rules apply wherever browser console errors are collected, including watcher captures and
+sidecar replays in separate processes. No `NODE_OPTIONS` preload is needed. Each rule has a JavaScript regex
+string `message` and an optional regex string `sourceUrl` matching Playwright's console source location:
+
+```json
+{
+  "console": {
+    "ignore": [{ "message": "^Known vendor warning", "sourceUrl": "^https://cdn\\.example\\.com/" }],
+    "ignoreThirdPartyCsp": true
+  }
+}
+```
+
+By default only third-party inline-style CSP violations with a known HTTP(S) source outside `appUrl`'s origin
+are ignored. Errors from the app origin, unknown sources, CSP script violations and uncaught page exceptions
+remain failures. Set `console.ignoreThirdPartyCsp: false` to disable the built-in rule. Additional rules should
+match specific known noise; no new console config is required for community-management's third-party CSP noise.
+
 ## Settle and latency
 
 A page counts as loaded when `load` has fired, no request has been in flight for `settle.networkIdleMs`
@@ -553,7 +573,7 @@ retry on 429/5xx (honoring `retry-after`); the key never appears in logs, notes 
     "prune": { "above": 6, "keep": 4 },
     "verdict": true,
     "captions": true,
-    "budgetMs": 10000
+    "budgetMs": 20000
   },
   "claimFile": "docs/claim.md"
 }
@@ -562,22 +582,24 @@ retry on 429/5xx (honoring `retry-after`); the key never appears in logs, notes 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | on when a key exists | `false` never makes a request (cached prune decisions still apply); `true` without a key adds a note to the proof block |
-| `models.triage` | `openai/gpt-6-luna-decisions-20261006` | image model (pinned) for the image check |
-| `models.text` | `typesafe/jev-1.13` | text model (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the dated id is what answers) for pruning, claim and captions |
-| `triage` | `warn` | `fail`, `warn` or `off`: what a non-clean image check does; `off` sends no image requests |
+| `models.triage` | `openai/gpt-6-luna-decisions-20261006` | vision model (pinned) for the image check and claim criteria |
+| `models.text` | `typesafe/jev-1.13` | text model (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the dated id is what answers) for pruning and captions |
+| `triage` | `warn` | `fail`, `warn` or `off`: what a non-clean image check does; `off` disables frame triage; claims still use images when `verdict` is on |
 | `prune` | `{ above: 6, keep: 4 }` | prune when one changed file fans out to more than `above` routes, keeping the `keep` likeliest; `false` disables |
 | `verdict` | `true` | advisory claim check against `claimFile` |
 | `captions` | `true` | a caption under each headline still |
-| `budgetMs` | `10000` | time all decisions of one `finish` share; unfinished work is skipped with a note |
+| `budgetMs` | `20000` | time all decisions of one `finish` share; unfinished work is skipped with a note |
 
 **Image check.** Each headline frame the DOM heuristics call `clean` is shown to the image model as a `choice`
 between `clean`, `loading`, `error` and `blank` (DOM says fine, the pixels may not). One request per frame, up to 6
 at a time. A non-clean answer with confidence 0.7 or more fails `finish` with
 `<route> looks <label> to the image check (<confidence>)` (`triage: "fail"`) or becomes a note (`"warn"`, the
 default). The answer is recorded on the route in the proof block and in `--json` (`routes[].imageCheck`). An empty
-state with an explicit message ("No invoices yet") counts as clean. If an image request reports more than 2000
-input tokens, the image was read as text (a wrong-encoding regression): it is logged loudly in `watcher.log`, noted,
-and the answer is ignored.
+state with an explicit message ("No invoices yet") counts as clean for page health. It can still contradict a claim.
+Stills taller than 1600 px or wider than 1280 px are sent as a readable top-of-viewport crop (up to 1280×800)
+plus a resized full page (fits 1280×1600). The saved proof PNG stays at its original resolution. Corrupt PNGs,
+files over 20 MiB and decoded images over 64 megapixels are rejected before a request. Only wildly inflated
+image-check usage (over 16,000 input tokens) is ignored and logged; normal tall stills are checked.
 
 **Route pruning.** When one changed file fans out to more than `prune.above` routes, one text request asks, per
 route, whether the change visibly affects it; the `prune.keep` likeliest and anything at 0.5 or more are kept. A
@@ -588,19 +610,30 @@ nothing. Pruned routes are listed in the notes.
 
 **Claim check (advisory).** `finish` reads the claim (`claimFile`, default `<statusDir>/claim.md`; missing means a
 note), splits it into criteria in code (bullet or numbered lines; otherwise the whole text is one criterion) and asks
-one `noul` per criterion against the headline pages' visible text (up to 8 KB of the app root's text per frame, kept
-in `frames/<id>.text.json` next to the PNG) and rendered component files. 0.7 or more is `satisfied`, below 0.3
-`not visible`, else `partial`; the overall verdict is derived in code. It never fails `finish`. The model reads text,
-so colors and layout are not visible to it. The proof block gets a "Claim check (advisory)" section ending with
-`Advisory — reviewer decides.`
+one `noul` and a typed reason per criterion against **every clean headline screenshot** and visible page text.
+Claims use `models.triage` (Luna), including when frame triage is off; Jev remains the text model for pruning
+and captions. Text includes visible dialogs and other body overlays outside `appRoot`, deduplicated with overlay
+text first, capped at 8 KiB per frame and 24 KiB across claim pages. Component filenames provide context, never
+proof of visible behavior. Colors, layout and icon-only controls are judged from pixels.
+
+0.70 or more is `satisfied`, below 0.30 `not visible`, else `partial`; the overall computation is unchanged.
+A high-confidence reason that an empty state contradicts the criterion caps its probability below 0.30.
+A claim about the empty-state message itself can still be satisfied. Claim checks are advisory and never fail
+`finish`. The proof block and normal `finish` stdout include a ready-to-paste "Claim check (advisory)" markdown
+block with criterion reasons; `--json` and `--hook` retain their output formats. Missing screenshots or budget
+exhaustion produce `unknown` with a note rather than an unsupported text-only verdict.
+
+The shared decision budget defaults to 20 s; the claim request gets at most 15 s within that budget and finish's
+own deadline. Other requests retain the 8 s timeout. Claims exceeding 128 prepared images or 64 MiB of encoded
+state are skipped with an explicit note.
 
 **Captions.** Three to five candidate captions are built in code (route title from the route file's `title`, else the
 path; changed file names; style, template or script change from the diff); the text model picks one, shown under
 the still. Without a key, or on failure, the first template is used.
 
 **Accounting.** The proof block ends with `decisions: N requests, M ms, $cost` (M is wall time inside decision phases,
-which run concurrently). One finish makes one image request per headline frame plus at most three text requests
-(prune on a cache miss, claim, captions), about 1.2k input tokens and $0.00012 per image and about $0.00002 per
+which run concurrently). One finish makes one image request per headline frame plus one vision claim request and at most two text requests
+(prune on a cache miss, captions), about 1.2k input tokens and $0.00012 per image and about $0.00002 per
 text request.
 
 `doctor` has a `decisions` row: key present (and from where), the mode summary, and, with `doctor --probe-decisions`

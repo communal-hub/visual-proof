@@ -27,6 +27,7 @@
     "chokidar": "^5.0.0",
     "es-module-lexer": "^3.0.3",
     "picomatch": "^4.0.7",
+    "sharp": "^0.35.5",
     "ws": "^8.22.0"
   },
   "peerDependencies": {

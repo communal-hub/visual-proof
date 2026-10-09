@@ -6,7 +6,7 @@ const parse = (decisions?: unknown, extra: Record<string, unknown> = {}) =>
   parseConfig({ appUrl: 'http://localhost:1', ...(decisions === undefined ? {} : { decisions }), ...extra }, '/repo', {});
 
 describe('decisions config', () => {
-  it('defaults: on when a key exists, warn, prune above 6 keep 4, verdict and captions on, 10 s, pinned models', () => {
+  it('defaults: on when a key exists, warn, prune above 6 keep 4, verdict and captions on, 20 s, pinned models', () => {
     const { decisions, claimFile } = parse();
     expect(decisions).toEqual({
       models: { triage: DEFAULT_TRIAGE_MODEL, text: DEFAULT_TEXT_MODEL },
@@ -14,7 +14,7 @@ describe('decisions config', () => {
       prune: { above: 6, keep: 4 },
       verdict: true,
       captions: true,
-      budgetMs: 10_000,
+      budgetMs: 20_000,
     });
     expect(decisions.enabled).toBeUndefined();
     expect(claimFile).toBeUndefined();
@@ -85,7 +85,7 @@ describe('decisions config', () => {
     const base = parse().decisions;
     expect(describeMode(base, false)).toBe('heuristics only (no OPENROUTER_API_KEY)');
     expect(describeMode({ ...base, enabled: false }, true)).toBe('off (decisions.enabled is false)');
-    expect(describeMode(base, true)).toBe('triage warn, prune above 6 keep 4, verdict on, captions on, budget 10000 ms');
+    expect(describeMode(base, true)).toBe('triage warn, prune above 6 keep 4, verdict on, captions on, budget 20000 ms');
     expect(describeMode({ ...base, prune: false, verdict: false }, true)).toContain('prune off, verdict off');
   });
 });

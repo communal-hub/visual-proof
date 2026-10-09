@@ -1,5 +1,14 @@
 import { ConfigError } from './config.js';
 
+/** Cut UTF-8 text at a whole code point, without exceeding the byte budget. */
+export function truncateUtf8(text: string, bytes: number): string {
+  const buffer = Buffer.from(text);
+  if (buffer.length <= bytes) return text;
+  let end = bytes;
+  while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end--;
+  return buffer.subarray(0, end).toString('utf8');
+}
+
 /** A multi-line message (`- field` bullets after a headline) as one line, every line kept: `a; b; c`. */
 export function flatten(message: string): string {
   return message
