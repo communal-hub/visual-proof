@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { CaptureResult, CaptureSignals, Capturer, PrimeResult } from '../../src/browser.js';
+import type { CaptureResult, CaptureSignals, Capturer, PrimeResult, ScenarioPlan, ScenarioResult } from '../../src/browser.js';
 import type { JsonResponse } from '../../src/resolve/param-sources.js';
 import { parseConfig, type Config } from '../../src/config.js';
 import type { Dirs } from '../../src/paths.js';
@@ -37,6 +37,8 @@ class FakeCapturer implements Capturer {
   timing?: { settleMs: number; screenshotMs: number };
   /** Set to make the fake warm-up capable; the default fake cannot prime, like a capturer without the method. */
   prime?: (url: string) => Promise<PrimeResult>;
+  /** Set to make the fake able to run sidecar scenarios. */
+  runScenario?: (plan: ScenarioPlan) => Promise<ScenarioResult>;
   async warm() {
     this.warmed = true;
   }
@@ -1084,5 +1086,241 @@ describe('paramSources (route params from list endpoints)', () => {
     };
     await start();
     expect(primed).toEqual(['http://app.test/invoices/7']);
+  });
+});
+
+describe('sidecar scenarios', () => {
+  const SC = '.visual-proof/sidecars/refund.vp';
+  const OTHER = '.visual-proof/sidecars/home.vp';
+  const sidecarGraph: ImportGraph = {
+    ...graph,
+    routes: ['/', '/invoices/:id'].map((p) => ({ path: p, routeFile: 'src/router/index.js', component: null, layouts: [], dynamic: false })),
+  };
+  let plans: ScenarioPlan[];
+  let scenarioFailure: { line: number; text: string; reason: string } | undefined;
+
+  const writeSidecar = (file: string, text: string) => {
+    fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+    fs.writeFileSync(path.join(repo, file), text);
+  };
+
+  beforeEach(() => {
+    plans = [];
+    scenarioFailure = undefined;
+    capturer.runScenario = async (plan) => {
+      plans.push(plan);
+      const stills = plan.steps.filter((s) => s.verb === 'still');
+      const done = scenarioFailure ? stills.slice(0, 0) : stills;
+      const out = done.map((s) => ({
+        name: (s as { name: string }).name,
+        at: new Date().toISOString(),
+        png: Buffer.from(`still:${(s as { name: string }).name}`),
+        signals: { ...cleanSignals, ...(scenarioFailure ? { stepFailure: `line ${scenarioFailure.line} ${scenarioFailure.text}: ${scenarioFailure.reason}` } : {}) },
+        renderedFiles: ['src/pages/Detail.vue'],
+        steps: plan.steps.filter((x) => x.line <= s.line).map((x) => ({ line: x.line, text: x.text })),
+        failed: false,
+      }));
+      if (scenarioFailure) {
+        const next = stills[0] as { name: string };
+        out.push({
+          name: next.name,
+          at: new Date().toISOString(),
+          png: Buffer.from('failed'),
+          signals: { ...cleanSignals, stepFailure: `line ${scenarioFailure.line} ${scenarioFailure.text}: ${scenarioFailure.reason}` } as never,
+          renderedFiles: null as never,
+          steps: [{ line: scenarioFailure.line, text: scenarioFailure.text }],
+          failed: true,
+        });
+      }
+      return { stills: out, ms: 5, ...(scenarioFailure ? { failure: scenarioFailure } : {}) };
+    };
+    writeSidecar(SC, '# refund\ngoto /invoices/:id\nclick [data-test=refund]\nstill modal\nstill after\n');
+    writeSidecar(OTHER, 'goto /\nstill home\n');
+  });
+
+  const startSc = (overrides: Parameters<typeof startWatch>[1] = {}) => start({ buildGraph: async () => sidecarGraph, ...overrides });
+  const sidecarFrames = () => timeline().list().filter((f) => f.route.startsWith('sidecar:'));
+
+  it('replays a changed sidecar file: one frame per still, with route, routeKey, sourceFile, steps and the sidecar trigger', async () => {
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+
+    expect(plans).toHaveLength(1);
+    expect(plans[0]).toMatchObject({ file: SC, name: 'refund' });
+    expect(plans[0]!.gotos.get(2)).toEqual({ url: 'http://app.test/invoices/1', path: '/invoices/1' }); // through routeParams
+    expect(capturer.urls).toEqual([]); // no route captured
+    const frames = sidecarFrames();
+    expect(frames.map((f) => f.route)).toEqual([`sidecar:${SC}#modal`, `sidecar:${SC}#after`]);
+    expect(frames[0]).toMatchObject({
+      routeKey: `sidecar:${SC}#modal`,
+      sourceFile: SC,
+      trigger: 'sidecar',
+      status: 'clean',
+      treeHash: tree,
+      renderedFiles: ['src/pages/Detail.vue'],
+      steps: [{ line: 2, text: 'goto /invoices/:id' }, { line: 3, text: 'click [data-test=refund]' }, { line: 4, text: 'still modal' }],
+    });
+    expect(handle!.sessionId).toBe(frames[0]!.sessionId);
+    expect(statusJson().frames).toBe(2);
+    expect(batches[0]).toMatchObject({ sidecar: [SC], routes: [`sidecar:${SC}#modal`, `sidecar:${SC}#after`], outcome: 'captured' });
+    expect(logText()).toMatch(/sidecar \.visual-proof\/sidecars\/refund\.vp: 2 still\(s\)/);
+  });
+
+  it('does not wait on the HMR barrier for a sidecar-only batch', async () => {
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    expect(barrier.calls).toEqual([]);
+  });
+
+  it('a screen file whose route a scenario visits replays it (through the import graph); an unrelated one does not', async () => {
+    await startSc();
+    pushBatch({ screen: ['src/pages/Detail.vue'] }); // /invoices/:id: refund.vp visits it
+    await nextBatch();
+    expect(plans.map((p) => p.file)).toEqual([SC]);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/1']);
+    expect(sidecarFrames().every((f) => f.trigger === 'screen' && f.sourceFile === SC)).toBe(true);
+
+    plans.length = 0;
+    pushBatch({ screen: ['src/pages/Home.vue'] }); // /: only home.vp visits it
+    await nextBatch(2);
+    expect(plans.map((p) => p.file)).toEqual([OTHER]);
+  });
+
+  it('a shared component replays every scenario on any of its routes', async () => {
+    await startSc();
+    pushBatch({ screen: ['src/components/Badge.vue'] }); // / and /invoices/:id
+    await nextBatch();
+    expect(plans.map((p) => p.file).sort()).toEqual([OTHER, SC]);
+  });
+
+  it('a backend change replays only scenarios that have run this session', async () => {
+    await startSc();
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch();
+    expect(plans).toEqual([]);
+
+    pushBatch({ sidecar: [SC] });
+    await nextBatch(2);
+    plans.length = 0;
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(3);
+    expect(plans.map((p) => p.file)).toEqual([SC]);
+    expect(sidecarFrames().filter((f) => f.trigger === 'backend')).toHaveLength(2);
+  });
+
+  it('an unmapped screen file recaptures like a backend change, scenarios included', async () => {
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    plans.length = 0;
+    pushBatch({ screen: ['src/unknown/Thing.vue'] });
+    await nextBatch(2);
+    expect(plans.map((p) => p.file)).toEqual([SC]);
+  });
+
+  it('resolves a route-key goto through paramSources when routeParams has nothing', async () => {
+    config = parseConfig(
+      {
+        appUrl: 'http://app.test',
+        routeFiles: ['src/router/**/*.js'],
+        screenGlobs: ['src/**'],
+        paramSources: { '/invoices/:id': { url: '/api/invoices', pick: '0.id' } },
+      },
+      repo,
+      {},
+    );
+    capturer.getJson = async () => ({ status: 200, json: [{ id: 7 }] });
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    expect(plans[0]!.gotos.get(2)).toEqual({ url: 'http://app.test/invoices/7', path: '/invoices/7' });
+  });
+
+  it('an unfillable route key is passed on as the goto error, so the scenario fails at that line', async () => {
+    config = parseConfig({ appUrl: 'http://app.test', screenGlobs: ['src/**'], routeFiles: ['src/router/**/*.js'] }, repo, {});
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    const goto = plans[0]!.gotos.get(2)!;
+    expect('error' in goto && goto.error).toContain('cannot fill /invoices/:id');
+  });
+
+  it('records the error frame of a failed step with its reasons, and still counts the scenario as run', async () => {
+    scenarioFailure = { line: 3, text: 'click [data-test=refund]', reason: 'selector not found' };
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    const frames = sidecarFrames();
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ route: `sidecar:${SC}#modal`, status: 'error', reasons: ['line 3 click [data-test=refund]: selector not found'] });
+    expect(logText()).toContain('failed at line 3 click [data-test=refund]: selector not found');
+
+    plans.length = 0;
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(plans.map((p) => p.file)).toEqual([SC]);
+  });
+
+  it('skips a scenario that does not parse, logging each problem once', async () => {
+    writeSidecar(SC, 'goto /\nclik x\nlogin ghost\nstill s\n');
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch(2);
+    expect(plans).toEqual([]);
+    expect(sidecarFrames()).toEqual([]);
+    const warnings = logText().split('\n').filter((l) => l.includes('warning: sidecar'));
+    expect(warnings).toHaveLength(2); // one line per problem, and the second batch repeats neither
+    expect(warnings[0]).toContain(`${SC}:2: unknown verb "clik"`);
+    expect(warnings[1]).toContain(`${SC}:3: login needs a login hook`);
+    expect(batches[0]!.outcome).toBe('no-routes');
+  });
+
+  it('a deleted sidecar file runs nothing and is forgotten', async () => {
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    fs.rmSync(path.join(repo, SC));
+    plans.length = 0;
+    pushBatch({ sidecar: [SC] });
+    await nextBatch(2);
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(3);
+    expect(plans).toEqual([]);
+  });
+
+  it('discards scenario frames when the tree changed during the run, then replays', async () => {
+    await startSc();
+    let calls = 0;
+    const run = capturer.runScenario!;
+    capturer.runScenario = async (plan) => {
+      if (++calls === 1) tree = 'b'.repeat(40);
+      return run(plan);
+    };
+    pushBatch({ sidecar: [SC] });
+    await nextBatch(2);
+    expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'captured']);
+    expect(sidecarFrames().map((f) => f.treeHash)).toEqual(['b'.repeat(40), 'b'.repeat(40)]);
+    expect(calls).toBe(2);
+  });
+
+  it('a capturer without runScenario skips sidecars with a log line', async () => {
+    capturer.runScenario = undefined;
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    expect(logText()).toContain(`sidecar ${SC} skipped: this capturer cannot run scenarios`);
+    expect(sidecarFrames()).toEqual([]);
+  });
+
+  it('does nothing when the sidecars list is empty', async () => {
+    config = parseConfig({ appUrl: 'http://app.test', sidecars: [], screenGlobs: ['src/**'] }, repo, {});
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    expect(plans).toEqual([]);
   });
 });

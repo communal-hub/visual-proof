@@ -3,8 +3,11 @@ import path from 'node:path';
 import { chromium, type Browser as PwBrowser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import type { Config } from './config.js';
 import { SIDECAR_TEXT_LIMIT } from './decisions/sidecar.js';
+import { firstLine } from './text.js';
 import { hostBlocker } from './hosts.js';
 import { normalizeRenderedFiles, renderedFilesScript } from './rendered.js';
+import { FAILED_STILL, roleEmail, type SidecarStep } from './sidecar.js';
+import type { FrameStep } from './timeline.js';
 import type { TriageSignals } from './triage.js';
 
 /** Max characters of app-root text kept on a capture. */
@@ -87,7 +90,46 @@ export interface Capturer {
    * Optional: capturers without it cannot resolve `paramSources`.
    */
   getJson?(urlPath: string): Promise<JsonResponse>;
+  /**
+   * Run a sidecar scenario in the warm context and return a still per `still` step (or an error still where a step
+   * failed). Optional: capturers without it skip sidecars.
+   */
+  runScenario?(plan: ScenarioPlan): Promise<ScenarioResult>;
   close(): Promise<void>;
+}
+
+/** A parsed sidecar with its `goto` targets already resolved to concrete URLs (the watcher owns route params). */
+export interface ScenarioPlan {
+  /** Config-relative path of the sidecar file. */
+  file: string;
+  name: string;
+  steps: SidecarStep[];
+  /** Per `goto` line: where it goes, or why it cannot (unfilled route params). */
+  gotos: Map<number, { url: string; path: string } | { error: string }>;
+}
+
+/** One still of a scenario: a normal capture plus the steps that led to it. */
+export interface ScenarioStill {
+  /** The `still` name, or {@link FAILED_STILL} for the synthetic frame of a failure after the last still. */
+  name: string;
+  at: string;
+  png: Buffer;
+  signals: CaptureSignals;
+  renderedFiles: string[] | null;
+  timing?: CaptureTiming;
+  /** The page's full text (for the decisions claim check), like {@link CaptureResult.pageText}. */
+  pageText?: string;
+  /** Steps run from the start of the scenario up to and including this still (or the failing step). */
+  steps: FrameStep[];
+  /** True for the error still of a failed step. */
+  failed: boolean;
+}
+
+export interface ScenarioResult {
+  stills: ScenarioStill[];
+  /** The step that stopped the scenario, if any. */
+  failure?: { line: number; text: string; reason: string };
+  ms: number;
 }
 
 export class LoginError extends Error {
@@ -116,6 +158,7 @@ export type BrowserConfig = Pick<
   | 'blockHosts'
   | 'allowHosts'
   | 'settle'
+  | 'roles'
 >;
 
 export interface BrowserOptions {
@@ -128,7 +171,14 @@ export interface BrowserOptions {
   now?: () => number;
   /** Runs on the prepared page right before the screenshot (tests inspect what the still will show). */
   beforeScreenshot?: (page: Page) => Promise<void>;
+  /** Total time one sidecar scenario may take before it is stopped. Default 60 s. */
+  scenarioTimeoutMs?: number;
+  /** How long a sidecar step waits for its selector. Default 5 s. */
+  stepTimeoutMs?: number;
 }
+
+export const SCENARIO_TIMEOUT_MS = 60_000;
+export const STEP_TIMEOUT_MS = 5000;
 
 const STALE_DEP_RETRIES = 2;
 const STALE_DEP_PAUSE_MS = 300;
@@ -150,6 +200,8 @@ export class Browser implements Capturer {
   private browser: PwBrowser | null = null;
   private context: BrowserContext | null = null;
   private loggedIn = false;
+  /** Email the shared context is logged in as (the default `login.email`, or a role's during a sidecar scenario). */
+  private sessionEmail: string | null = null;
   /** The last login failure and when it happened; reused (not retried) until the back-off passes. */
   private loginFailure: { error: LoginError; at: number } | null = null;
   private readonly pages = new Set<Page>();
@@ -262,6 +314,7 @@ export class Browser implements Capturer {
     this.browser = null;
     this.context = null;
     this.loggedIn = false;
+    this.sessionEmail = null;
     this.loginFailure = null;
     for (const page of [...this.pages]) await page.close().catch(() => {});
     this.pages.clear();
@@ -283,6 +336,7 @@ export class Browser implements Capturer {
       reducedMotion: 'reduce',
     });
     this.loggedIn = false;
+    this.sessionEmail = null;
     this.loginFailure = null;
     try {
       await this.installRoutes(this.context);
@@ -322,7 +376,9 @@ export class Browser implements Capturer {
   // ---- login ---------------------------------------------------------------
 
   private async ensureLoggedIn(): Promise<void> {
-    if (this.config.login.type !== 'http-hook' || this.loggedIn) return;
+    if (this.config.login.type !== 'http-hook') return;
+    // A scenario that logged in as another role leaves the context on that role until it restores the default.
+    if (this.loggedIn && this.sessionEmail === this.config.login.email) return;
     const failure = this.loginFailure;
     if (failure) {
       const backoffMs = this.options.loginBackoffMs ?? LOGIN_BACKOFF_MS;
@@ -343,7 +399,7 @@ export class Browser implements Capturer {
   }
 
   /** POST the login hook through the context so its session cookie lands in the shared jar. */
-  private async login(): Promise<void> {
+  private async login(email: string | undefined = this.config.login.email): Promise<void> {
     const { login, appUrl, repoDir } = this.config;
     if (login.type !== 'http-hook' || !login.url) return;
     const context = await this.ensureContext();
@@ -364,7 +420,7 @@ export class Browser implements Capturer {
     let status: number;
     try {
       const response = await context.request.post(target, {
-        data: { email: login.email },
+        data: { email },
         headers,
         failOnStatusCode: false,
         timeout: 15_000,
@@ -376,32 +432,60 @@ export class Browser implements Capturer {
     }
     if (status < 200 || status >= 300) throw new LoginError(`login failed: HTTP ${status} from ${login.url}`);
     this.loggedIn = true;
-    this.log(`logged in as ${login.email}`);
+    this.sessionEmail = email ?? null;
+    this.log(`logged in as ${email}`);
   }
 
   // ---- capture -------------------------------------------------------------
+
+  /** A fresh page in the warm context with the listeners every capture and scenario needs. */
+  private async openPage(context: BrowserContext): Promise<Watched> {
+    const page = await context.newPage();
+    this.pages.add(page);
+    const watched: Watched = { page, network: new NetworkIdle(page), consoleErrors: [], pageErrors: [], navigations: 0 };
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      // Chromium reports a request we aborted ourselves as a failed resource load; that is not the app's error.
+      if (/net::ERR_(FAILED|BLOCKED_BY_CLIENT)/.test(msg.text()) && this.isBlocked(msg.location().url)) return;
+      watched.consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => watched.pageErrors.push(err.message || String(err)));
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) watched.navigations++;
+    });
+    return watched;
+  }
+
+  /**
+   * Wait until the loaded page is stable and read it. The page can navigate again on its own after `load` (Vite
+   * reloads when it re-optimizes dependencies; apps redirect after a guard), so re-settle whenever that happens
+   * mid-stabilisation.
+   */
+  private async settleAndRead(watched: Watched, label: string, maxWaitMs = this.config.settle.maxWaitMs): Promise<Dom> {
+    const { page, network } = watched;
+    let dom = emptyDom();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const seen = watched.navigations;
+      // No request in flight for `settle.networkIdleMs`, but give up after `settle.maxWaitMs`.
+      await network.wait(this.config.settle.networkIdleMs, maxWaitMs);
+      const settled = await settle(page);
+      const read = settled
+        ? await readDom(page, this.config.appRoot, this.config.spinnerSelectors, (m) => this.log(`capture ${label}: reading the page failed: ${m}`))
+        : null;
+      if (read && watched.navigations === seen) return read;
+      if (read) dom = read;
+      this.log(`capture ${label}: page navigated while settling (attempt ${attempt + 1})`);
+    }
+    return dom;
+  }
 
   /**
    * Open a fresh page, navigate and wait for the app to settle. The page is returned open: the caller
    * screenshots it if it wants to and must close it.
    */
   private async loadPage(context: BrowserContext, url: string): Promise<Loaded> {
-    const page = await context.newPage();
-    this.pages.add(page);
-    const network = new NetworkIdle(page);
-    const consoleErrors: string[] = [];
-    const pageErrors: string[] = [];
-    page.on('console', (msg) => {
-      if (msg.type() !== 'error') return;
-      // Chromium reports a request we aborted ourselves as a failed resource load; that is not the app's error.
-      if (/net::ERR_(FAILED|BLOCKED_BY_CLIENT)/.test(msg.text()) && this.isBlocked(msg.location().url)) return;
-      consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(err.message || String(err)));
-    let navigations = 0;
-    page.on('framenavigated', (frame) => {
-      if (frame === page.mainFrame()) navigations++;
-    });
+    const watched = await this.openPage(context);
+    const { page, network, consoleErrors, pageErrors } = watched;
 
     try {
       let navOk = true;
@@ -417,29 +501,8 @@ export class Browser implements Capturer {
         this.log(`capture ${url}: navigation failed: ${(err as Error).message.split('\n')[0]}`);
       }
 
-      let dom = emptyDom();
       const settleStart = Date.now();
-      if (navOk) {
-        // The page can navigate again on its own after `load` (Vite reloads when it re-optimizes
-        // dependencies; apps redirect after a guard). Re-settle whenever that happens mid-stabilisation.
-        for (let attempt = 0; attempt < 4; attempt++) {
-          const seen = navigations;
-          // No request in flight for `settle.networkIdleMs`, but give up after `settle.maxWaitMs`.
-          await network.wait(this.config.settle.networkIdleMs, this.config.settle.maxWaitMs);
-          const settled = await settle(page);
-          const read = settled
-            ? await readDom(page, this.config.appRoot, this.config.spinnerSelectors, (m) =>
-                this.log(`capture ${url}: reading the page failed: ${m}`),
-              )
-            : null;
-          if (read && navigations === seen) {
-            dom = read;
-            break;
-          }
-          if (read) dom = read;
-          this.log(`capture ${url}: page navigated while settling (attempt ${attempt + 1})`);
-        }
-      }
+      const dom = navOk ? await this.settleAndRead(watched, url) : emptyDom();
       return {
         page,
         navOk,
@@ -448,7 +511,7 @@ export class Browser implements Capturer {
         consoleErrors,
         pageErrors,
         // The initial navigation is the first one; anything after it is the page moving on its own.
-        extraNavigations: Math.max(0, navigations - 1),
+        extraNavigations: Math.max(0, watched.navigations - 1),
         network,
         settleMs: Date.now() - settleStart,
       };
@@ -463,58 +526,71 @@ export class Browser implements Capturer {
     const loaded = await this.loadPage(context, url);
     const { page, navOk, httpStatus, dom, consoleErrors, pageErrors } = loaded;
     const { fullText: _fullText, ...signalDom } = dom; // the long text goes to the sidecar, not into the signals
-    const screenshotStart = Date.now();
     try {
-      let layout: CaptureLayout | undefined;
-      let renderedFiles: string[] | null = null;
-      if (navOk && this.config.renderCheck !== 'off') {
-        renderedFiles = await page
-          .evaluate(renderedFilesScript(this.config.appRoot))
-          .then((raw) => normalizeRenderedFiles(raw as string[] | null, this.config.repoDir), () => null);
-      }
-      if (navOk) {
-        try {
-          layout = await this.preparePage(page, url, loaded.network);
-        } catch (err) {
-          this.log(`capture ${url}: preparing the page for the screenshot failed: ${(err as Error).message.split('\n')[0]}`);
-        }
-        await this.options.beforeScreenshot?.(page);
-      }
-
-      let screenshotError: string | undefined;
-      const { width } = this.config.viewport;
-      const masks = await this.maskLocators(page, url);
-      if (layout) layout.masked = masks.count;
-      const png = await page
-        .screenshot({
-          fullPage: true,
-          ...(masks.locators.length > 0 ? { mask: masks.locators } : {}),
-          // Keep the viewport width and cut the height at the cap, whatever overflows horizontally or below.
-          ...(layout ? { clip: { x: 0, y: 0, width, height: layout.height } } : {}),
-          type: 'png',
-          animations: 'disabled',
-          caret: 'hide',
-        })
-        .catch((err: Error) => {
-          screenshotError = err.message.split('\n')[0] || err.name;
-          this.log(`capture ${url}: screenshot failed: ${screenshotError}`);
-          return Buffer.from(BLANK_PNG_BASE64, 'base64');
-        });
-
+      const shot = await this.shoot(page, url, loaded.network, navOk);
       return {
-        png,
+        png: shot.png,
         finalUrl: page.url(),
         pageText: dom.fullText,
         httpStatus,
-        ...(layout ? { layout } : {}),
-        renderedFiles,
-        timing: { settleMs: loaded.settleMs, screenshotMs: Date.now() - screenshotStart },
-        signals: { navOk, httpStatus, consoleErrors, pageErrors, ...signalDom, ...(screenshotError ? { screenshotError } : {}) },
+        ...(shot.layout ? { layout: shot.layout } : {}),
+        renderedFiles: shot.renderedFiles,
+        timing: { settleMs: loaded.settleMs, screenshotMs: shot.ms },
+        signals: { navOk, httpStatus, consoleErrors, pageErrors, ...signalDom, ...(shot.error ? { screenshotError: shot.error } : {}) },
       };
     } finally {
       this.pages.delete(page);
       await page.close().catch(() => {});
     }
+  }
+
+  /**
+   * The screenshot half of a capture, on a settled page: the rendered-component walk, preparing the page (hide
+   * overlays, grow inner scrollers), masks, the PNG. Shared by route captures and scenario stills.
+   */
+  private async shoot(
+    page: Page,
+    url: string,
+    network: NetworkIdle,
+    navOk: boolean,
+  ): Promise<{ png: Buffer; layout?: CaptureLayout; renderedFiles: string[] | null; error?: string; ms: number }> {
+    const started = Date.now();
+    let layout: CaptureLayout | undefined;
+    let renderedFiles: string[] | null = null;
+    if (navOk && this.config.renderCheck !== 'off') {
+      renderedFiles = await page
+        .evaluate(renderedFilesScript(this.config.appRoot))
+        .then((raw) => normalizeRenderedFiles(raw as string[] | null, this.config.repoDir), () => null);
+    }
+    if (navOk) {
+      try {
+        layout = await this.preparePage(page, url, network);
+      } catch (err) {
+        this.log(`capture ${url}: preparing the page for the screenshot failed: ${(err as Error).message.split('\n')[0]}`);
+      }
+      await this.options.beforeScreenshot?.(page);
+    }
+
+    let error: string | undefined;
+    const { width } = this.config.viewport;
+    const masks = await this.maskLocators(page, url);
+    if (layout) layout.masked = masks.count;
+    const png = await page
+      .screenshot({
+        fullPage: true,
+        ...(masks.locators.length > 0 ? { mask: masks.locators } : {}),
+        // Keep the viewport width and cut the height at the cap, whatever overflows horizontally or below.
+        ...(layout ? { clip: { x: 0, y: 0, width, height: layout.height } } : {}),
+        type: 'png',
+        animations: 'disabled',
+        caret: 'hide',
+      })
+      .catch((err: Error) => {
+        error = err.message.split('\n')[0] || err.name;
+        this.log(`capture ${url}: screenshot failed: ${error}`);
+        return Buffer.from(BLANK_PNG_BASE64, 'base64');
+      });
+    return { png, ...(layout ? { layout } : {}), renderedFiles, ...(error ? { error } : {}), ms: Date.now() - started };
   }
 
   async prime(url: string): Promise<PrimeResult> {
@@ -541,6 +617,310 @@ export class Browser implements Capturer {
       this.log(`prime ${url}: Vite reloaded the page during pass ${pass + 1}; settling again`);
     }
     return { passes, reloads, navOk: last?.navOk ?? false, httpStatus: last?.httpStatus ?? null };
+  }
+
+  // ---- sidecar scenarios ----------------------------------------------------
+
+  /**
+   * Run a sidecar scenario on one fresh page of the warm context: the steps in order, a still (settle, triage
+   * signals, rendered components, prepared screenshot) at each `still`. The first step that fails stops the
+   * scenario and becomes an error still for the next pending `still` (or a synthetic one when none is left), with
+   * a screenshot of where the page was. The whole run is bounded (`scenarioTimeoutMs`, 60 s): a scenario cannot
+   * hang. `login <role>` switches the shared session; the default login is restored afterwards.
+   */
+  async runScenario(plan: ScenarioPlan): Promise<ScenarioResult> {
+    const context = await this.ensureContext();
+    const started = Date.now();
+    const deadline = started + (this.options.scenarioTimeoutMs ?? SCENARIO_TIMEOUT_MS);
+    const stepTimeout = this.options.stepTimeoutMs ?? STEP_TIMEOUT_MS;
+
+    let authFailure: string | undefined;
+    try {
+      await this.ensureLoggedIn();
+    } catch (err) {
+      authFailure = (err as Error).message;
+    }
+
+    const watched = await this.openPage(context);
+    const { page } = watched;
+    const run: ScenarioRun = {
+      plan,
+      watched,
+      stills: [],
+      executed: [],
+      httpStatus: null,
+      authFailure,
+      deadline,
+      stepTimeout,
+      cancelled: false,
+      failure: undefined,
+      current: null,
+    };
+
+    try {
+      const body = this.runSteps(run).catch((err: Error) => {
+        // A bug or a closed page, not a step failing: still report it against the step it happened in.
+        if (!run.failure) run.failure = failureOf(run.current, err.message.split('\n')[0] || err.name);
+      });
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        body.then(() => 'done' as const),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - Date.now()) + 1000);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (outcome === 'timeout') {
+        run.cancelled = true;
+        run.failure ??= failureOf(run.current, `scenario exceeded ${Math.round((this.options.scenarioTimeoutMs ?? SCENARIO_TIMEOUT_MS) / 1000)} s`);
+        this.log(`scenario ${plan.file}: stopped after exceeding its time limit`);
+      }
+
+      if (run.failure) run.stills.push(await this.failureStill(run));
+    } finally {
+      this.pages.delete(page);
+      await page.close().catch(() => {});
+      await this.restoreDefaultLogin();
+    }
+    return { stills: run.stills, ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started };
+  }
+
+  private async runSteps(run: ScenarioRun): Promise<void> {
+    for (const step of run.plan.steps) {
+      if (run.cancelled) return;
+      run.current = step;
+      run.executed.push({ line: step.line, text: step.text });
+      if (run.deadline - Date.now() <= 0) {
+        run.failure = failureOf(step, 'scenario exceeded its time limit');
+        return;
+      }
+      const reason = await this.runStep(run, step);
+      if (run.cancelled) return;
+      if (reason !== null) {
+        run.failure = failureOf(step, reason);
+        return;
+      }
+    }
+  }
+
+  /** One step; null on success, else why it failed. */
+  private async runStep(run: ScenarioRun, step: SidecarStep): Promise<string | null> {
+    const { page, network } = run.watched;
+    const left = (): number => Math.max(1, run.deadline - Date.now());
+    const timeout = (): number => Math.min(run.stepTimeout, left());
+    const label = `${run.plan.file}:${step.line}`;
+
+    switch (step.verb) {
+      case 'goto':
+        return this.stepGoto(run, step, label);
+
+      case 'click':
+      case 'fill': {
+        const target = await this.findTarget(page, step.selector, timeout());
+        if (typeof target === 'string') return target;
+        try {
+          if (step.verb === 'click') await target.click({ timeout: timeout() });
+          else await target.fill(step.value, { timeout: timeout() });
+        } catch (err) {
+          return `${step.verb} failed: ${firstLine(err)}`;
+        }
+        await this.afterAction(run);
+        return null;
+      }
+
+      case 'press': {
+        try {
+          await page.keyboard.press(step.key);
+        } catch (err) {
+          return `press failed: ${firstLine(err)}`;
+        }
+        await this.afterAction(run);
+        return null;
+      }
+
+      case 'wait': {
+        if (step.ms !== undefined) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(step.ms!, left())));
+          return null;
+        }
+        const target = await this.findTarget(page, step.selector!, timeout());
+        return typeof target === 'string' ? target : null;
+      }
+
+      case 'login': {
+        const email = roleEmail(step.role, this.config);
+        if (this.config.login.type !== 'http-hook') return 'login needs login.type "http-hook"';
+        if (email === null) return `unknown role ${JSON.stringify(step.role)}`;
+        try {
+          // A fresh session: nothing of the previous role's cookies may leak into this one.
+          await (await this.ensureContext()).clearCookies();
+          this.loggedIn = false;
+          await this.login(email);
+        } catch (err) {
+          this.loggedIn = false;
+          return `login as ${step.role} failed: ${firstLine(err)}`;
+        }
+        return null;
+      }
+
+      case 'still': {
+        const started = Date.now();
+        const dom = await this.settleAndRead(run.watched, label, Math.min(this.config.settle.maxWaitMs, left()));
+        const settleMs = Date.now() - started;
+        const shot = await this.shoot(page, label, network, true);
+        await page.evaluate(UNPREPARE_SCRIPT).catch(() => {}); // the scenario goes on from this very page
+        if (run.cancelled) return null; // the time limit already ended this scenario; its failure still is the last one
+        const signals = this.scenarioSignals(run, dom, shot.error);
+        run.stills.push({
+          name: step.name,
+          at: new Date().toISOString(),
+          png: shot.png,
+          signals,
+          renderedFiles: shot.renderedFiles,
+          timing: { settleMs, screenshotMs: shot.ms },
+          pageText: dom.fullText,
+          steps: [...run.executed],
+          failed: false,
+        });
+        return null;
+      }
+    }
+  }
+
+  private async stepGoto(run: ScenarioRun, step: Extract<SidecarStep, { verb: 'goto' }>, label: string): Promise<string | null> {
+    const resolved = run.plan.gotos.get(step.line);
+    if (!resolved) return `cannot resolve ${step.target}`;
+    if ('error' in resolved) return `${resolved.error} (add routeParams)`;
+    const { page } = run.watched;
+    const { url } = resolved;
+    const navTimeout = (): number => Math.min(this.options.navigationTimeoutMs ?? 30_000, Math.max(1, run.deadline - Date.now()));
+
+    const visit = async (): Promise<string | null> => {
+      run.watched.consoleErrors.length = 0;
+      run.watched.pageErrors.length = 0;
+      let response;
+      try {
+        response = await page.goto(url, { waitUntil: 'load', timeout: navTimeout() });
+      } catch (err) {
+        return `navigation failed: ${firstLine(err)}`;
+      }
+      run.httpStatus = response?.status() ?? null;
+      await this.settleAndRead(run.watched, label, Math.min(this.config.settle.maxWaitMs, Math.max(1, run.deadline - Date.now())));
+      return null;
+    };
+
+    let failure = await visit();
+    if (failure) return failure;
+
+    // A cold dev server answers module requests with 504 "Outdated Optimize Dep" while it re-bundles; transient.
+    for (let retry = 0; retry < STALE_DEP_RETRIES && hasStaleDepError(run.watched.consoleErrors); retry++) {
+      this.log(`scenario ${label}: Vite is re-optimizing dependencies (504 Outdated Optimize Dep); loading again`);
+      await new Promise((resolve) => setTimeout(resolve, STALE_DEP_PAUSE_MS));
+      failure = await visit();
+      if (failure) return failure;
+    }
+
+    if (this.config.login.type === 'http-hook') {
+      let reason = authProblem(url, { httpStatus: run.httpStatus, finalUrl: page.url() });
+      if (reason) {
+        this.log(`scenario ${label}: ${reason}; logging in again`);
+        try {
+          // Same identity as before the redirect: the role the scenario is in, not necessarily the default.
+          this.loggedIn = false;
+          await this.login(this.sessionEmail ?? this.config.login.email);
+          failure = await visit();
+          if (failure) return failure;
+          reason = authProblem(url, { httpStatus: run.httpStatus, finalUrl: page.url() });
+        } catch (err) {
+          reason = firstLine(err);
+        }
+        run.authFailure = reason ?? undefined;
+      }
+    }
+    return null;
+  }
+
+  /** A locator for the first match once it is visible, or why not: `selector not found` / `not visible` / invalid. */
+  private async findTarget(page: Page, selector: string, timeoutMs: number): Promise<Locator | string> {
+    const locator = page.locator(selector).first();
+    try {
+      await locator.waitFor({ state: 'visible', timeout: timeoutMs });
+      return locator;
+    } catch (err) {
+      if ((err as Error).name !== 'TimeoutError') return `invalid selector: ${firstLine(err)}`;
+      const present = await page.locator(selector).count().catch(() => 0);
+      return present > 0 ? 'selector not visible' : 'selector not found';
+    }
+  }
+
+  /** After an action: let the requests it started finish, then paint. A short version of the capture settle. */
+  private async afterAction(run: ScenarioRun): Promise<void> {
+    const cap = Math.min(this.config.settle.maxWaitMs, 2000, Math.max(1, run.deadline - Date.now()));
+    await run.watched.network.wait(this.config.settle.networkIdleMs, cap);
+    await settle(run.watched.page);
+  }
+
+  private scenarioSignals(run: ScenarioRun, fullDom: Dom, screenshotError?: string): CaptureSignals {
+    const { fullText: _fullText, ...dom } = fullDom; // the long text goes to the page-text sidecar, not into the signals
+    const { consoleErrors, pageErrors } = run.watched;
+    const signals: CaptureSignals = {
+      navOk: true,
+      httpStatus: run.httpStatus,
+      // Errors since the previous still belong to this one; the next still starts clean.
+      consoleErrors: consoleErrors.splice(0),
+      pageErrors: pageErrors.splice(0),
+      ...dom,
+      ...(screenshotError ? { screenshotError } : {}),
+    };
+    if (run.authFailure) signals.authFailure = run.authFailure;
+    return signals;
+  }
+
+  /**
+   * The error still for a failed scenario: it takes the name of the next `still` that was not reached (the line of
+   * the failing step or later), else the synthetic {@link FAILED_STILL}. It shows the page as the step left it.
+   */
+  private async failureStill(run: ScenarioRun): Promise<ScenarioStill> {
+    const failure = run.failure!;
+    const pending = run.plan.steps.find((s) => s.verb === 'still' && s.line >= failure.line);
+    const name = pending && pending.verb === 'still' ? pending.name : FAILED_STILL;
+    const { page, network } = run.watched;
+
+    // Best effort and bounded: the page may be hung, closed, or mid-navigation.
+    const guard = <T>(work: Promise<T>, fallback: T, ms = 4000): Promise<T> =>
+      Promise.race([work.catch(() => fallback), new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms))]);
+    const dom = await guard(readDom(page, this.config.appRoot, this.config.spinnerSelectors).then((d) => d ?? emptyDom()), emptyDom());
+    const shot = await guard(
+      this.shoot(page, `${run.plan.file}:${failure.line}`, network, true),
+      { png: Buffer.from(BLANK_PNG_BASE64, 'base64'), renderedFiles: null, error: 'page unavailable', ms: 0 } as Awaited<ReturnType<Browser['shoot']>>,
+      8000,
+    );
+    const signals = this.scenarioSignals(run, dom);
+    signals.stepFailure = `line ${failure.line} ${failure.text}: ${failure.reason}`;
+    return {
+      name,
+      at: new Date().toISOString(),
+      png: shot.png,
+      signals,
+      renderedFiles: shot.renderedFiles,
+      timing: { settleMs: 0, screenshotMs: shot.ms },
+      pageText: dom.fullText,
+      steps: [...run.executed],
+      failed: true,
+    };
+  }
+
+  /** Put the context back on the default login after a scenario that switched roles. Never throws. */
+  private async restoreDefaultLogin(): Promise<void> {
+    if (this.config.login.type !== 'http-hook' || this.sessionEmail === this.config.login.email) return;
+    try {
+      await this.context?.clearCookies();
+      this.loggedIn = false;
+      await this.ensureLoggedIn();
+    } catch (err) {
+      this.loggedIn = false; // the next capture logs in again
+      this.log(`restoring the default login failed: ${firstLine(err)}`);
+    }
   }
 
   /**
@@ -598,6 +978,15 @@ export class Browser implements Capturer {
     this.options.log?.(message);
   }
 }
+
+/** Undo {@link prepareScript} so a scenario can go on from the same page: its style elements and grow attributes. */
+const UNPREPARE_SCRIPT = `(() => {
+  for (const style of document.querySelectorAll('style[data-visual-proof]')) style.remove();
+  for (const el of document.querySelectorAll('[data-vp-grow], [data-vp-flow]')) {
+    el.removeAttribute('data-vp-grow');
+    el.removeAttribute('data-vp-flow');
+  }
+})()`;
 
 /** A login-needed symptom in a finished capture, or null. */
 function authProblem(requestedUrl: string, result: { httpStatus: number | null; finalUrl: string }): string | null {
@@ -692,6 +1081,36 @@ async function readDom(
     onError((err as Error).message.split('\n')[0] ?? 'evaluate failed');
     return null;
   }
+}
+
+/** A page with the listeners every capture needs; the counters keep growing while it is open. */
+interface Watched {
+  page: Page;
+  network: NetworkIdle;
+  consoleErrors: string[];
+  pageErrors: string[];
+  /** Main-frame navigations so far, the initial one included. */
+  navigations: number;
+}
+
+/** Mutable state of one running scenario. */
+interface ScenarioRun {
+  plan: ScenarioPlan;
+  watched: Watched;
+  stills: ScenarioStill[];
+  executed: FrameStep[];
+  /** Status of the latest document load; client-side navigation keeps it. */
+  httpStatus: number | null;
+  authFailure: string | undefined;
+  deadline: number;
+  stepTimeout: number;
+  cancelled: boolean;
+  failure: { line: number; text: string; reason: string } | undefined;
+  current: SidecarStep | null;
+}
+
+function failureOf(step: SidecarStep | null, reason: string): { line: number; text: string; reason: string } {
+  return { line: step?.line ?? 0, text: step?.text ?? '', reason };
 }
 
 interface Loaded {
