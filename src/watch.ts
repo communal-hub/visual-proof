@@ -10,7 +10,6 @@ import { headCommit, workingTreeHash } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { ParamSourceResolver, type SourceOutcome } from './resolve/param-sources.js';
-import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
 import {
   findSidecarFiles,
@@ -21,7 +20,7 @@ import {
   validateSidecar,
   type Sidecar,
 } from './sidecar.js';
-import { Timeline, type Frame, type FrameStep, type Trigger } from './timeline.js';
+import { Timeline, type Frame, type FrameStep, type ParamsFrom, type Trigger } from './timeline.js';
 import { startFsWatch, type FsWatchHandle, type WatchBatch } from './trigger/fs-watch.js';
 import { ViteHmrClient, type BarrierResult, type HmrState } from './trigger/vite-hmr.js';
 import { type DaemonState, type Status, type WarmupRouteStatus } from './status.js';
@@ -31,6 +30,13 @@ import { type DecisionsApi } from './decisions/client.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { writeTextSidecar } from './decisions/sidecar.js';
 import { pruneForWatch } from './decisions/watch.js';
+// v0.8 dynamic params hooks: the tiers, discovery and the session file live in src/resolve/param-*.ts and session-*.ts.
+import { ParamDiscoverer, writeDiscoveryCache, type DiscoveryOutcome } from './resolve/param-discovery.js';
+import { ParamFiller, type FillOutcome } from './resolve/param-fill.js';
+import { loadLayeredParams, type LayeredParams } from './resolve/param-tiers.js';
+import { hasParams } from './resolve/route-pattern.js';
+import { changedSessionRoutes, readSessionParams, type SessionEntry } from './resolve/session-params.js';
+import { watchSessionParams, type SessionWatchHandle } from './resolve/session-watch.js';
 
 export type { DaemonState, Status };
 
@@ -67,6 +73,8 @@ export interface WatchOptions {
   maxRequeues?: number;
   /** Replaces the OpenRouter Decisions client (tests). */
   decisionsClient?: DecisionsApi;
+  /** v0.8: replaces the watcher on `session-params.json` (tests). */
+  watchSession?: typeof watchSessionParams;
 }
 
 export interface FrameEvent {
@@ -96,6 +104,10 @@ interface Pending {
   screen: Set<string>;
   backend: Set<string>;
   sidecar: Set<string>;
+  /** v0.8: route keys whose session params were just set (`visual-proof params set`). */
+  params: Set<string>;
+  /** v0.8: the session file revision the `params` come from; acknowledged in `status.json` when handled. */
+  paramsRev?: number;
   startedAt: number;
   attempts: number;
 }
@@ -106,6 +118,10 @@ interface Target {
   url: string;
   trigger: Trigger;
   sourceFile?: string;
+  /** v0.8 provenance: which tier filled the route's params, and for `discovered` the page that had the link. */
+  paramsFrom?: ParamsFrom;
+  foundOn?: string;
+  discoveryMs?: number;
 }
 
 /** A sidecar scenario chosen to run in a batch. */
@@ -116,6 +132,13 @@ interface ScenarioJob {
 }
 
 const STALE_MESSAGE = 'stale: freshness marker missing, capture refused';
+
+/** Which tier filled a route's params (v0.8); empty for a route without params. */
+interface Provenance {
+  paramsFrom?: ParamsFrom;
+  foundOn?: string;
+  discoveryMs?: number;
+}
 
 export async function startWatch(config: Config, opts: WatchOptions = {}): Promise<WatchHandle> {
   const watcher = new Watcher(config, opts);
@@ -136,6 +159,15 @@ class Watcher {
   private readonly paramSources: ParamSourceResolver;
   /** A4 decisions: route pruning for high fan-out files (cached in the status dir; `finish` reads the same cache). */
   private readonly decisions: DecisionRuntime;
+  // v0.8 dynamic params
+  /** Fills a route's params from the tiers beyond the cheap ones; created in `start()` once the capturer is known. */
+  private filler: ParamFiller | null = null;
+  private discoverer: ParamDiscoverer | null = null;
+  /** Which of session/config/file each key in the last-read params came from. */
+  private paramOrigin: LayeredParams['origin'] = {};
+  /** The session entries last seen, to tell which ones a change of the file is about. */
+  private sessionSeen: Record<string, SessionEntry> = {};
+  private sessionWatch: SessionWatchHandle | null = null;
 
   private capturer: Capturer | null = null;
   private barrier: BarrierSource | null = null;
@@ -155,7 +187,7 @@ class Watcher {
   /** The route-params problems last logged, so an unchanged bad file does not log on every batch. */
   private lastParamsProblems = '';
   /** Concrete path -> route, for every route that produced a frame this session. */
-  private readonly sessionRoutes = new Map<string, { routeKey: string; url: string }>();
+  private readonly sessionRoutes = new Map<string, { routeKey: string; url: string; paramsFrom?: ParamsFrom; foundOn?: string }>();
   /** Sidecar files that produced frames this session; a backend (or unmapped) change replays them. */
   private readonly sidecarsRun = new Set<string>();
   /** The sidecar problems last logged, so an unchanged bad file does not log on every batch. */
@@ -217,6 +249,7 @@ class Watcher {
         this.opts.capturer ??
         (await Browser.launch(this.config, { log: (m) => this.log(`browser: ${m}`) }));
       await this.capturer.warm();
+      this.setupParamFiller();
 
       this.graph = this.loadGraph();
       this.graph.catch(() => {}); // surfaced on first use, not as an unhandled rejection
@@ -235,6 +268,8 @@ class Watcher {
         onBatch: (batch) => this.enqueue(batch),
         onError: (err) => this.fail(err),
       });
+
+      await this.startSessionWatch();
 
       await this.warmUp().catch((err: Error) => {
         // Never fatal: the watcher works without a warm Vite, only its first capture is slower.
@@ -411,6 +446,7 @@ class Watcher {
   private async teardown(): Promise<void> {
     this.stopping = true;
     await this.trigger?.stop().catch(() => {});
+    await this.sessionWatch?.stop().catch(() => {});
     await this.barrier?.stop().catch(() => {});
     await this.capturer?.close().catch(() => {});
   }
@@ -472,6 +508,8 @@ class Watcher {
     screen: Iterable<string>;
     backend: Iterable<string>;
     sidecar: Iterable<string>;
+    params?: Iterable<string>;
+    paramsRev?: number;
     startedAt: number;
     attempts: number;
   }): void {
@@ -479,12 +517,15 @@ class Watcher {
       screen: new Set(),
       backend: new Set(),
       sidecar: new Set(),
+      params: new Set(),
       startedAt: part.startedAt,
       attempts: part.attempts,
     });
     for (const f of part.screen) pending.screen.add(f);
     for (const f of part.backend) pending.backend.add(f);
     for (const f of part.sidecar) pending.sidecar.add(f);
+    for (const k of part.params ?? []) pending.params.add(k);
+    if (part.paramsRev !== undefined) pending.paramsRev = Math.max(pending.paramsRev ?? 0, part.paramsRev);
     pending.startedAt = Math.min(pending.startedAt, part.startedAt);
     pending.attempts = Math.max(pending.attempts, part.attempts);
   }
@@ -508,6 +549,8 @@ class Watcher {
     const screen = [...batch.screen].sort();
     const backend = [...batch.backend].sort();
     const sidecar = [...batch.sidecar].sort();
+    const paramKeys = [...batch.params].sort(); // v0.8: routes whose session params were just set
+    let requeued = false;
     const done = (outcome: BatchEvent['outcome'], routes: string[] = []): void => {
       this.events.emit('batch', { screen, backend, sidecar, routes, outcome } satisfies BatchEvent);
     };
@@ -518,6 +561,7 @@ class Watcher {
       this.status.lastError = STALE_MESSAGE; // so `finish` can say why there is no frame
       this.writeStatus();
       this.events.emit('refused', { reason: STALE_MESSAGE, marker, screen, backend });
+      this.ackSessionParams(batch);
       done('refused');
       return;
     }
@@ -541,7 +585,10 @@ class Watcher {
       // Routes captured earlier this session are re-captured when the change cannot be traced to a route.
       let recapture: { trigger: Trigger; why: string; sourceFile: string } | null = null;
       // The data behind the list endpoints may have changed (a re-seed): look the ids up again.
-      if (backend.length > 0) this.paramSources.invalidate();
+      if (backend.length > 0) {
+        this.paramSources.invalidate();
+        this.discoverer?.invalidate(); // v0.8: discovered ids are as stale as list-endpoint ids
+      }
       if (screen.length > 0) {
         const [barrier, resolution] = await Promise.all([
           this.waitBarrier(batch.startedAt, screen),
@@ -560,23 +607,27 @@ class Watcher {
         if (screen.length === 0) this.log(`batch backend=${backend.join(',')}`);
         recapture = { trigger: 'backend', why: 'backend change', sourceFile: backend[0]! };
       }
+      // v0.8: `visual-proof params set` routes are captured at the current tree whatever else changed.
+      if (paramKeys.length > 0) this.addSessionTargets(paramKeys, targets);
       if (recapture) {
         for (const [capturedPath, route] of this.sessionRoutes) {
           // Re-resolve: a re-run seeder may have moved a param route to a new id since it was captured.
           const concrete = concretePath(route.routeKey, params);
           let routePath = concrete.ok ? concrete.path : capturedPath;
           let url = concrete.ok ? joinUrl(this.config.appUrl, routePath) : route.url;
-          if (!concrete.ok && this.paramSources.has(route.routeKey)) {
-            const outcome = await this.fromSource(route.routeKey);
+          let provenance: Provenance = concrete.ok ? this.provenanceOf(route.routeKey) : { paramsFrom: route.paramsFrom, foundOn: route.foundOn };
+          if (!concrete.ok && this.filler?.canFill(route.routeKey)) {
+            const outcome = await this.fillRoute(route.routeKey);
             if (!outcome.ok) {
               this.log(`skipped route ${route.routeKey}: ${outcome.reason}`);
               continue;
             }
             routePath = outcome.path;
             url = joinUrl(this.config.appUrl, routePath);
+            provenance = { paramsFrom: outcome.from, foundOn: outcome.foundOn, discoveryMs: outcome.discoveryMs };
           }
           if (!targets.has(routePath)) {
-            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: recapture.trigger, sourceFile: recapture.sourceFile });
+            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: recapture.trigger, sourceFile: recapture.sourceFile, ...provenance });
           }
         }
         if (this.sessionRoutes.size === 0) this.log(`${recapture.why}: no routes captured this session yet`);
@@ -667,7 +718,8 @@ class Watcher {
         this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
         if (requeue) {
           // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
-          this.merge({ screen, backend, sidecar, startedAt: Date.now(), attempts: batch.attempts + 1 });
+          this.merge({ screen, backend, sidecar, params: paramKeys, paramsRev: batch.paramsRev, startedAt: Date.now(), attempts: batch.attempts + 1 });
+          requeued = true;
         }
         done('discarded', routes);
         return;
@@ -687,8 +739,10 @@ class Watcher {
             status: verdict.status,
             reasons: verdict.reasons,
             renderedFiles,
-            ...(timing ? { timing } : {}),
+            ...(timing ? { timing: { ...timing, ...(target.discoveryMs !== undefined ? { discoveryMs: target.discoveryMs } : {}) } } : {}),
             ...(steps ? { steps } : {}),
+            ...(target.paramsFrom ? { paramsFrom: target.paramsFrom } : {}),
+            ...(target.foundOn ? { paramsFoundOn: target.foundOn } : {}),
           },
           png,
         );
@@ -696,7 +750,7 @@ class Watcher {
         if (pageText !== undefined && this.config.decisions.verdict && this.config.decisions.enabled !== false) {
           writeTextSidecar(this.timeline.pngPath(frame), pageText);
         }
-        if (!steps) this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url });
+        if (!steps) this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url, paramsFrom: target.paramsFrom, foundOn: target.foundOn });
         this.status.frames++;
         this.status.lastCaptureAt = at;
         this.log(
@@ -713,6 +767,7 @@ class Watcher {
       this.fail(err as Error);
       done('error');
     } finally {
+      if (!requeued) this.ackSessionParams(batch);
       if (!this.stopping) this.setState('ready');
       if (this.graphStale && !this.stopping) this.refreshGraph();
     }
@@ -793,12 +848,15 @@ class Watcher {
     return jobs;
   }
 
-  /** A `goto` target is a concrete path, or a route key filled through routeParams, the seed file, then paramSources. */
+  /**
+   * A `goto` target is a concrete path, or a route key filled through the same chain as every capture: session params,
+   * the seed file, routeParams, paramSources, then link discovery (v0.8; `params` already has the first three).
+   */
   private async resolveGoto(target: string, params: Record<string, string>): Promise<{ url: string; path: string } | { error: string }> {
     const concrete = concretePath(target, params);
     if (concrete.ok) return { path: concrete.path, url: joinUrl(this.config.appUrl, concrete.path) };
-    if (this.paramSources.has(target)) {
-      const outcome = await this.fromSource(target);
+    if (this.filler?.canFill(target)) {
+      const outcome = await this.fillRoute(target);
       if (outcome.ok) return { path: outcome.path, url: joinUrl(this.config.appUrl, outcome.path) };
       return { error: `cannot fill ${target}: ${outcome.reason}` };
     }
@@ -819,16 +877,15 @@ class Watcher {
 
   // ---- routes --------------------------------------------------------------
 
-  /** Config `routeParams` plus the seed file, re-read per batch. Problems are logged once per distinct message. */
+  /** Session params over the seed file over config `routeParams`, re-read per batch. Problems are logged once per distinct message. */
   private readRouteParams(): Record<string, string> {
-    const result = loadRouteParams(this.config);
-    const problems = [...(result.error ? [result.error] : []), ...result.warnings];
-    const key = problems.join('\n');
+    const layered = this.layered();
+    const key = layered.problems.join('\n');
     if (key !== this.lastParamsProblems) {
       this.lastParamsProblems = key;
-      for (const problem of problems) this.log(`warning: ${problem}`);
+      for (const problem of layered.problems) this.log(`warning: ${problem}`);
     }
-    return result.params;
+    return layered.params;
   }
 
   private async resolveScreen(
@@ -866,14 +923,15 @@ class Watcher {
       url: r.url,
       trigger: 'screen' as const,
       sourceFile: r.sourceFiles[0],
+      ...this.provenanceOf(r.routeKey),
     }));
     for (const skip of resolution.skipped) {
-      if (!this.paramSources.has(skip.routeKey)) {
+      if (!this.filler?.canFill(skip.routeKey)) {
         this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
         continue;
       }
-      // Neither routeParams nor the seed file has it: ask the list endpoint.
-      const outcome = await this.fromSource(skip.routeKey);
+      // Neither the session, routeParams nor the seed file has it: ask the list endpoint, then the parent page's links.
+      const outcome = await this.fillRoute(skip.routeKey);
       if (!outcome.ok) {
         this.log(`skipped route ${skip.routeKey}: ${outcome.reason}`);
         continue;
@@ -884,6 +942,9 @@ class Watcher {
         url: joinUrl(this.config.appUrl, outcome.path),
         trigger: 'screen',
         sourceFile: skip.sourceFiles[0],
+        paramsFrom: outcome.from,
+        foundOn: outcome.foundOn,
+        discoveryMs: outcome.discoveryMs,
       });
     }
     return { targets, unmapped: resolution.unmapped };
@@ -905,6 +966,112 @@ class Watcher {
     }
     this.writeStatus();
     return outcome;
+  }
+
+  // ---- dynamic params (v0.8) ----------------------------------------------
+
+  /** Session, seed-file and config params merged; remembers which tier each key came from. */
+  private layered(): LayeredParams {
+    const layered = loadLayeredParams(this.config, this.files.sessionParams);
+    this.paramOrigin = layered.origin;
+    return layered;
+  }
+
+  /** `paramsFrom` for a route filled by the session, seed file or config; none for a route without params. */
+  private provenanceOf(routeKey: string): Provenance {
+    const from = this.paramOrigin[routeKey];
+    return from !== undefined && hasParams(routeKey) ? { paramsFrom: from } : {};
+  }
+
+  /** Link discovery needs a browser that can collect links; the filler chains source and discovery behind the cheap tiers. */
+  private setupParamFiller(): void {
+    const capturer = this.capturer;
+    if (this.config.paramDiscovery === 'links' && capturer?.collectLinks) {
+      this.discoverer = new ParamDiscoverer({
+        appUrl: this.config.appUrl,
+        collect: (url) => capturer.collectLinks!(url),
+        routes: async () => {
+          const graph = await this.getGraph();
+          return [...new Set([...graph.routes.map((r) => r.path), ...Object.values(this.config.staticRoutes).flat()])];
+        },
+        fillParent: async (routeKey, depth) => {
+          const outcome = await this.filler!.fill(routeKey, depth);
+          return outcome.ok ? { ok: true, path: outcome.path } : outcome;
+        },
+        onCacheChange: (entries) => writeDiscoveryCache(this.files.paramDiscovery, this.sessionId, entries),
+        log: (m) => this.log(m),
+      });
+    }
+    this.filler = new ParamFiller({
+      layered: () => this.layered(),
+      hasSource: (key) => this.paramSources.has(key),
+      fromSource: (key) => this.fromSource(key),
+      discoverer: this.discoverer,
+      onDiscovery: (key, outcome) => this.recordDiscovery(key, outcome),
+    });
+  }
+
+  private fillRoute(routeKey: string): Promise<FillOutcome> {
+    return this.filler!.fill(routeKey);
+  }
+
+  /** Keep the latest discovery outcome per route key in `status.json` so `finish` can say why a route stayed unfilled. */
+  private recordDiscovery(routeKey: string, outcome: DiscoveryOutcome): void {
+    const entries = (this.status.paramDiscovery ??= {});
+    const before = entries[routeKey];
+    if (outcome.ok) {
+      entries[routeKey] = { path: outcome.path, foundOn: outcome.foundOn, at: new Date().toISOString() };
+    } else {
+      if (before?.error !== outcome.reason) this.log(`warning: param discovery for ${routeKey}: ${outcome.reason}`);
+      entries[routeKey] = { ...(before?.path !== undefined ? { path: before.path, foundOn: before.foundOn } : {}), error: outcome.reason, at: new Date().toISOString() };
+    }
+    this.writeStatus();
+  }
+
+  /** Targets for routes whose session params were just set; a route cleared since is skipped. */
+  private addSessionTargets(keys: string[], targets: Map<string, Target>): void {
+    const { routes } = readSessionParams(this.files.sessionParams);
+    for (const routeKey of keys) {
+      const entry = routes[routeKey];
+      if (!entry) continue;
+      targets.set(entry.path, { path: entry.path, routeKey, url: joinUrl(this.config.appUrl, entry.path), trigger: 'params', paramsFrom: 'session' });
+    }
+  }
+
+  /** Watch `session-params.json`: a `params set` from the CLI queues its route for capture at the current tree. */
+  private async startSessionWatch(): Promise<void> {
+    const session = readSessionParams(this.files.sessionParams);
+    this.sessionSeen = session.routes; // entries from before this watcher started are tier-one params, but not captured by themselves
+    this.status.sessionParamsRev = session.rev;
+    if (Object.keys(session.routes).length > 0) this.log(`session params: ${Object.keys(session.routes).join(', ')} (from ${this.files.sessionParams})`);
+    const watch = this.opts.watchSession ?? watchSessionParams;
+    this.sessionWatch = await watch(this.files.sessionParams, () => this.onSessionParams(), (err) => this.fail(err));
+  }
+
+  private onSessionParams(): void {
+    if (this.stopping) return;
+    const session = readSessionParams(this.files.sessionParams);
+    const changed = changedSessionRoutes(this.sessionSeen, session.routes);
+    this.sessionSeen = session.routes;
+    if (changed.length === 0) {
+      // A clear, or a rewrite that changed nothing: nothing to capture, but `params set` may be waiting on the revision.
+      if (session.rev > (this.status.sessionParamsRev ?? 0) && this.pending === null) {
+        this.status.sessionParamsRev = session.rev;
+        this.writeStatus();
+      }
+      return;
+    }
+    this.log(`session params set for ${changed.join(', ')}; capturing`);
+    this.merge({ screen: [], backend: [], sidecar: [], params: changed, paramsRev: session.rev, startedAt: Date.now(), attempts: 0 });
+    if (!this.warmingUp) this.running ??= this.drain();
+    this.refreshPending();
+    this.writeStatus();
+  }
+
+  /** The session file revision this batch came from is handled (captured, refused or dropped): tell `params set`. */
+  private ackSessionParams(batch: Pending): void {
+    if (batch.paramsRev === undefined || this.stopping) return;
+    this.status.sessionParamsRev = Math.max(this.status.sessionParamsRev ?? 0, batch.paramsRev);
   }
 
   private getGraph(): Promise<ImportGraph> {

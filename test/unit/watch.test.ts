@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { CaptureResult, CaptureSignals, Capturer, PrimeResult, ScenarioPlan, ScenarioResult } from '../../src/browser.js';
+import type { CaptureResult, CaptureSignals, Capturer, LinkPage, PrimeResult, ScenarioPlan, ScenarioResult } from '../../src/browser.js';
 import type { JsonResponse } from '../../src/resolve/param-sources.js';
 import { parseConfig, type Config } from '../../src/config.js';
 import type { Dirs } from '../../src/paths.js';
 import type { ImportGraph } from '../../src/resolve/import-graph.js';
+import { clearSessionParams, readSessionParams, setSessionParams } from '../../src/resolve/session-params.js';
 import { Timeline } from '../../src/timeline.js';
 import type { FsWatchOptions, WatchBatch } from '../../src/trigger/fs-watch.js';
 import type { BarrierResult, HmrState } from '../../src/trigger/vite-hmr.js';
@@ -33,6 +34,8 @@ class FakeCapturer implements Capturer {
   failFor: (url: string) => boolean = () => false;
   /** Set to make the fake able to fetch JSON (paramSources); like `prime`, a fake without it cannot. */
   getJson?: (urlPath: string) => Promise<JsonResponse>;
+  /** Set to make the fake able to collect page links (link discovery); a fake without it cannot. */
+  collectLinks?: (url: string) => Promise<LinkPage>;
   /** Set to report a timing breakdown on each capture. */
   timing?: { settleMs: number; screenshotMs: number };
   /** Set to make the fake warm-up capable; the default fake cannot prime, like a capturer without the method. */
@@ -99,6 +102,7 @@ let capturer: FakeCapturer;
 let barrier: FakeBarrier;
 let pushBatch: (batch: Partial<WatchBatch>) => void;
 let fireEvent: () => void;
+let fireSession: () => void;
 let triggerStopped: boolean;
 let eventCounter: number;
 let handle: WatchHandle | null;
@@ -148,6 +152,11 @@ async function start(overrides: Parameters<typeof startWatch>[1] = {}): Promise<
     treeHash: async () => {
       treeCalls++;
       return tree;
+    },
+    // The real watcher on session-params.json is covered by session-watch.test.ts and the integration tests.
+    watchSession: async (_file: string, onChange: () => void) => {
+      fireSession = onChange;
+      return { stop: async () => {} };
     },
     startTrigger: async (options: FsWatchOptions) => {
       pushBatch = (batch) =>
@@ -1238,6 +1247,41 @@ describe('sidecar scenarios', () => {
     expect(plans[0]!.gotos.get(2)).toEqual({ url: 'http://app.test/invoices/7', path: '/invoices/7' });
   });
 
+  it('resolves a route-key goto through session params, which outrank routeParams (v0.8)', async () => {
+    config = parseConfig({ appUrl: 'http://app.test', screenGlobs: ['src/**'], routeFiles: ['src/router/**/*.js'], routeParams: { '/invoices/:id': '/invoices/1' } }, repo, {});
+    setSessionParams(path.join(dirs.statusDir, 'session-params.json'), '/invoices/:id', { path: '/invoices/9', params: { id: '9' }, at: new Date().toISOString() });
+    await startSc();
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    expect(plans[0]!.gotos.get(2)).toEqual({ url: 'http://app.test/invoices/9', path: '/invoices/9' });
+  });
+
+  it('resolves a route-key goto by link discovery when no other tier has it (v0.8)', async () => {
+    config = parseConfig({ appUrl: 'http://app.test', screenGlobs: ['src/**'], routeFiles: ['src/router/**/*.js'] }, repo, {});
+    const loaded: string[] = [];
+    capturer.collectLinks = async (url) => {
+      loaded.push(url);
+      return { ok: true, hrefs: ['http://app.test/invoices/4'], ms: 1 };
+    };
+    const routes = ['/', '/invoices', '/invoices/:id'].map((p) => ({ path: p, routeFile: 'src/router/index.js', component: null, layouts: [], dynamic: false }));
+    await startSc({ buildGraph: async () => ({ ...graph, routes }) });
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    expect(loaded).toEqual(['http://app.test/invoices']);
+    expect(plans[0]!.gotos.get(2)).toEqual({ url: 'http://app.test/invoices/4', path: '/invoices/4' });
+  });
+
+  it('a goto that discovery cannot fill reports why (v0.8)', async () => {
+    config = parseConfig({ appUrl: 'http://app.test', screenGlobs: ['src/**'], routeFiles: ['src/router/**/*.js'] }, repo, {});
+    capturer.collectLinks = async () => ({ ok: true, hrefs: [], ms: 1 });
+    const routes = ['/', '/invoices', '/invoices/:id'].map((p) => ({ path: p, routeFile: 'src/router/index.js', component: null, layouts: [], dynamic: false }));
+    await startSc({ buildGraph: async () => ({ ...graph, routes }) });
+    pushBatch({ sidecar: [SC] });
+    await nextBatch();
+    const goto = plans[0]!.gotos.get(2)!;
+    expect('error' in goto && goto.error).toBe('cannot fill /invoices/:id: discovery: no link matching /invoices/:id on /invoices (the page has no links)');
+  });
+
   it('an unfillable route key is passed on as the goto error, so the scenario fails at that line', async () => {
     config = parseConfig({ appUrl: 'http://app.test', screenGlobs: ['src/**'], routeFiles: ['src/router/**/*.js'] }, repo, {});
     await startSc();
@@ -1322,5 +1366,358 @@ describe('sidecar scenarios', () => {
     pushBatch({ sidecar: [SC] });
     await nextBatch();
     expect(plans).toEqual([]);
+  });
+});
+
+describe('link discovery (v0.8)', () => {
+  const DETAIL = 'src/pages/Detail.vue';
+  const discoveryGraph: ImportGraph = {
+    fileToRoutes: new Map([
+      [DETAIL, ['/invoices/:id']],
+      ['src/pages/Team.vue', ['/clubs/:clubId/teams/:teamId']],
+    ]),
+    routes: ['/', '/invoices', '/invoices/:id', '/clubs', '/clubs/:clubId/teams', '/clubs/:clubId/teams/:teamId'].map((path) => ({
+      path,
+      routeFile: 'src/router/index.js',
+      component: null,
+      layouts: [],
+      dynamic: false,
+    })),
+    unresolved: [],
+  };
+  let pages: Record<string, string[]>;
+  let loaded: string[];
+
+  const configure = (extra: Record<string, unknown> = {}): void => {
+    config = parseConfig(
+      { appUrl: 'http://app.test', freshnessMarker: '.hot', routeFiles: ['src/router/**/*.js'], screenGlobs: ['src/**'], backendGlobs: ['server/**'], ...extra },
+      repo,
+      {},
+    );
+  };
+  const startDiscovery = (overrides: Parameters<typeof startWatch>[1] = {}) => start({ buildGraph: async () => discoveryGraph, ...overrides });
+
+  beforeEach(() => {
+    configure();
+    pages = { '/invoices': ['/', '/invoices/12', '/invoices/13'] };
+    loaded = [];
+    capturer.timing = { settleMs: 30, screenshotMs: 10 };
+    capturer.collectLinks = async (url) => {
+      loaded.push(url);
+      const hrefs = pages[new URL(url).pathname];
+      return hrefs ? { ok: true, hrefs, ms: 1 } : { ok: false, hrefs: [], error: 'HTTP 404', ms: 1 };
+    };
+  });
+
+  it('fills a param route nobody configured from the first matching link of its parent page', async () => {
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(loaded).toEqual(['http://app.test/invoices']);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/12']);
+    const frame = timeline().list()[0]!;
+    expect(frame).toMatchObject({ route: '/invoices/12', routeKey: '/invoices/:id', status: 'clean', trigger: 'screen', paramsFrom: 'discovered', paramsFoundOn: '/invoices' });
+    expect(frame.timing).toMatchObject({ settleMs: 30, screenshotMs: 10, discoveryMs: expect.any(Number) });
+    expect(statusJson().paramDiscovery['/invoices/:id']).toMatchObject({ path: '/invoices/12', foundOn: '/invoices' });
+    expect(statusJson().paramDiscovery['/invoices/:id'].error).toBeUndefined();
+    expect(logText()).toContain('param discovery: /invoices/:id -> /invoices/12 (found on /invoices,');
+    expect(JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'param-discovery.json'), 'utf8'))).toMatchObject({
+      sessionId: handle!.sessionId,
+      routes: { '/invoices/:id': { path: '/invoices/12', foundOn: '/invoices' } },
+    });
+  });
+
+  it('caches the id for the session: a second batch does not load the parent again', async () => {
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch(2);
+    expect(loaded).toEqual(['http://app.test/invoices']);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/12', 'http://app.test/invoices/12']);
+  });
+
+  it('a backend change drops the cache and discovers again, so a re-seeded id is followed', async () => {
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    pages['/invoices'] = ['/invoices/30'];
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(loaded).toEqual(['http://app.test/invoices', 'http://app.test/invoices']);
+    expect(capturer.urls.at(-1)).toBe('http://app.test/invoices/30');
+    expect(timeline().list().at(-1)).toMatchObject({ route: '/invoices/30', trigger: 'backend', paramsFrom: 'discovered' });
+    expect(JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'param-discovery.json'), 'utf8')).routes['/invoices/:id'].path).toBe('/invoices/30');
+  });
+
+  it('a route discovery cannot fill is skipped and not reused after a backend change; the reason is in status.json and the log', async () => {
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    pages['/invoices'] = ['/'];
+    capturer.urls = [];
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual([]);
+    expect(statusJson().paramDiscovery['/invoices/:id']).toMatchObject({ path: '/invoices/12', error: 'no link matching /invoices/:id on /invoices' });
+    expect(logText()).toContain('warning: param discovery for /invoices/:id: no link matching /invoices/:id on /invoices');
+    expect(logText()).toContain('skipped route /invoices/:id: discovery: no link matching /invoices/:id on /invoices');
+  });
+
+  it('does not cache a failure: the next batch tries again', async () => {
+    pages['/invoices'] = [];
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(timeline().list()).toEqual([]);
+    expect(statusJson().paramDiscovery['/invoices/:id'].error).toBe('no link matching /invoices/:id on /invoices (the page has no links)');
+    pages['/invoices'] = ['/invoices/5'];
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch(2);
+    expect(loaded).toHaveLength(2);
+    expect(timeline().list()[0]).toMatchObject({ route: '/invoices/5', paramsFrom: 'discovered' });
+    expect(statusJson().paramDiscovery['/invoices/:id'].error).toBeUndefined();
+  });
+
+  it('fills a nested route through its parent, which is discovered first', async () => {
+    pages = { '/clubs': ['/clubs/4/teams'], '/clubs/4/teams': ['/clubs/4/teams/40'] };
+    await startDiscovery();
+    pushBatch({ screen: ['src/pages/Team.vue'] });
+    await nextBatch();
+    expect(loaded).toEqual(['http://app.test/clubs', 'http://app.test/clubs/4/teams']);
+    expect(timeline().list()[0]).toMatchObject({ route: '/clubs/4/teams/40', paramsFrom: 'discovered', paramsFoundOn: '/clubs/4/teams' });
+    const entries = statusJson().paramDiscovery;
+    expect(entries['/clubs/:clubId/teams']).toMatchObject({ path: '/clubs/4/teams', foundOn: '/clubs' });
+    expect(entries['/clubs/:clubId/teams/:teamId']).toMatchObject({ path: '/clubs/4/teams/40', foundOn: '/clubs/4/teams' });
+  });
+
+  it('paramDiscovery "off" never loads a parent page', async () => {
+    configure({ paramDiscovery: 'off' });
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(loaded).toEqual([]);
+    expect(capturer.urls).toEqual([]);
+    expect(logText()).toContain('skipped route /invoices/:id: no routeParams entry for /invoices/:id');
+    expect(statusJson().paramDiscovery).toBeUndefined();
+  });
+
+  it('a capturer that cannot collect links leaves the route skipped, as before', async () => {
+    capturer.collectLinks = undefined;
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(capturer.urls).toEqual([]);
+    expect(logText()).toContain('skipped route /invoices/:id: no routeParams entry for /invoices/:id');
+  });
+
+  it('prefers routeParams, then a working list endpoint, over discovery; a failing list endpoint falls through to it', async () => {
+    configure({ routeParams: { '/invoices/:id': '/invoices/1' } });
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(loaded).toEqual([]);
+    expect(timeline().list()[0]).toMatchObject({ route: '/invoices/1', paramsFrom: 'config' });
+    await handle!.stop();
+    handle = null;
+    batches = [];
+    fs.rmSync(dirs.scratchDir, { recursive: true, force: true });
+
+    configure({ paramSources: { '/invoices/:id': { url: '/api/i', pick: '0.id' } } });
+    capturer.getJson = async () => ({ status: 200, json: [{ id: 99 }] });
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(loaded).toEqual([]);
+    expect(timeline().list()[0]).toMatchObject({ route: '/invoices/99', paramsFrom: 'source' });
+    await handle!.stop();
+    handle = null;
+    batches = [];
+    fs.rmSync(dirs.scratchDir, { recursive: true, force: true });
+
+    capturer.getJson = async () => ({ status: 500, error: 'HTTP 500' });
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(loaded).toEqual(['http://app.test/invoices']);
+    expect(timeline().list()[0]).toMatchObject({ route: '/invoices/12', paramsFrom: 'discovered' });
+    expect(statusJson().paramSources['/invoices/:id'].error).toBe('paramSources /api/i failed: HTTP 500');
+  });
+
+  it('labels a route filled from the config or the seed file with its tier', async () => {
+    configure({ routeParams: { '/invoices/:id': '/invoices/1' }, routeParamsFile: '.vp/params.json' });
+    fs.mkdirSync(path.join(repo, '.vp'));
+    fs.writeFileSync(path.join(repo, '.vp/params.json'), JSON.stringify({ '/invoices/:id': '/invoices/2' }));
+    await startDiscovery();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(timeline().list().map((f) => [f.route, f.paramsFrom])).toEqual([['/invoices/2', 'file']]);
+  });
+});
+
+describe('session params (v0.8)', () => {
+  const DETAIL = 'src/pages/Detail.vue';
+  const sessionFile = (): string => path.join(dirs.statusDir, 'session-params.json');
+  const set = (routeKey: string, routePath: string): number =>
+    setSessionParams(sessionFile(), routeKey, { path: routePath, params: {}, at: new Date().toISOString() });
+
+  beforeEach(() => {
+    config = parseConfig(
+      {
+        appUrl: 'http://app.test',
+        freshnessMarker: '.hot',
+        routeFiles: ['src/router/**/*.js'],
+        screenGlobs: ['src/**'],
+        backendGlobs: ['server/**'],
+        routeParams: { '/invoices/:id': '/invoices/1' },
+      },
+      repo,
+      {},
+    );
+  });
+
+  it('a params set captures its route at the current tree, with no file change, and acknowledges the revision', async () => {
+    await start();
+    expect(statusJson().sessionParamsRev).toBe(0);
+    const rev = set('/invoices/:id', '/invoices/5');
+    fireSession();
+    await nextBatch();
+    expect(batches[0]).toMatchObject({ screen: [], backend: [], routes: ['/invoices/5'], outcome: 'captured' });
+    expect(capturer.urls).toEqual(['http://app.test/invoices/5']);
+    expect(timeline().list()[0]).toMatchObject({
+      route: '/invoices/5',
+      routeKey: '/invoices/:id',
+      trigger: 'params',
+      paramsFrom: 'session',
+      treeHash: tree,
+      status: 'clean',
+    });
+    expect(statusJson()).toMatchObject({ sessionParamsRev: rev, pending: false, state: 'ready' });
+    expect(logText()).toContain('session params set for /invoices/:id; capturing');
+  });
+
+  it('marks the watcher pending from the moment it hears of the change until the capture is done', async () => {
+    await start();
+    let during: Record<string, unknown> | null = null;
+    capturer.onCapture = () => {
+      during = statusJson();
+    };
+    set('/invoices/:id', '/invoices/5');
+    fireSession();
+    expect(statusJson()).toMatchObject({ pending: true });
+    await nextBatch();
+    expect(during).toMatchObject({ state: 'capturing', pending: true, sessionParamsRev: 0 }); // acknowledged only once handled
+    expect(statusJson()).toMatchObject({ pending: false, sessionParamsRev: 1 });
+  });
+
+  it('outranks routeParams in the next screen batch too, and clearing falls back to them', async () => {
+    await start();
+    set('/invoices/:id', '/invoices/5');
+    fireSession();
+    await nextBatch();
+    capturer.urls = [];
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/5']);
+    expect(timeline().list().at(-1)).toMatchObject({ trigger: 'screen', paramsFrom: 'session' });
+
+    clearSessionParams(sessionFile(), '/invoices/:id');
+    fireSession();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch(3);
+    expect(capturer.urls.at(-1)).toBe('http://app.test/invoices/1');
+    expect(timeline().list().at(-1)).toMatchObject({ paramsFrom: 'config' });
+  });
+
+  it('a clear, or a rewrite that changes nothing, captures nothing but acknowledges the revision', async () => {
+    await start();
+    set('/invoices/:id', '/invoices/5');
+    fireSession();
+    await nextBatch();
+    capturer.urls = [];
+    const rev = clearSessionParams(sessionFile()).rev;
+    fireSession();
+    expect(capturer.urls).toEqual([]);
+    expect(batches).toHaveLength(1);
+    expect(statusJson().sessionParamsRev).toBe(rev);
+  });
+
+  it('entries that were already there when the watcher started are used but not captured by themselves', async () => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    const rev = set('/invoices/:id', '/invoices/8');
+    await start();
+    expect(statusJson().sessionParamsRev).toBe(rev);
+    expect(logText()).toContain('session params: /invoices/:id');
+    fireSession();
+    expect(capturer.urls).toEqual([]);
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    expect(capturer.urls).toEqual(['http://app.test/invoices/8']);
+  });
+
+  it('a backend change re-captures the session route at its session path', async () => {
+    await start();
+    set('/invoices/:id', '/invoices/5');
+    fireSession();
+    await nextBatch();
+    capturer.urls = [];
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/5']);
+    expect(timeline().list().at(-1)).toMatchObject({ trigger: 'backend', paramsFrom: 'session' });
+  });
+
+  it('merges a set that arrives while a capture runs into the next batch', async () => {
+    await start();
+    const unblock: { release?: () => void } = {};
+    capturer.onCapture = () => new Promise<void>((resolve) => (unblock.release = resolve));
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await new Promise((r) => setTimeout(r, 30));
+    capturer.onCapture = () => {};
+    set('/invoices/:id', '/invoices/6');
+    fireSession();
+    unblock.release!();
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/', 'http://app.test/invoices/6']);
+  });
+
+  it('a refused capture (stale freshness marker) still acknowledges, so params set stops waiting', async () => {
+    await start();
+    fs.rmSync(path.join(repo, '.hot'));
+    const refused: unknown[] = [];
+    handle!.events.on('refused', (e) => refused.push(e));
+    const rev = set('/invoices/:id', '/invoices/5');
+    fireSession();
+    await nextBatch();
+    expect(refused).toHaveLength(1);
+    expect(capturer.urls).toEqual([]);
+    expect(statusJson().sessionParamsRev).toBe(rev);
+  });
+
+  it('keeps the route and the revision across a discarded, re-queued batch, and acknowledges only the final one', async () => {
+    await start();
+    let calls = 0;
+    capturer.onCapture = () => {
+      if (calls++ === 0) tree = 'b'.repeat(40); // the tree moves under the first capture
+    };
+    const rev = set('/invoices/:id', '/invoices/5');
+    fireSession();
+    await nextBatch(2);
+    expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'captured']);
+    expect(timeline().list()).toHaveLength(1);
+    expect(timeline().list()[0]).toMatchObject({ route: '/invoices/5', paramsFrom: 'session', treeHash: 'b'.repeat(40) });
+    expect(statusJson().sessionParamsRev).toBe(rev);
+  });
+
+  it('a broken session file is logged once and the other tiers still apply', async () => {
+    await start();
+    fs.writeFileSync(sessionFile(), '{ nope');
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch();
+    pushBatch({ screen: [DETAIL] });
+    await nextBatch(2);
+    expect(capturer.urls).toEqual(['http://app.test/invoices/1', 'http://app.test/invoices/1']);
+    expect(logText().match(/warning: session params file is not valid JSON/g)).toHaveLength(1);
+    expect(readSessionParams(sessionFile()).error).toBeDefined();
   });
 });
