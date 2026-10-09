@@ -5,6 +5,7 @@ import type { Config } from './config.js';
 import { SIDECAR_TEXT_LIMIT } from './decisions/sidecar.js';
 import { firstLine } from './text.js';
 import { hostBlocker } from './hosts.js';
+import { ACTION_PAUSE_MS, CURSOR_HIDE_CSS, CURSOR_SCRIPT, GLIDE_STEP_MS, glidePath, nonCssSelectors, recordingStyleScript, ScreenRecorder, typingDelayMs, type Point } from './motion.js';
 import { normalizeRenderedFiles, renderedFilesScript } from './rendered.js';
 import { FAILED_STILL, roleEmail, type SidecarStep } from './sidecar.js';
 import type { FrameStep } from './timeline.js';
@@ -123,6 +124,11 @@ export interface ScenarioPlan {
   steps: SidecarStep[];
   /** Per `goto` line: where it goes, or why it cannot (unfilled route params). */
   gotos: Map<number, { url: string; path: string } | { error: string }>;
+  /**
+   * Record the run as a motion clip (v0.9) into `dir`, which must not exist yet: a drawn cursor glides to what it
+   * clicks and fills are typed, and each still shows for `holdMs`. Absent: run as fast as possible, no clip.
+   */
+  record?: { dir: string; holdMs: number };
 }
 
 /** One still of a scenario: a normal capture plus the steps that led to it. */
@@ -144,9 +150,18 @@ export interface ScenarioStill {
 
 export interface ScenarioResult {
   stills: ScenarioStill[];
+  /** The motion clip, when the plan asked for one and something was recorded. */
+  clip?: RecordedClip;
   /** The step that stopped the scenario, if any. */
   failure?: { line: number; text: string; reason: string };
   ms: number;
+}
+
+export interface RecordedClip {
+  /** The plan's `record.dir`, holding the JPEGs and `manifest.json`. */
+  dir: string;
+  frames: number;
+  seconds: number;
 }
 
 export class LoginError extends Error {
@@ -227,6 +242,8 @@ export class Browser implements Capturer {
   private blockedCount = 0;
   /** Mask selectors already reported as invalid, so the log says it once. */
   private readonly badMasks = new Set<string>();
+  /** The motion-clip warning about Playwright-only mask selectors was logged. */
+  private warnedUncoveredMasks = false;
 
   constructor(
     private readonly config: BrowserConfig,
@@ -642,6 +659,7 @@ export class Browser implements Capturer {
         type: 'png',
         animations: 'disabled',
         caret: 'hide',
+        style: CURSOR_HIDE_CSS,
       })
       .catch((err: Error) => {
         error = err.message.split('\n')[0] || err.name;
@@ -701,6 +719,23 @@ export class Browser implements Capturer {
 
     const watched = await this.openPage(context);
     const { page } = watched;
+    let recorder: ScreenRecorder | undefined;
+    if (plan.record) {
+      recorder = new ScreenRecorder(plan.record.dir, plan.name, this.config.viewport, (m) => this.log(m));
+      try {
+        // The recording should show the app's own transitions; stills disable animations themselves.
+        await page.emulateMedia({ reducedMotion: 'no-preference' });
+        await page.addInitScript(CURSOR_SCRIPT);
+        await page.addInitScript(recordingStyleScript(this.config.hideSelectors, this.config.maskSelectors));
+        const uncovered = nonCssSelectors(this.config.maskSelectors);
+        if (uncovered.length > 0 && !this.warnedUncoveredMasks) {
+          this.warnedUncoveredMasks = true;
+          this.log(`recording: maskSelectors ${uncovered.map((m) => JSON.stringify(m)).join(', ')} are not CSS and stay visible in motion clips`);
+        }
+      } catch (err) {
+        this.log(`scenario ${plan.file}: preparing the recording failed: ${firstLine(err)}`);
+      }
+    }
     const run: ScenarioRun = {
       plan,
       watched,
@@ -713,8 +748,12 @@ export class Browser implements Capturer {
       cancelled: false,
       failure: undefined,
       current: null,
+      recorder,
+      holdMs: plan.record?.holdMs ?? 0,
+      mouse: { x: Math.round(this.config.viewport.width / 2), y: Math.round(this.config.viewport.height / 2) },
     };
 
+    let clip: RecordedClip | undefined;
     try {
       const body = this.runSteps(run).catch((err: Error) => {
         // A bug or a closed page, not a step failing: still report it against the step it happened in.
@@ -736,11 +775,12 @@ export class Browser implements Capturer {
 
       if (run.failure) run.stills.push(await this.failureStill(run));
     } finally {
+      if (recorder) clip = (await recorder.stop(run.holdMs).catch(() => null)) ?? undefined;
       this.pages.delete(page);
       await page.close().catch(() => {});
       await this.restoreDefaultLogin();
     }
-    return { stills: run.stills, ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started };
+    return { stills: run.stills, ...(clip ? { clip } : {}), ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started };
   }
 
   private async runSteps(run: ScenarioRun): Promise<void> {
@@ -752,8 +792,17 @@ export class Browser implements Capturer {
         run.failure = failureOf(step, 'scenario exceeded its time limit');
         return;
       }
+      if (run.recorder) {
+        // Start once there is a page to show: before the first step that is not a navigation or a login.
+        if (!run.recorder.started && step.verb !== 'goto' && step.verb !== 'login') await this.beginRecording(run);
+        run.recorder.caption(`${run.plan.name} / ${step.text}`);
+      }
       const reason = await this.runStep(run, step);
       if (run.cancelled) return;
+      if (run.recorder && reason === null && step.verb === 'goto') {
+        if (!run.recorder.started) await this.beginRecording(run);
+        else await run.watched.page.mouse.move(run.mouse.x, run.mouse.y).catch(() => {}); // the new page's cursor
+      }
       if (reason !== null) {
         run.failure = failureOf(step, reason);
         return;
@@ -777,7 +826,8 @@ export class Browser implements Capturer {
         const target = await this.findTarget(page, step.selector, timeout());
         if (typeof target === 'string') return target;
         try {
-          if (step.verb === 'click') await target.click({ timeout: timeout() });
+          if (run.recorder?.started) await this.humanAction(run, step, target, timeout);
+          else if (step.verb === 'click') await target.click({ timeout: timeout() });
           else await target.fill(step.value, { timeout: timeout() });
         } catch (err) {
           return `${step.verb} failed: ${firstLine(err)}`;
@@ -788,7 +838,8 @@ export class Browser implements Capturer {
 
       case 'press': {
         try {
-          await page.keyboard.press(step.key);
+          if (run.recorder?.started) await page.keyboard.press(step.key, { delay: 60 });
+          else await page.keyboard.press(step.key);
         } catch (err) {
           return `press failed: ${firstLine(err)}`;
         }
@@ -825,8 +876,10 @@ export class Browser implements Capturer {
         const started = Date.now();
         const dom = await this.settleAndRead(run.watched, label, Math.min(this.config.settle.maxWaitMs, left()));
         const settleMs = Date.now() - started;
+        run.recorder?.pause(); // preparing the page for the screenshot is not part of the flow
         const shot = await this.shoot(page, label, network, true);
         await page.evaluate(UNPREPARE_SCRIPT).catch(() => {}); // the scenario goes on from this very page
+        run.recorder?.resume(run.holdMs);
         if (run.cancelled) return null; // the time limit already ended this scenario; its failure still is the last one
         const signals = this.scenarioSignals(run, dom, shot.error);
         run.stills.push({
@@ -916,6 +969,52 @@ export class Browser implements Capturer {
     const cap = Math.min(this.config.settle.maxWaitMs, 2000, Math.max(1, run.deadline - Date.now()));
     await run.watched.network.wait(this.config.settle.networkIdleMs, cap);
     await settle(run.watched.page);
+    // Recording: give the viewer a beat to see what the action did.
+    if (run.recorder?.started) await sleep(Math.min(ACTION_PAUSE_MS, Math.max(0, run.deadline - Date.now())));
+  }
+
+  /** Start the screencast with the cursor in the middle of the view. */
+  private async beginRecording(run: ScenarioRun): Promise<void> {
+    const { page } = run.watched;
+    await page.mouse.move(run.mouse.x, run.mouse.y).catch(() => {});
+    await run.recorder!.begin(page);
+  }
+
+  /**
+   * A click or fill the way a person does it, for the recording: the cursor glides to the element, then clicks it,
+   * or focuses it and types the value. Typing that does not end in the value (masked or date inputs) falls back to
+   * a plain fill, so the page ends where a fill would leave it.
+   */
+  private async humanAction(
+    run: ScenarioRun,
+    step: Extract<SidecarStep, { verb: 'click' | 'fill' }>,
+    target: Locator,
+    timeout: () => number,
+  ): Promise<void> {
+    const { page } = run.watched;
+    await target.scrollIntoViewIfNeeded({ timeout: timeout() }).catch(() => {});
+    const box = await target.boundingBox().catch(() => null);
+    if (box) {
+      const to = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+      for (const point of glidePath(run.mouse, to)) {
+        if (run.cancelled || run.deadline - Date.now() <= 0) break;
+        await page.mouse.move(point.x, point.y);
+        await sleep(GLIDE_STEP_MS);
+      }
+      run.mouse = to;
+      await sleep(Math.min(120, Math.max(0, run.deadline - Date.now())));
+    }
+    if (step.verb === 'click') {
+      await target.click({ timeout: timeout() });
+      return;
+    }
+    // Show the press without clicking: a click could open what a fill never would (a date picker).
+    await page.evaluate(`window.__vpCursor && window.__vpCursor.ring(${run.mouse.x}, ${run.mouse.y})`).catch(() => {});
+    await target.fill('', { timeout: timeout() });
+    await target.focus({ timeout: timeout() });
+    await target.pressSequentially(step.value, { delay: typingDelayMs(step.value.length), timeout: timeout() });
+    const typed = await target.inputValue({ timeout: 500 }).catch(() => null);
+    if (typed !== null && typed !== step.value) await target.fill(step.value, { timeout: timeout() });
   }
 
   private scenarioSignals(run: ScenarioRun, fullDom: Dom, screenshotError?: string): CaptureSignals {
@@ -943,6 +1042,7 @@ export class Browser implements Capturer {
     const pending = run.plan.steps.find((s) => s.verb === 'still' && s.line >= failure.line);
     const name = pending && pending.verb === 'still' ? pending.name : FAILED_STILL;
     const { page, network } = run.watched;
+    run.recorder?.pause();
 
     // Best effort and bounded: the page may be hung, closed, or mid-navigation.
     const guard = <T>(work: Promise<T>, fallback: T, ms = 4000): Promise<T> =>
@@ -1168,7 +1268,15 @@ interface ScenarioRun {
   cancelled: boolean;
   failure: { line: number; text: string; reason: string } | undefined;
   current: SidecarStep | null;
+  /** Set when the plan asked for a motion clip. */
+  recorder: ScreenRecorder | undefined;
+  /** How long each still shows in the clip (ms). */
+  holdMs: number;
+  /** Where the mouse is (viewport px); glides start here. */
+  mouse: Point;
 }
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function failureOf(step: SidecarStep | null, reason: string): { line: number; text: string; reason: string } {
   return { line: step?.line ?? 0, text: step?.text ?? '', reason };

@@ -178,3 +178,34 @@ describe('Timeline.latestAtTree', () => {
     expect(new Timeline(scratch, 10).latestAtTree('/invoices/1', tree1)?.id).toBe('f-000001');
   });
 });
+
+describe('Timeline clips (v0.9)', () => {
+  it('a clip dir is removed with the last frame that uses it', () => {
+    const tl = new Timeline(scratch, 2);
+    const a = tl.newClip();
+    const b = tl.newClip();
+    expect(a.clip).not.toBe(b.clip);
+    expect(a.dir).toBe(path.join(scratch, a.clip));
+    for (const c of [a, b]) {
+      fs.mkdirSync(c.dir, { recursive: true });
+      fs.writeFileSync(path.join(c.dir, 'manifest.json'), '{}');
+    }
+    tl.append(frame({ clip: a.clip }), png(1));
+    tl.append(frame({ clip: a.clip }), png(2));
+    const third = tl.append(frame({ clip: b.clip }), png(3)); // evicts frame 1; frame 2 still uses a
+    expect(fs.existsSync(a.dir)).toBe(true);
+    expect(tl.clipPath(third)).toBe(b.dir);
+    tl.append(frame(), png(4)); // evicts frame 2: a goes
+    expect(fs.existsSync(a.dir)).toBe(false);
+    expect(fs.existsSync(b.dir)).toBe(true);
+    expect(tl.clipPath(tl.list().at(-1)!)).toBeUndefined();
+  });
+
+  it('dropClip removes a clip no frame was written for', () => {
+    const tl = new Timeline(scratch, 5);
+    const c = tl.newClip();
+    fs.mkdirSync(c.dir, { recursive: true });
+    tl.dropClip(c.clip);
+    expect(fs.existsSync(c.dir)).toBe(false);
+  });
+});

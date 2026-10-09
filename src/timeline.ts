@@ -45,6 +45,11 @@ export interface Frame {
   paramsFrom?: ParamsFrom;
   /** v0.8: with `paramsFrom: "discovered"`, the page whose links gave the id. */
   paramsFoundOn?: string;
+  /**
+   * v0.9, sidecar frames only: the motion clip of the run the still came from (a directory relative to the scratch
+   * dir, `clips/<id>`). Every still of one run shares it.
+   */
+  clip?: string;
   /** Path of the PNG relative to the scratch dir. */
   png: string;
 }
@@ -52,10 +57,12 @@ export interface Frame {
 export type NewFrame = Omit<Frame, 'id' | 'png'>;
 
 const INDEX_FILE = 'index.jsonl';
+const CLIPS_DIR = 'clips';
+let clipSeq = 0;
 
 /**
  * Scratch-dir frame store: `index.jsonl` (one Frame per line, oldest first) plus
- * `frames/<id>.png`. All I/O is synchronous so ids cannot interleave within a process;
+ * `frames/<id>.png`, and `clips/<id>/` for motion clips (v0.9). All I/O is synchronous so ids cannot interleave within a process;
  * the next id is re-derived from the index on every append so restarts continue the sequence.
  */
 export class Timeline {
@@ -113,6 +120,21 @@ export class Timeline {
     return path.join(this.scratchDir, frame.png);
   }
 
+  /** A fresh, not yet created clip directory: `clip` goes on the frames, `dir` to the recorder. */
+  newClip(): { clip: string; dir: string } {
+    const clip = `${CLIPS_DIR}/c-${Date.now().toString(36)}-${process.pid}-${(++clipSeq).toString(36)}`;
+    return { clip, dir: path.join(this.scratchDir, clip) };
+  }
+
+  clipPath(frame: Pick<Frame, 'clip'>): string | undefined {
+    return frame.clip ? path.join(this.scratchDir, frame.clip) : undefined;
+  }
+
+  /** Remove a clip no frame was written for (a discarded batch). */
+  dropClip(clip: string): void {
+    fs.rmSync(path.join(this.scratchDir, clip), { recursive: true, force: true });
+  }
+
   private evict(records: Frame[]): void {
     const excess = records.length - this.maxFrames;
     if (excess <= 0) return;
@@ -121,6 +143,9 @@ export class Timeline {
     fs.writeFileSync(tempPath, records.slice(excess).map((r) => `${JSON.stringify(r)}\n`).join(''));
     fs.renameSync(tempPath, this.indexPath);
     for (const old of records.slice(0, excess)) fs.rmSync(this.pngPath(old), { force: true });
+    // A clip goes with the last frame that uses it.
+    const kept = new Set(records.slice(excess).map((r) => r.clip));
+    for (const old of records.slice(0, excess)) if (old.clip && !kept.has(old.clip)) this.dropClip(old.clip);
   }
 
   private readIndex(): Frame[] {
