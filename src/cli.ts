@@ -23,6 +23,8 @@ export interface ParsedArgs {
   json: boolean;
   /** `doctor --json --normalize`: strip machine-specific details from the report. */
   normalize: boolean;
+  /** `doctor --probe-decisions`: probe the decisions models even when the app is not up. */
+  probeDecisions: boolean;
   /** `status --wait` (and the `ready` command): block until the watcher is ready. */
   wait: boolean;
   /** Seconds `--wait` may block; undefined means the default. */
@@ -51,6 +53,8 @@ Options:
   --json            finish, doctor: print the result as JSON on stdout
   --normalize       doctor --json: strip ports, absolute paths, hashes, timings and
                     versions, so the report can be checked in as a golden file
+  --probe-decisions doctor only: send one tiny request to each decisions model (needs
+                    OPENROUTER_API_KEY); without it they are probed only when the app is up
   --wait            status: block until the watcher is ready with nothing pending
                     (exit 0), or fail fast on error / a dead watcher / stop (exit 1)
   --timeout <s>     status --wait, ready: give up after this many seconds
@@ -92,7 +96,7 @@ Examples:
 `;
 
 export function parseArgs(argv: string[]): ParsedArgs {
-  const parsed: ParsedArgs = { command: null, hook: false, json: false, normalize: false, wait: false, help: false };
+  const parsed: ParsedArgs = { command: null, hook: false, json: false, normalize: false, probeDecisions: false, wait: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '-h' || arg === '--help') {
@@ -103,6 +107,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       parsed.json = true;
     } else if (arg === '--normalize') {
       parsed.normalize = true;
+    } else if (arg === '--probe-decisions') {
+      parsed.probeDecisions = true;
     } else if (arg === '--wait') {
       parsed.wait = true;
     } else if (arg === '--timeout' || arg.startsWith('--timeout=')) {
@@ -132,6 +138,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
   if (parsed.normalize && !parsed.help && (parsed.command !== 'doctor' || !parsed.json)) {
     throw new UsageError('--normalize is only valid with doctor --json');
+  }
+  if (parsed.probeDecisions && parsed.command !== 'doctor' && !parsed.help) {
+    throw new UsageError('--probe-decisions is only valid with the doctor command');
   }
   if (parsed.wait && parsed.command !== 'status' && parsed.command !== 'ready' && !parsed.help) {
     throw new UsageError('--wait is only valid with the status command');
@@ -172,7 +181,13 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     if (args.command === 'finish') {
       return await finishCommand({ configPath: args.configPath, hook: args.hook, json: args.json, env });
     }
-    return await doctorCommand({ configPath: args.configPath, json: args.json, normalize: args.normalize, env });
+    return await doctorCommand({
+      configPath: args.configPath,
+      json: args.json,
+      normalize: args.normalize,
+      env,
+      ...(args.probeDecisions ? { options: { probeDecisions: true } } : {}),
+    });
   } catch (err) {
     process.stderr.write(`visual-proof ${args.command}: internal error: ${firstLine(err)}\n`);
     return EXIT.INTERNAL;

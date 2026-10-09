@@ -15,8 +15,11 @@ import { loadRouteParams } from './resolve/route-params.js';
 import { firstLine, flatten } from './text.js';
 import { globBase } from './trigger/fs-watch.js';
 import { ViteHmrClient } from './trigger/vite-hmr.js';
+// A4 decisions hooks (v0.6): the row's logic lives in src/decisions/doctor.ts.
+import { loadApiKey } from './decisions/client.js';
+import { describeDecisions, probeWithKey, type DecisionsProbe } from './decisions/doctor.js';
 
-export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'paramTiers' | 'renderCheck';
+export type CapabilityName = 'config' | 'git' | 'browser' | 'trigger' | 'barrier' | 'freshness' | 'login' | 'routes' | 'params' | 'paramTiers' | 'renderCheck' | 'decisions';
 /** `ok`: working at its best tier. `warn`: working at a fallback tier. `missing`: not working. `skipped`: not probed. */
 export type CapabilityStatus = 'ok' | 'warn' | 'missing' | 'skipped';
 
@@ -54,6 +57,10 @@ export interface Probes {
    * `paramSources`). One entry per path; a transport failure is `status: 0` with an `error`.
    */
   getJson(config: Config, paths: string[], timeoutMs: number): Promise<JsonResponse[]>;
+  /** Whether the app answers HTTP at `appUrl` (any status). Decides whether the decisions models are probed on their own. */
+  appUp(config: Config, timeoutMs: number): Promise<boolean>;
+  /** One tiny request per decisions model with the key from `env` (or `.env` next to the config). Rejects without a key. */
+  probeDecisions(config: Config, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<DecisionsProbe>;
 }
 
 export interface DoctorOptions {
@@ -61,7 +68,9 @@ export interface DoctorOptions {
   dirs?: Dirs;
   probes?: Partial<Probes>;
   /** Per-probe timeouts; the slowest one bounds the whole run. */
-  timeouts?: { browserMs?: number; barrierMs?: number; loginMs?: number; routesMs?: number; paramsMs?: number };
+  timeouts?: { browserMs?: number; barrierMs?: number; loginMs?: number; routesMs?: number; paramsMs?: number; decisionsMs?: number };
+  /** `doctor --probe-decisions`: probe the decisions models even when the app is not up. */
+  probeDecisions?: boolean;
 }
 
 export const CAPABILITY_ORDER: CapabilityName[] = [
@@ -76,6 +85,7 @@ export const CAPABILITY_ORDER: CapabilityName[] = [
   'params',
   'paramTiers',
   'renderCheck',
+  'decisions',
 ];
 
 const BROWSER_MS = 8000;
@@ -83,6 +93,9 @@ const BARRIER_MS = 3000;
 const LOGIN_MS = 3000;
 const ROUTES_MS = 5000;
 const PARAMS_MS = 4000;
+/** Each decisions model gets one tiny request, all of them together bounded by this (doctor stays under 10 s). */
+const DECISIONS_MS = 5000;
+const APP_UP_MS = 1500;
 
 export async function runDoctor(config: Config | ConfigError, opts: DoctorOptions = {}): Promise<DoctorReport> {
   const dirs = opts.dirs ?? resolveDirs(opts.env);
@@ -105,7 +118,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   const skipped = (reason: string): Capability => ({ tier: 'unknown', status: 'skipped', required: false, detail: reason });
   const cfg = invalid ? null : (config as Config);
 
-  const [git, browser, trigger, barrier, login, routes, paramTiers] = await Promise.all([
+  const [git, browser, trigger, barrier, login, routes, paramTiers, decisions] = await Promise.all([
     checkGit(cfg),
     checkBrowser(probes, t.browserMs ?? BROWSER_MS),
     cfg ? checkTrigger(cfg, dirs) : { tier: 'none', status: 'missing' as const, required: true, detail: 'config is invalid, so the trigger globs are unknown' },
@@ -113,6 +126,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
     cfg ? checkLogin(cfg, probes, t.loginMs ?? LOGIN_MS) : skipped('config is invalid'),
     cfg ? checkRoutes(cfg, probes, t.routesMs ?? ROUTES_MS) : skipped('config is invalid'),
     cfg ? checkParamTiers(cfg, probes, t.routesMs ?? ROUTES_MS, t.paramsMs ?? PARAMS_MS) : skipped('config is invalid'),
+    cfg ? checkDecisions(cfg, probes, opts.env ?? process.env, t.decisionsMs ?? DECISIONS_MS, opts.probeDecisions === true) : skipped('config is invalid'),
   ]);
   caps.git = git;
   caps.browser = browser;
@@ -124,6 +138,7 @@ export async function runDoctor(config: Config | ConfigError, opts: DoctorOption
   caps.params = cfg ? checkParams(cfg) : skipped('config is invalid');
   caps.paramTiers = paramTiers;
   caps.renderCheck = cfg ? checkRenderCheck(cfg) : skipped('config is invalid');
+  caps.decisions = decisions;
 
   const ordered = {} as Record<CapabilityName, Capability>;
   for (const name of CAPABILITY_ORDER) ordered[name] = caps[name];
@@ -363,6 +378,30 @@ function checkRenderCheck(config: Config): Capability {
   return { tier: 'off', status: 'warn', required: false, detail: 'rendered components are not checked (renderCheck: "off")' };
 }
 
+/**
+ * A4: is there a key, do the models resolve, what mode is on. The probe (one tiny request per model, bounded)
+ * only runs with `--probe-decisions` or when the app is up, so a doctor run without either stays offline.
+ * Informational, never required.
+ */
+async function checkDecisions(config: Config, probes: Probes, env: NodeJS.ProcessEnv, timeoutMs: number, force: boolean): Promise<Capability> {
+  const key = loadApiKey(env, config.repoDir);
+  const d = config.decisions;
+  let probe: DecisionsProbe | null = null;
+  const why = 'run doctor --probe-decisions, or start the app';
+  if (key && d.enabled !== false) {
+    const up = force || (await probes.appUp(config, APP_UP_MS).catch(() => false));
+    if (up) {
+      try {
+        probe = await withTimeout(probes.probeDecisions(config, env, timeoutMs), timeoutMs + 500, 'decisions probe');
+      } catch (err) {
+        return { tier: 'degraded', status: 'warn', required: false, detail: `key found; the decisions probe failed: ${firstLine(err)}` };
+      }
+    }
+  }
+  const result = describeDecisions(d, key, probe, why);
+  return { tier: result.tier, status: result.status, required: false, detail: result.detail };
+}
+
 function entries(n: number): string {
   return n === 1 ? 'entry' : 'entries';
 }
@@ -408,6 +447,18 @@ const defaultProbes: Probes = {
   },
 
   buildGraph: (config) => buildImportGraph(config),
+
+  async appUp(config, timeoutMs) {
+    try {
+      const res = await fetch(config.appUrl, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+      await res.body?.cancel().catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  probeDecisions: (config, env, timeoutMs) => probeWithKey(env, config.repoDir, config.decisions.models, timeoutMs),
 
   async getJson(config, paths, timeoutMs) {
     const deadline = Date.now() + timeoutMs;

@@ -4,6 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { main, parseArgs, UsageError } from '../../src/cli.js';
 import { tmpDir } from './helpers.js';
 
+describe('parseArgs --probe-decisions', () => {
+  it('is a doctor option', () => {
+    expect(parseArgs(['doctor', '--probe-decisions'])).toMatchObject({ command: 'doctor', probeDecisions: true });
+    expect(parseArgs(['doctor']).probeDecisions).toBe(false);
+    expect(() => parseArgs(['finish', '--probe-decisions'])).toThrow('--probe-decisions is only valid with the doctor command');
+  });
+});
+
 describe('parseArgs', () => {
   it.each(['start', 'stop', 'status', 'ready', 'watch', 'finish', 'doctor'] as const)('parses %s', (command) => {
     expect(parseArgs([command])).toMatchObject({ command, hook: false, help: false });
