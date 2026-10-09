@@ -37,7 +37,8 @@ it('happy path: edit, clean frame, commit, finish exits 0 with a valid proof blo
   expect(block).not.toContain('Failures');
 
   // The artifact is the headline frame's PNG, byte for byte.
-  expect(fs.readdirSync(h.dirs.artifactDir)).toEqual([path.basename(artifact)]);
+  // (plus replay-<shortTree>.mp4 on a machine with ffmpeg: only the stills are compared here)
+  expect(fs.readdirSync(h.dirs.artifactDir).filter((f) => f.endsWith('.png'))).toEqual([path.basename(artifact)]);
   expect(fs.readFileSync(artifact).equals(fs.readFileSync(event.pngPath))).toBe(true);
   expect(fs.readFileSync(artifact).subarray(1, 4).toString()).toBe('PNG');
   expect(h.git('rev-parse', 'HEAD^{tree}')).toBe(tree);

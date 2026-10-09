@@ -41,6 +41,8 @@ export interface Harness {
   stopWatch(): Promise<void>;
   /** Read-modify-write a repo-relative file. */
   edit(file: string, fn: (content: string) => string): void;
+  /** Write `.visual-proof/sidecars/<name>.vp` (the default sidecar glob) and return its repo-relative path. */
+  writeSidecar(name: string, text: string): string;
   /** `git add -A && git commit`; returns the new `HEAD^{tree}`. */
   commitAll(message?: string): string;
   /** Run git in the repo and return trimmed stdout. */
@@ -158,6 +160,12 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
       edit(file, fn) {
         const target = path.join(dir, file);
         fs.writeFileSync(target, fn(fs.readFileSync(target, 'utf8')));
+      },
+      writeSidecar(name, text) {
+        const rel = `.visual-proof/sidecars/${name}.vp`;
+        fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+        fs.writeFileSync(path.join(dir, rel), text);
+        return rel;
       },
       git: (...args) => git(dir, ...args),
       finish: (finishOptions = {}) => runFinish(config, { env, ...finishOptions }),
