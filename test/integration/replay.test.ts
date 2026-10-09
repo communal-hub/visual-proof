@@ -19,7 +19,7 @@ let sessionFrames: number;
 let tree: string;
 
 beforeAll(async () => {
-  h = await createHarness();
+  h = await createHarness({ config: { replay: { motion: false } } }); // the stills replay; motion.test.ts covers clips
   await h.start();
   const modal = h.writeSidecar('modal', `goto ${INTERACT}\nclick [data-test=open-modal]\nwait [data-test=confirm-modal]\nstill modal-open\n`);
   const form = h.writeSidecar('form', `goto ${INTERACT}\nfill [data-test=name-input] "Ada"\nclick [data-test=next]\nstill step-2\n`);
