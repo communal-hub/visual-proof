@@ -381,9 +381,14 @@ the status JSON.
 | 3 | setup or config error (invalid config, not a git repo, watcher cannot start) |
 | 4 | internal error |
 
-`finish` never falls back to an earlier clean frame: the final frame of each expected
-route at HEAD must be `clean`. Failures and remedy hints go to stderr and into the proof
-block.
+`finish` carries an earlier frame forward only when nothing it depends on has changed since (edit page A, then page
+B, then commit: A keeps its frame from before B's edit). The frame's tree is diffed with HEAD's; the frame goes
+stale when a changed file is a backend file (`backendGlobs`), a route file (`routeFiles`), a screen file no route
+renders, a screen file on one of the frame's routes, a component the frame rendered, or (for a sidecar still) its own
+sidecar file. Docs, tests and config do not. A stale frame fails as before, naming the file
+(`no frame at HEAD for /a (the last clean frame, at tree 1a2b3c4d, is stale: src/shared/S.vue changed since)`); a
+carried one is noted (`/a carried forward from tree 1a2b3c4d: ...`) and listed as `carriedFrom` in `finish --json`.
+It never falls back to an earlier clean frame behind a newer one that is not clean.
 
 A changed screen file that maps to no route still fails `finish` (add `staticRoutes` or
 `ignoreScreenGlobs`), but the watcher now re-captures every route captured this session when one

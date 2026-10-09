@@ -27,7 +27,10 @@ it('other-tree: an edit is captured, then partly reverted without a capture; the
 
   const result = await h.finish();
   expect(result.ok).toBe(false);
-  expect(result.failures).toEqual([`no frame at HEAD for ${REPORTS_ROUTE}`]);
+  // The earlier frame is not carried: the page it shows was edited again after it was captured.
+  expect(result.failures).toEqual([
+    `no frame at HEAD for ${REPORTS_ROUTE} (the last clean frame, at tree ${captured.frame.treeHash.slice(0, 8)}, is stale: ${REPORTS} (rendered in it) changed since)`,
+  ]);
   // The clean frame from the other tree exists and is not substituted.
   expect(h.timeline().list().some((f) => f.id === captured.frame.id)).toBe(true);
   expect(fs.readdirSync(h.dirs.artifactDir)).toEqual([]);

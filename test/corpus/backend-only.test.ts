@@ -44,7 +44,9 @@ describe('backend-only', () => {
 
     const result = await h.finish();
     expect(result.ok).toBe(false);
-    expect(result.failures).toEqual([`no frame at HEAD for ${DETAIL_ROUTE}`]);
+    expect(result.failures).toEqual([
+      expect.stringMatching(new RegExp(`^no frame at HEAD for ${DETAIL_ROUTE} \\(the last clean frame, at tree [0-9a-f]{8}, is stale: ${DATA} \\(a backend file\\) changed since\\)$`)),
+    ]);
 
     const cli = await h.cli('finish');
     expect(cli.code).toBe(1);

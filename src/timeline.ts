@@ -95,6 +95,13 @@ export class Timeline {
       .find((r) => r.treeHash === treeHash && (r.route === route || r.routeKey === route));
   }
 
+  /** Latest frame for a route (matched by concrete path or route pattern) at any tree. */
+  latest(route: string): Frame | undefined {
+    return this.readIndex()
+      .reverse()
+      .find((r) => r.route === route || r.routeKey === route);
+  }
+
   pngPath(frame: Pick<Frame, 'png'>): string {
     return path.join(this.scratchDir, frame.png);
   }

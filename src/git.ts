@@ -151,6 +151,18 @@ export async function headFiles(repoDir: string): Promise<string[]> {
   return splitNul(stdout);
 }
 
+/**
+ * Files that differ between two tree objects (`git diff --name-only <from> <to>`), relative to `repoDir` and
+ * with POSIX separators; null when git cannot compare them (not a tree object, e.g. one that was pruned).
+ */
+export async function treeDiff(repoDir: string, fromTree: string, toTree: string): Promise<string[] | null> {
+  if (!/^[0-9a-f]{40,64}$/.test(fromTree) || !/^[0-9a-f]{40,64}$/.test(toTree)) return null;
+  const result = await git(repoDir, ['diff', '--name-only', '-z', '--no-renames', fromTree, toTree], {}, true);
+  if (!result.ok) return null;
+  const prefix = await showPrefix(repoDir);
+  return splitNul(result.stdout).flatMap((file) => relativeTo(prefix, file));
+}
+
 /** A file's content at HEAD (`repoDir`-relative path), or null when HEAD does not have it. */
 export async function showAtHead(repoDir: string, file: string): Promise<string | null> {
   const result = await git(repoDir, ['show', `HEAD:./${file}`], {}, true);

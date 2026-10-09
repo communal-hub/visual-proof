@@ -6,6 +6,7 @@ import { changeSet, headFiles, headTree, isGitRepo, showAtHead, workingTreeHash 
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
+import { Carrier } from './carry.js';
 import { buildReplay, type ReplayResult } from './replay.js';
 import { loadRouteParams } from './resolve/route-params.js';
 import { concretePath, resolveRoutes } from './resolve/routes.js';
@@ -62,6 +63,8 @@ export interface RouteProof {
   via: 'screen' | 'backend' | 'sidecar';
   /** Sidecar stills only: the scenario file and name, and the still. `route` and `routeKey` are `sidecar:<file>#<still>`. */
   scenario?: { file: string; name: string; still: string };
+  /** Set when the frame is not from HEAD's tree but was carried forward: nothing it depends on changed since (see `src/carry.ts`). The frame's own tree. */
+  carriedFrom?: string;
   /** Set when a frame at HEAD's tree exists. */
   status?: FrameStatus;
   reasons: string[];
@@ -340,7 +343,7 @@ async function gather(
       for (const error of errors) state.failures.push(`sidecar ${formatSidecarError(file, error)}`);
       continue;
     }
-    scenarios.push({ file, name: sidecar.name, stills: sidecar.stills });
+    scenarios.push({ file, name: sidecar.name, stills: sidecar.stills, keys: scenarioRouteKeys(sidecar, knownKeys) });
     state.notes.push(`sidecar ${file}: ${touched ? 'changed' : `visits ${visits.join(', ')}`}`);
     for (const still of sidecar.stills) {
       const route = sidecarRoute(file, still);
@@ -372,6 +375,8 @@ async function gather(
   const shortTree = tree.slice(0, SHORT_TREE);
   const used = new Set<string>();
   const headlines = new Map<RouteProof, Frame>();
+  const carrier = new Carrier({ config, graph: graphFailed ? null : graph, headTree: tree });
+  const scenarioKeys = new Map(scenarios.map((sc) => [sc.file, sc.keys]));
   for (const route of list) {
     if (state.closed) return;
     if (now() >= deadline) {
@@ -379,16 +384,32 @@ async function gather(
       return;
     }
     state.routes.push(route);
-    const frame = timeline.latestAtTree(route.route, tree);
+    let frame = timeline.latestAtTree(route.route, tree);
     const scenario = route.scenario;
+    let staleNote = '';
+    if (!frame) {
+      // The watcher only re-captures what a save affects: an earlier clean frame stands when nothing it depends on changed since.
+      const older = timeline.latest(route.route);
+      if (older) {
+        const carried = await carrier.check(older, scenario ? { keys: scenarioKeys.get(scenario.file) ?? [], sidecarFile: scenario.file } : { keys: [route.routeKey] });
+        if (state.closed) return;
+        if (carried.ok) {
+          frame = older;
+          route.carriedFrom = carried.fromTree;
+          state.notes.push(`${scenario ? `sidecar ${scenario.file} still ${scenario.still}` : route.route} carried forward from tree ${carried.fromTree.slice(0, SHORT_TREE)}: nothing it depends on changed since`);
+        } else if (carried.reason) {
+          staleNote = ` (${carried.reason})`;
+        }
+      }
+    }
     if (!frame && scenario) {
-      state.failures.push(`sidecar ${scenario.file} still ${scenario.still}: no frame at HEAD`);
+      state.failures.push(`sidecar ${scenario.file} still ${scenario.still}: no frame at HEAD${staleNote}`);
       continue;
     }
     if (!frame) {
       const sourceError = route.route === route.routeKey ? status?.paramSources?.[route.routeKey]?.error : undefined;
       if (sourceError) state.failures.push(`cannot capture ${route.routeKey}: ${sourceError} (add routeParams)`);
-      else state.failures.push(`no frame at HEAD for ${route.route}`);
+      else state.failures.push(`no frame at HEAD for ${route.route}${staleNote}`);
       continue;
     }
     if (route.route === route.routeKey) route.route = frame.route; // filled from a list endpoint: the frame knows the id
@@ -478,6 +499,8 @@ interface ExpectedScenario {
   file: string;
   name: string;
   stills: string[];
+  /** Route keys its `goto` steps visit. */
+  keys: string[];
 }
 
 function frameNumber(id: string | undefined): number {
@@ -574,7 +597,7 @@ async function addHints(config: Config, dirs: Dirs, state: State): Promise<void>
   const hints: string[] = [];
   const status = readStatusFile(statusFiles(dirs).status);
   const live = status !== null && status.state !== 'stopped' && status.state !== 'error' && watcherPid(dirs, status) !== null;
-  const noFrame = state.failures.some((f) => f.startsWith('no frame at HEAD for ') || f.endsWith(': no frame at HEAD'));
+  const noFrame = state.failures.some((f) => f.startsWith('no frame at HEAD for ') || /: no frame at HEAD( \(|$)/.test(f));
 
   if (noFrame && !live) {
     hints.push('the watcher is not running, so nothing was captured while you edited: run visual-proof start');
@@ -582,7 +605,7 @@ async function addHints(config: Config, dirs: Dirs, state: State): Promise<void>
   if (noFrame && typeof status?.lastError === 'string' && status.lastError !== '') {
     hints.push(`the watcher's last capture problem: ${status.lastError}`);
   }
-  if (state.failures.some((f) => f.endsWith(': no frame at HEAD'))) {
+  if (state.failures.some((f) => /: no frame at HEAD( \(|$)/.test(f))) {
     hints.push('a sidecar scenario has no frame at HEAD: save the sidecar file (or a screen file it visits) with the watcher running to replay it, then rerun finish');
   }
   try {

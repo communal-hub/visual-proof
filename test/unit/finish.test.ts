@@ -151,11 +151,12 @@ describe('runFinish', () => {
     editAndCommit('src/pages/A.vue');
     const result = await finish();
     expect(result.ok).toBe(false);
-    expect(result.failures).toEqual(['no frame at HEAD for /a']);
+    // (that tree is not a git object, so the frame cannot be carried forward either)
+    expect(result.failures).toEqual(['no frame at HEAD for /a (the last clean frame is at tree ffffffff, which git cannot compare with HEAD)']);
     expect(result.summary).toBe(`visual-proof: 1 failure, see ${result.proofBlockPath}`);
     const block = fs.readFileSync(result.proofBlockPath, 'utf8');
     expect(block).toContain('**Failures**');
-    expect(block).toContain('- no frame at HEAD for /a');
+    expect(block).toContain('- no frame at HEAD for /a (');
     expect(block).not.toContain('<img');
     expect(fs.readdirSync(dirs.artifactDir)).toEqual([]);
   });
@@ -202,7 +203,7 @@ describe('runFinish', () => {
       ['/a', 'backend'],
       ['/b/1', 'backend'],
     ]);
-    expect(result.failures).toEqual(['no frame at HEAD for /b/1']);
+    expect(result.failures).toEqual(['no frame at HEAD for /b/1 (the last clean frame is at tree aaaaaaaa, which git cannot compare with HEAD)']);
     expect(result.notes.join('\n')).toContain('captured route /gone no longer resolves');
   });
 
@@ -955,7 +956,9 @@ describe('sidecar scenarios in finish', () => {
     scenario('goto /a\nstill modal\n');
     commitAll(repo, 'add sidecar');
     await stillFrame('modal', 'clean', { tree: 'f'.repeat(40) });
-    expect((await finishSc()).failures).toEqual([`sidecar ${SC} still modal: no frame at HEAD`]);
+    expect((await finishSc()).failures).toEqual([
+      `sidecar ${SC} still modal: no frame at HEAD (the last clean frame is at tree ffffffff, which git cannot compare with HEAD)`,
+    ]);
   });
 
   it('a step that failed after the last still fails the scenario, unless a newer run passed', async () => {
@@ -1047,6 +1050,225 @@ describe('sidecar scenarios in finish', () => {
       await stillFrame('modal', 'clean', { renderedFiles: ['src/pages/A.vue'] });
       const result = await finish({ buildGraph: async () => MODAL_GRAPH });
       expect(result.failures).toEqual([expect.stringContaining('src/components/Modal.vue never rendered on /a')]);
+    });
+  });
+});
+
+describe('carrying frames forward (an earlier clean frame stands when nothing it depends on changed)', () => {
+  const SC = '.visual-proof/sidecars/refund.vp';
+  const tree = async () => (await headTree(repo))!;
+  /** Commit a change and return the new tree. */
+  const commitEdit = async (file: string, body?: string): Promise<string> => {
+    editAndCommit(file, body);
+    return tree();
+  };
+  const finishGraph = (g: ImportGraph = GRAPH, opts: Parameters<typeof runFinish>[1] = {}) => finish({ buildGraph: async () => g, ...opts });
+
+  it('two edits in a row: the first page keeps its frame from the first tree', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    const t2 = await commitEdit('src/pages/Home.vue');
+    await frame('/', 'clean', { tree: t2 });
+
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.routes.map((r) => [r.route, r.status, r.carriedFrom])).toEqual([
+      ['/', 'clean', undefined],
+      ['/a', 'clean', t1],
+    ]);
+    expect(result.notes).toContain(`/a carried forward from tree ${t1.slice(0, 8)}: nothing it depends on changed since`);
+    // The still is the carried frame's, copied like any headline; the proof block has both images.
+    const short = t2.slice(0, 8);
+    expect(fs.existsSync(path.join(dirs.artifactDir, `a-${short}.png`))).toBe(true);
+    expect(fs.readFileSync(result.proofBlockPath, 'utf8').match(/<img /g)).toHaveLength(2);
+  });
+
+  it('files outside screenGlobs, backendGlobs and sidecars do not invalidate (docs, config, tests)', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    write(repo, 'README.md', '# changed\n');
+    write(repo, 'docs/notes.txt', 'n\n');
+    write(repo, 'visual-proof.config.json', '{}\n');
+    commitAll(repo, 'docs');
+    const result = await finish();
+    expect(result.failures).toEqual([]);
+    expect(result.routes[0]).toMatchObject({ route: '/a', carriedFrom: t1 });
+  });
+
+  it('a later edit to a component the first route shares fails it, naming the file, while the recaptured route passes', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    const t2 = await commitEdit('src/shared/S.vue'); // renders on /a and /c
+    await frame('/c', 'clean', { tree: t2 });
+
+    const result = await finish();
+    expect(result.ok).toBe(false);
+    expect(result.failures).toEqual([`no frame at HEAD for /a (the last clean frame, at tree ${t1.slice(0, 8)}, is stale: src/shared/S.vue changed since)`]);
+    expect(result.routes.find((r) => r.route === '/c')).toMatchObject({ status: 'clean' });
+    expect(result.routes.find((r) => r.route === '/a')!.carriedFrom).toBeUndefined();
+  });
+
+  it('a page file edited again after its frame is stale', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    await commitEdit('src/pages/A.vue');
+    expect((await finish()).failures).toEqual([expect.stringContaining('src/pages/A.vue changed since')]);
+  });
+
+  it('a screen file no route renders makes every earlier frame stale', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    const t2 = await commitEdit('src/pages/Orphan.vue');
+    await frame('/', 'clean', { tree: t2 });
+    write(repo, 'src/pages/Home.vue', '<template>home2</template>\n');
+    commitAll(repo, 'home');
+    const t3 = await tree();
+    await frame('/', 'clean', { tree: t3 });
+    const result = await finish();
+    // (the unmapped file itself fails finish as well, as before)
+    expect(result.failures).toContainEqual(expect.stringContaining('no frame at HEAD for /a (the last clean frame, at tree'));
+    expect(result.failures).toContainEqual(expect.stringContaining('src/pages/Orphan.vue (no route renders it) changed since'));
+  });
+
+  it('a route file change makes every earlier frame stale (the graph cannot be trusted for it)', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    write(repo, 'src/router/index.js', 'export default []\n');
+    commitAll(repo, 'router');
+    const t2 = await tree();
+    await frame('/', 'clean', { tree: t2 });
+    write(repo, 'src/pages/Home.vue', '<template>h</template>\n');
+    commitAll(repo, 'home');
+    await frame('/', 'clean', { tree: await tree() });
+    configure({ routeFiles: ['src/router/**/*.js'] });
+    expect((await finish()).failures).toEqual([expect.stringContaining('src/router/index.js (a route file) changed since')]);
+  });
+
+  describe('backend changes', () => {
+    it('a backend change after a frame makes it stale', async () => {
+      const t1 = await commitEdit('src/pages/A.vue');
+      await frame('/a', 'clean', { tree: t1 });
+      await commitEdit('server/data.json', '{"v":2}\n');
+      const result = await finish();
+      expect(result.ok).toBe(false);
+      expect(result.failures).toEqual([
+        `no frame at HEAD for /a (the last clean frame, at tree ${t1.slice(0, 8)}, is stale: server/data.json (a backend file) changed since)`,
+      ]);
+    });
+
+    it('a backend change before the frame does not: the frame was captured with it', async () => {
+      await commitEdit('server/data.json', '{"v":2}\n');
+      const t1 = await commitEdit('src/pages/A.vue');
+      await frame('/a', 'clean', { tree: t1, trigger: 'backend' });
+      write(repo, 'README.md', 'x\n');
+      commitAll(repo, 'docs');
+      const result = await finish();
+      expect(result.failures).toEqual([]);
+      expect(result.routes[0]).toMatchObject({ route: '/a', carriedFrom: t1 });
+    });
+
+    it('when the watcher recaptured after the backend change, the frame at HEAD is used as before', async () => {
+      const t1 = await commitEdit('src/pages/A.vue');
+      await frame('/a', 'clean', { tree: t1 });
+      const t2 = await commitEdit('server/data.json', '{"v":2}\n');
+      await frame('/a', 'clean', { tree: t2, trigger: 'backend' });
+      const result = await finish();
+      expect(result.failures).toEqual([]);
+      expect(result.routes[0]!.carriedFrom).toBeUndefined();
+    });
+  });
+
+  it('rendered components count as dependencies: a file in the frame\'s renderedFiles that changed makes it stale', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1, renderedFiles: ['src/pages/A.vue', 'src/pages/C.vue'] });
+    const t2 = await commitEdit('src/pages/C.vue'); // /c's page, but /a rendered it
+    await frame('/c', 'clean', { tree: t2 });
+    expect((await finish()).failures).toEqual([expect.stringContaining('src/pages/C.vue (rendered in it) changed since')]);
+  });
+
+  it('only a clean frame is carried: an earlier error frame is not', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'error', { tree: t1 });
+    await commitEdit('src/pages/Home.vue');
+    await frame('/', 'clean');
+    expect((await finish()).failures).toEqual(['no frame at HEAD for /a']);
+  });
+
+  it('the latest frame decides: a clean frame older than a later error frame is not carried', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    await frame('/a', 'error', { tree: t1 });
+    await commitEdit('src/pages/Home.vue');
+    await frame('/', 'clean');
+    expect((await finish()).failures).toEqual(['no frame at HEAD for /a']);
+  });
+
+  it('does not carry without an import graph', async () => {
+    const t1 = await commitEdit('src/pages/A.vue');
+    await frame('/a', 'clean', { tree: t1 });
+    await commitEdit('README.md', '# r\n');
+    const result = await finish({
+      buildGraph: async () => {
+        throw new Error('boom');
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.routes).toEqual([]);
+  });
+
+  describe('sidecar frames', () => {
+    const stillFrame = (still: string, extra: Partial<NewFrame> & { tree?: string } = {}) =>
+      frame(sidecarRoute(SC, still), 'clean', { sourceFile: SC, trigger: 'sidecar', ...extra });
+    const addScenario = async (body = 'goto /a\nstill modal\n') => {
+      write(repo, SC, body);
+      commitAll(repo, 'sidecar');
+      return tree();
+    };
+
+    it('a sidecar added after the route frames: the route frames are carried and the scenario has its own', async () => {
+      const t1 = await commitEdit('src/pages/A.vue');
+      await frame('/a', 'clean', { tree: t1 });
+      const t2 = await addScenario();
+      await stillFrame('modal', { tree: t2 });
+      const result = await finishGraph();
+      expect(result.failures).toEqual([]);
+      expect(result.routes.map((r) => [r.route, r.carriedFrom])).toEqual([
+        ['/a', t1],
+        [sidecarRoute(SC, 'modal'), undefined],
+      ]);
+    });
+
+    it('a sidecar frame carries over a later unrelated edit; editing its own file makes it stale; another sidecar does not', async () => {
+      const t0 = await addScenario();
+      await stillFrame('modal', { tree: t0, renderedFiles: ['src/pages/A.vue'] });
+      write(repo, '.visual-proof/sidecars/other.vp', 'goto /\nstill home\n');
+      commitAll(repo, 'other sidecar');
+      const t1 = await tree();
+      await frame(sidecarRoute('.visual-proof/sidecars/other.vp', 'home'), 'clean', { tree: t1, sourceFile: '.visual-proof/sidecars/other.vp', trigger: 'sidecar' });
+      await commitEdit('src/pages/C.vue'); // /c: not on the scenario's route
+      await frame('/c', 'clean');
+
+      let result = await finishGraph();
+      expect(result.failures).toEqual([]);
+      expect(result.routes.find((r) => r.route === sidecarRoute(SC, 'modal'))!.carriedFrom).toBe(t0);
+
+      await addScenario('# edited\ngoto /a\nstill modal\n');
+      result = await finishGraph();
+      expect(result.failures).toEqual([
+        expect.stringContaining(`sidecar ${SC} still modal: no frame at HEAD (the last clean frame, at tree ${t0.slice(0, 8)}, is stale: ${SC} changed since)`),
+      ]);
+    });
+
+    it('a sidecar frame goes stale when a page on a route it visits changes', async () => {
+      const t0 = await addScenario();
+      await stillFrame('modal', { tree: t0 });
+      await commitEdit('src/pages/A.vue');
+      await frame('/a', 'clean');
+      const result = await finishGraph();
+      expect(result.failures).toEqual([
+        expect.stringContaining(`sidecar ${SC} still modal: no frame at HEAD (the last clean frame, at tree ${t0.slice(0, 8)}, is stale: src/pages/A.vue changed since)`),
+      ]);
     });
   });
 });
