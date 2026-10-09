@@ -227,6 +227,39 @@ describe('capture-quality fields (v0.3)', () => {
     expect(() => parse({ renderCheck: 'maybe' })).toThrow('"renderCheck" must be "fail", "warn" or "off", got "maybe"');
   });
 
+  describe('sidecars, roles and replay (v0.5)', () => {
+    it('defaults: the sidecar glob, no roles, replay on with 60 frames of 1.2 s on a canvas up to 1600 px', () => {
+      const config = parse({});
+      expect(config.sidecars).toEqual(['.visual-proof/sidecars/*.vp']);
+      expect(config.roles).toEqual({});
+      expect(config.replay).toEqual({ enabled: true, maxFrames: 60, secondsPerFrame: 1.2, maxHeight: 1600 });
+    });
+
+    it('reads sidecars, roles and replay', () => {
+      const config = parse({
+        sidecars: ['scenarios/*.vp', 'more/**/*.vp'],
+        roles: { finance: 'fin@example.test', reviewer: 'rev@example.test' },
+        replay: { enabled: false, maxFrames: 10, secondsPerFrame: 0.5, maxHeight: 900 },
+      });
+      expect(config.sidecars).toEqual(['scenarios/*.vp', 'more/**/*.vp']);
+      expect(config.roles).toEqual({ finance: 'fin@example.test', reviewer: 'rev@example.test' });
+      expect(config.replay).toEqual({ enabled: false, maxFrames: 10, secondsPerFrame: 0.5, maxHeight: 900 });
+    });
+
+    it('rejects bad values with the field name', () => {
+      expect(() => parse({ sidecars: 'a.vp' })).toThrow('"sidecars" must be an array of strings');
+      expect(() => parse({ roles: { a: 1 } })).toThrow('"roles" must be an object of string values');
+      expect(() => parse({ roles: { default: 'a@b.test' } })).toThrow('"roles" key "default" is reserved');
+      expect(() => parse({ roles: { 'bad role': 'a@b.test' } })).toThrow('"roles" key "bad role" must be letters');
+      expect(() => parse({ roles: { a: '' } })).toThrow('"roles.a" must be a non-empty login email');
+      expect(() => parse({ replay: { enabled: 'yes' } })).toThrow('"replay.enabled" must be a boolean');
+      expect(() => parse({ replay: { maxFrames: 0 } })).toThrow('"replay.maxFrames" must be a positive integer');
+      expect(() => parse({ replay: { secondsPerFrame: 0 } })).toThrow('"replay.secondsPerFrame" must be a positive number');
+      expect(() => parse({ replay: { secondsPerFrame: 'fast' } })).toThrow('"replay.secondsPerFrame" must be a positive number');
+      expect(() => parse({ replay: 3 })).toThrow('"replay" must be an object');
+    });
+  });
+
   describe('flake controls and settle (v0.4)', () => {
     it('defaults: no fixed time, no masks, the tracker block list, 250 ms idle (capped at 5 s)', () => {
       const config = parse({});

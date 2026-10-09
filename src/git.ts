@@ -145,6 +145,18 @@ export async function changedFiles(repoDir: string, baseRef: string, options: Ch
   return (await changeSet(repoDir, baseRef, options)).files;
 }
 
+/** Files in HEAD's tree below `repoDir`, relative to it (POSIX). Empty when HEAD has no commits. */
+export async function headFiles(repoDir: string): Promise<string[]> {
+  const { stdout } = await git(repoDir, ['ls-tree', '-r', '-z', '--name-only', 'HEAD'], {}, true);
+  return splitNul(stdout);
+}
+
+/** A file's content at HEAD (`repoDir`-relative path), or null when HEAD does not have it. */
+export async function showAtHead(repoDir: string, file: string): Promise<string | null> {
+  const result = await git(repoDir, ['show', `HEAD:./${file}`], {}, true);
+  return result.ok ? result.stdout : null;
+}
+
 /**
  * `git rev-parse --show-prefix`: the path of `repoDir` below the git toplevel (`sub/dir/`), or ''
  * at the toplevel. `git diff --name-only` and `git status --porcelain` report toplevel-relative
