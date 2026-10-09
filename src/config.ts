@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseDecisions, type DecisionsConfig } from './decisions/config.js';
 
 export const CONFIG_FILE_NAME = 'visual-proof.config.json';
 
@@ -125,6 +126,10 @@ export interface Config {
   maxFrames: number;
   finishBudgetMs: number;
   baseRef: string;
+  // A4 decisions (src/decisions/**): model calls at bounded decision points, never navigation.
+  decisions: DecisionsConfig;
+  /** File holding the claim the change is meant to prove (bullet lines are criteria); relative to `repoDir`. Default `<statusDir>/claim.md`. */
+  claimFile?: string;
 }
 
 export class ConfigError extends Error {
@@ -232,6 +237,8 @@ export function parseConfig(
     maxFrames: v.posInt('maxFrames') ?? 200,
     finishBudgetMs: v.posInt('finishBudgetMs') ?? 25_000,
     baseRef: v.string('baseRef') ?? 'main',
+    decisions: parseDecisions(raw.decisions, errors),
+    claimFile: v.string('claimFile'),
   };
 
   if (errors.length > 0) {

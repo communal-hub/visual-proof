@@ -3,6 +3,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     testTimeout: 10_000,
+    setupFiles: ['test/setup.ts'],
     projects: [
       {
         extends: true,
@@ -17,7 +18,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: 'integration',
-          include: ['test/integration/**/*.test.ts', 'test/corpus/**/*.test.ts'],
+          include: ['test/integration/**/*.test.ts', 'test/corpus/**/*.test.ts', 'test/live/**/*.test.ts'],
           // Each file owns a dev server and a Chromium; too many side by side starve the
           // latency-sensitive tests (save-to-still, HMR barrier). Runs after the unit project.
           maxWorkers: 2,

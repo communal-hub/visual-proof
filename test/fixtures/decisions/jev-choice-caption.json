@@ -1,0 +1,1 @@
+{"model":"typesafe/jev-1.13-20260917","answers":{"cap":{"type":"choice","choice":"c1","probabilities":{"c1":0.84,"c2":0.16,"c3":0,"c4":0},"confidence":0.79}},"usage":{"input_tokens":494,"output_tokens":50,"cost":0.000020748},"id":"gen-dec-fixture-5","provider":"TypeSafe"}
