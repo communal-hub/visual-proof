@@ -147,6 +147,37 @@ describe('runFinish', () => {
     expect(block).not.toContain('Failures');
   });
 
+  describe('agent self-review table', () => {
+    const HEADER = '| Screen | Expected | Seen | PASS/FAIL |';
+    const rows = (block: string): string[] => block.split('\n').filter((l) => l.startsWith('| `'));
+
+    it('lists one row per still with blank Expected when claim.md has no expectation lines', async () => {
+      editAndCommit('src/pages/A.vue');
+      editAndCommit('src/pages/Home.vue');
+      await frame('/a');
+      await frame('/');
+      const block = (await finish()).proofBlock;
+      expect(block).toContain('**Agent self-review**');
+      expect(block).toContain(HEADER);
+      expect(rows(block)).toEqual(['| `/` |  | _TODO_ | _TODO_ |', '| `/a` |  | _TODO_ | _TODO_ |']);
+    });
+
+    it('pre-fills Expected from `<screen>: <what must be visible>` lines and leaves others blank', async () => {
+      editAndCommit('src/pages/A.vue');
+      editAndCommit('src/pages/Home.vue');
+      await frame('/a');
+      await frame('/');
+      fs.writeFileSync(path.join(dirs.statusDir, 'claim.md'), '- shows totals\n/a: the totals card | with a pipe\n- /unrelated: ignored\n');
+      const block = (await finish()).proofBlock;
+      expect(rows(block)).toEqual(['| `/` |  | _TODO_ | _TODO_ |', '| `/a` | the totals card \\| with a pipe | _TODO_ | _TODO_ |']);
+    });
+
+    it('has no table when there are no stills', async () => {
+      editAndCommit('README.md', '# changed\n');
+      expect((await finish()).proofBlock).not.toContain('self-review');
+    });
+  });
+
   it('fails with "no frame at HEAD" when the only frame is at another tree', async () => {
     await frame('/a', 'clean', { tree: 'f'.repeat(40) });
     editAndCommit('src/pages/A.vue');

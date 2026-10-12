@@ -555,6 +555,23 @@ In the status dir:
 Headline stills are copied to the artifact dir as `<route-slug>-<shortTree>.png` (sidecar stills as
 `sidecar-<scenario>-<still>-<shortTree>.png`), and the replay video as `replay-<shortTree>.mp4`.
 
+## Agent self-review
+
+`finish` appends an **Agent self-review** table to `proof-block.md`, one row per still:
+
+| Screen | Expected | Seen | PASS/FAIL |
+| --- | --- | --- | --- |
+| `/reports` | the totals card is visible | _TODO_ | _TODO_ |
+
+`Screen` comes from the still. `Expected` comes from per-screen expectation lines in `claim.md`, written as
+`<screen>: <what must be visible>` (a leading bullet or number is fine; `<screen>` is the route, or `sidecar <scenario> / <still>`,
+`<scenario> / <still>` or just `<still>` for sidecar stills); it is blank when no line matches. `Seen` and `PASS/FAIL` are
+placeholders (`_TODO_`).
+
+**Before the proof block goes into a PR, the agent must open every still with its image tool**, then replace each
+`_TODO_` with what it actually saw and `PASS` or `FAIL`. Do not fill the table from the captions, the image check
+or the expectations alone; a row that was not looked at stays `_TODO_`.
+
 ## Model decisions (A4)
 
 Fast typed-answer model calls at a few bounded decision points, never navigation. They need an OpenRouter key:
