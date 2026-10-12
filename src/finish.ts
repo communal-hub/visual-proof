@@ -23,7 +23,7 @@ import { describeError } from './text.js';
 import { Timeline, type Frame, type ParamsFrom } from './timeline.js';
 import type { FrameStatus } from './triage.js';
 // A4 decisions hooks (v0.6): everything else lives in src/decisions/**.
-import type { ClaimReport } from './decisions/claim.js';
+import { claimPath, readClaim, type ClaimReport } from './decisions/claim.js';
 import type { DecisionsApi } from './decisions/client.js';
 import {
   escapeCaption,
@@ -150,6 +150,8 @@ interface State {
   /** A4 decisions: the summary footer and the advisory claim check, set once the decision phase is over. */
   decisions?: DecisionsSummary;
   claim?: ClaimReport;
+  /** Text of claim.md, for the per-screen expectation lines of the self-review table. */
+  claimText?: string;
   /** v0.8: routes left unfilled (see {@link FinishResult.unfilled}). */
   unfilled: UnfilledRoute[];
 }
@@ -178,6 +180,8 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
     closed: false,
     unfilled: [],
   };
+  const claimFile = readClaim(claimPath(config.claimFile, config.repoDir, dirs.statusDir));
+  if ('text' in claimFile) state.claimText = claimFile.text;
   const runtime = new DecisionRuntime({
     config: config.decisions,
     env: opts.env ?? process.env,
@@ -874,6 +878,8 @@ function renderProofBlock(state: State): string {
     lines.push(stillLine(`\`${label}\` · ${route.status} · tree ${short}${route.scenario ? ` · ${route.scenario.file}` : ''}`, route));
   }
 
+  lines.push(...renderSelfReview(state));
+
   if (state.claim) lines.push('', ...renderClaimSection(state.claim));
 
   if (state.replay) {
@@ -888,6 +894,40 @@ function renderProofBlock(state: State): string {
   }
   if (state.decisions) lines.push('', renderFooter(state.decisions));
   return `${lines.join('\n')}\n`;
+}
+
+function stillLabel(route: RouteProof): string {
+  return route.scenario ? `sidecar ${route.scenario.name} / ${route.scenario.still}` : route.route;
+}
+
+/** `<screen>: <what must be visible>` lines of the claim, keyed by screen; bullets and numbering are tolerated. */
+export function parseExpectations(text: string | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const raw of (text ?? '').split(/\r?\n/)) {
+    const m = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?(.+?):\s+(\S.*)$/.exec(raw);
+    if (m && !out.has(m[1]!.trim())) out.set(m[1]!.trim(), m[2]!.trim());
+  }
+  return out;
+}
+
+function cell(value: string): string {
+  return value.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+}
+
+/** The agent self-review table: one row per still; Seen and PASS/FAIL are left for the agent. */
+function renderSelfReview(state: State): string[] {
+  const stills = state.routes.filter((r) => r.artifact && r.status);
+  if (stills.length === 0) return [];
+  const expected = parseExpectations(state.claimText);
+  const lines = ['', '**Agent self-review**', '', '| Screen | Expected | Seen | PASS/FAIL |', '| --- | --- | --- | --- |'];
+  for (const route of stills) {
+    const keys = route.scenario
+      ? [stillLabel(route), `${route.scenario.name} / ${route.scenario.still}`, route.scenario.still]
+      : [route.route];
+    const exp = keys.map((k) => expected.get(k)).find((v) => v !== undefined) ?? '';
+    lines.push(`| ${cell(`\`${stillLabel(route)}\``)} | ${cell(exp)} | _TODO_ | _TODO_ |`);
+  }
+  return lines;
 }
 
 /** A path as a markdown link target: spaces and parentheses would end the link early. */
