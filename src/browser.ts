@@ -416,7 +416,8 @@ export class Browser implements Capturer {
   private contextInFlight: Promise<BrowserContext> | null = null;
 
   private ensureContext(): Promise<BrowserContext> {
-    if (this.context && this.browser?.isConnected() !== false) return Promise.resolve(this.context);
+    // Not while a launch is under way: its context exists before its routes and clock are installed.
+    if (this.context && !this.contextInFlight && this.browser?.isConnected() !== false) return Promise.resolve(this.context);
     this.contextInFlight ??= this.doEnsureContext().finally(() => {
       this.contextInFlight = null;
     });

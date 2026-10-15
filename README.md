@@ -524,7 +524,8 @@ saves on a 10-core machine):
 | v0.13, 3 | 0.7 s | 7.8 s |
 | v0.13, 4 (the default on this machine) | 0.7 s | 6.5 s |
 
-Past 4 the dev server becomes the bottleneck (every navigation asks Vite for the app's whole module graph) and
+Set `focus.impactConcurrency: 1` for an app that rotates a session or CSRF cookie on every page load: side-by-side
+pages share one cookie jar. Past 4 the dev server becomes the bottleneck (every navigation asks Vite for the app's whole module graph) and
 screenshots slow down: 6 measured 5.7 s with the screenshot time doubled. On a real app every page also loads the
 backend, so the cap stays at 4, and the default is half the cores so a small agent VM keeps room for the dev server
 and the backend.
@@ -663,8 +664,8 @@ critical path. A screen that already has a before frame at the merge-base tree i
 --claim` or by `before`; the merge-base does not move with your commits), and when all of them have one no server is
 started (`before /a at merge-base 1a2b3c4d: clean (captured earlier)`). Sidecars are replayed as committed; an
 uncommitted one is skipped with a note, or replayed as it is on disk with `--working-tree-sidecars`. A claim line
-that names neither a route nor a sidecar still is noted. On a branch that has no commits of its own yet, `finish` and
-`before` no longer diff the base branch's last commit (`HEAD~1..HEAD`): an empty `main...HEAD` is trusted there.
+that names neither a route nor a sidecar still is noted. Because it does not diff anything, it is also the way to
+capture before frames on a branch with no commits of its own yet.
 
 ## Commands
 
@@ -779,7 +780,8 @@ re-queued as before. Either way a batch is re-queued at most twice (`giving up a
 blob id from the tree it started at, and remembers the content of each file at its last event; a write that leaves
 a file as it was (a `touch`, an amend or a pre-commit hook that rewrites the same bytes, regenerating
 `lang/en-CA.json` to what it already held) is not an event at all: it starts no batch, makes no frame stale, and is
-logged as `ignored: lang/en-CA.json written with the same content (nothing to capture)`. A file the starting tree
+logged as `ignored: lang/en-CA.json written with the same content (nothing to capture)`. The content is read when the event is
+handled, so a save and its revert that both land before that are seen as no change, like the file as it ended up. A file the starting tree
 does not have (a gitignored one) counts on its first event and is remembered from then on. Files over 16 MB are not
 hashed and always count.
 

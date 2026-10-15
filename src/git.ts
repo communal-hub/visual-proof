@@ -127,8 +127,7 @@ export async function isAncestorOfHead(repoDir: string, ancestor: string): Promi
  *
  * An empty `base...HEAD` is not trusted (working directly on the base branch makes it empty even
  * though commits were made), hence 2 and 3. A single-commit window is a guess, but it is the only
- * commit we can assume belongs to this task. On a named branch other than the base, an empty
- * `base...HEAD` is trusted: the branch has no commits of its own yet (v0.13).
+ * commit we can assume belongs to this task.
  */
 export async function changeSet(repoDir: string, baseRef: string, options: ChangeOptions = {}): Promise<ChangeSet> {
   const prefix = await showPrefix(repoDir);
@@ -221,10 +220,6 @@ async function committedChanges(
       const files = splitNul((await git(repoDir, ['diff', '--name-only', '-z', ref, 'HEAD'], {}, true)).stdout);
       if (files.length > 0) return { files, range: `${ref}..HEAD` };
     }
-    // v0.13: on a branch of its own that has no commits past the base yet, there is nothing committed to look at (the
-    // parent commit belongs to the base branch, not to this task).
-    const branch = await currentBranch(repoDir);
-    if (branch !== null && branch !== '(detached)' && branch !== baseRef && branch !== ref) return { files: [], range: `${ref}...HEAD` };
     break; // the base resolved but gave nothing: do not trust the emptiness, look at the anchor / parent
   }
   if (anchor && (await refExists(repoDir, anchor))) {

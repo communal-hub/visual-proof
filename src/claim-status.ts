@@ -99,15 +99,14 @@ export function readClaimRequest(file: string): ClaimRequest | null {
   return { rev: raw.rev, from: typeof raw.from === 'string' ? raw.from : 'unknown', at: typeof raw.at === 'string' ? raw.at : '' };
 }
 
-/** Write a new request and return its rev (always above the previous one). */
+/** Write a new request and return its rev (always above the previous one), or 0 when it cannot be written. */
 export function requestClaimCapture(file: string, from: string, now = Date.now()): number {
   const previous = readClaimRequest(file)?.rev ?? 0;
   const rev = Math.max(previous + 1, now);
   try {
     writeFileAtomic(file, `${JSON.stringify({ rev, from, at: new Date(now).toISOString() } satisfies ClaimRequest)}\n`);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    return 0; // no status dir: no watcher to ask
+  } catch {
+    return 0; // no status dir (no watcher to ask) or not writable: asking is a convenience, never a failure
   }
   return rev;
 }

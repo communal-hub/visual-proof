@@ -604,9 +604,14 @@ describe('runFinish waiting for the watcher (v0.13)', () => {
     expect(result).toMatchObject({ ok: true, truncated: false });
   });
 
-  it('asks the watcher for the claim screens while it waits, once', async () => {
+  it('asks the watcher for the claim screens while it waits, once, when the claim names screens', async () => {
     editAndCommit('src/pages/A.vue');
     writeStatus({});
+    setTimeout(() => void frame('/a'), 200);
+    await finish({ pollMs: 15, waitMs: 5000 });
+    expect(fs.existsSync(path.join(dirs.statusDir, 'claim-request.json'))).toBe(false); // no claim: nothing to ask for
+    fs.writeFileSync(path.join(dirs.statusDir, 'claim.md'), '- /a: the page\n');
+    editAndCommit('src/pages/A.vue');
     setTimeout(() => void frame('/a'), 300);
     await finish({ pollMs: 15, waitMs: 5000 });
     const request = JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'claim-request.json'), 'utf8'));

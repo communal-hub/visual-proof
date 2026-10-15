@@ -260,6 +260,8 @@ class Watcher {
   private requestWatch: SessionWatchHandle | null = null;
   /** Highest claim request merged into a batch, so a rewrite of the same request is not queued twice. */
   private requestSeen = 0;
+  /** Work queued from outside the running batch (a save, params, the claim, a claim request): it preempts impact captures. */
+  private newWork = false;
   /** Routes (by path) and sidecars (`sidecar:<file>`) of the running batch not captured yet. */
   private jobsLeft = new Set<string>();
   /** The last tree hashed and the event count read before it, for refreshing the claim status between batches. */
@@ -628,6 +630,7 @@ class Watcher {
       this.refreshPending();
       return;
     }
+    this.newWork = true;
     this.merge({ screen: batch.screen, backend: batch.backend, sidecar: batch.sidecar ?? [], startedAt: batch.startedAt, attempts: 0 });
     if (!this.warmingUp) this.running ??= this.drain();
     this.refreshPending();
@@ -680,6 +683,7 @@ class Watcher {
       while (this.pending && !this.stopping) {
         const batch = this.pending;
         this.pending = null;
+        this.newWork = false;
         await this.process(batch);
       }
     } finally {
@@ -846,15 +850,27 @@ class Watcher {
         const outcome = await this.captureRound(round, { batch, before: tree, eventsBefore: events, preemptible: !claimRound, mark, close: last ? close : undefined });
         if (outcome === null) return; // stopping
         if ('unknown' in outcome) {
-          // Cannot tell which frames the change reaches: none of this round can be trusted; the whole batch goes again.
+          // Cannot tell which frames the change reaches: none of this round can be trusted.
           const requeue = batch.attempts < (this.opts.maxRequeues ?? 2);
-          if (requeue) {
-            // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
+          if (requeue && index === 0) {
+            // Nothing recorded yet: the whole batch goes again. Not the old batch's startedAt: that would let a message
+            // from before this capture satisfy the next barrier.
             this.merge({ screen, backend, sidecar, params: paramKeys, paramsRev: batch.paramsRev, claim: batch.claim, requestRev: batch.requestRev, retry: batch.retry, retrySidecars: batch.retrySidecars, retryWait, startedAt: Date.now(), attempts: batch.attempts + 1 });
             requeued = true;
+          } else if (requeue) {
+            // The claim round is recorded and stands: only this round's captures go again.
+            const retry = new Map<string, Target>();
+            const retrySidecars = new Map<string, Trigger>();
+            for (const job of round) {
+              if ('route' in job) retry.set(job.route.path, job.route);
+              else retrySidecars.set(job.scenario.sidecar.file, job.scenario.trigger);
+            }
+            this.merge({ screen: [], backend: [], sidecar: [], paramsRev: batch.paramsRev, retry, retrySidecars, retryWait: screen, startedAt: Date.now(), attempts: batch.attempts + 1 });
+            requeued = true;
           }
-          done('discarded', [...dropped, ...outcome.routes]);
-          if (!requeue) await this.refreshClaim(tree, events, batch); // given up: still answer a claim request
+          if (kept.length > 0) done('captured', kept);
+          else done('discarded', [...dropped, ...outcome.routes]);
+          await this.refreshClaim(tree, events, batch); // answer a claim request either way
           return;
         }
         tree = outcome.after;
@@ -872,6 +888,8 @@ class Watcher {
     } catch (err) {
       this.fail(err as Error);
       done('error');
+      // A claim request this batch carried must still be answered, or `ready --claim` waits for nothing.
+      if (batch.requestRev !== undefined) this.claimRefused(batch, `the batch failed: ${(err as Error).message.split('\n')[0]}`);
     } finally {
       delete this.status.queue;
       delete this.status.remaining;
@@ -929,7 +947,8 @@ class Watcher {
     const ranScenarios: string[] = [];
     let captureFailed = false;
     let leftover: Job[] = [];
-    const halt = (): boolean => this.stopping || (ctx.preemptible && this.pending !== null);
+    // Only work from outside the batch preempts it: its own re-queued captures wait their turn.
+    const halt = (): boolean => this.stopping || (ctx.preemptible && this.newWork);
 
     const runRoute = async (target: Target): Promise<void> => {
       attempted.push(target.path);
@@ -1551,6 +1570,7 @@ class Watcher {
       return;
     }
     this.log(`session params set for ${changed.join(', ')}; capturing`);
+    this.newWork = true;
     this.merge({ screen: [], backend: [], sidecar: [], params: changed, paramsRev: session.rev, startedAt: Date.now(), attempts: 0 });
     if (!this.warmingUp) this.running ??= this.drain();
     this.refreshPending();
@@ -1600,6 +1620,7 @@ class Watcher {
       return;
     }
     this.log(`claim names ${added.join(', ')}; capturing the claim screens that have no clean frame at the current tree`);
+    this.newWork = true;
     this.merge({ screen: [], backend: [], sidecar: [], claim: true, startedAt: Date.now(), attempts: 0 });
     if (!this.warmingUp) this.running ??= this.drain();
     this.refreshPending();
@@ -1730,8 +1751,13 @@ class Watcher {
     try {
       await this.lookAtClaim(tree, eventsAt, batch);
     } catch (err) {
-      // Never fatal for the batch: the next look tries again.
-      this.log(`claim: could not check the claim screens: ${(err as Error).message.split('\n')[0]}`);
+      // Never fatal for the batch: the next look tries again. A request it was answering is answered with the reason.
+      const reason = `could not check the claim screens: ${(err as Error).message.split('\n')[0]}`;
+      this.log(`claim: ${reason}`);
+      if (batch?.requestRev !== undefined) {
+        this.claimRefused(batch, reason);
+        this.writeStatus();
+      }
     }
   }
 
@@ -1871,6 +1897,7 @@ class Watcher {
     if (!request || request.rev <= this.requestSeen) return;
     this.requestSeen = request.rev;
     this.log(`claim request from ${request.from}: capturing the claim screens${this.running ? ' before the rest of the running batch' : ''}`);
+    this.newWork = true;
     this.merge({ screen: [], backend: [], sidecar: [], claim: true, requestRev: request.rev, startedAt: Date.now(), attempts: 0 });
     if (!this.warmingUp) this.running ??= this.drain();
     this.refreshPending();

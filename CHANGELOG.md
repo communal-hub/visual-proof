@@ -65,8 +65,6 @@ shared component, batches thrown away by a regenerated file). Consumers that set
 
 ### Fixes
 
-- On a branch with no commits of its own yet (HEAD at the merge-base), `finish` and `before` no longer diff the base
-  branch's last commit (`HEAD~1..HEAD`); an empty `main...HEAD` is trusted on a named branch other than the base.
 - `before` skips screens that already have a before frame at the merge-base tree, and starts no dev server when all
   of them do.
 - Scenario results carry per-step timings.

@@ -2100,6 +2100,38 @@ describe('claim screens first (v0.13)', () => {
     expect(timeline().list()).toHaveLength(12);
   });
 
+  it('answers a claim request with the reason when its batch fails, so ready --claim does not wait for nothing', async () => {
+    fs.writeFileSync(claimFile(), '- /r1: x\n');
+    let broken = false;
+    await start({
+      buildGraph: async () => claimGraph,
+      treeHash: async () => {
+        if (broken) throw new Error('git is gone');
+        return tree;
+      },
+    });
+    broken = true;
+    const rev = request();
+    await nextBatch();
+    expect(batches[0]!.outcome).toBe('error');
+    expect(statusJson().claim).toMatchObject({ request: rev, ready: false, error: expect.stringContaining('git is gone') });
+  });
+
+  it('an unknown change in the impact round re-queues that round only: the recorded claim screen is not captured again', async () => {
+    fs.writeFileSync(claimFile(), '- /r1: x\n');
+    await startClaim({}, { maxImpact: 3 });
+    let n = 0;
+    capturer.onCapture = () => {
+      if (++n === 2) eventCounter++; // during the first impact capture; this trigger cannot say which file
+    };
+    pushBatch({ screen: [SHARED] });
+    await nextBatch(2);
+    expect(batches.map((b) => b.outcome)).toEqual(['captured', 'captured']);
+    expect(batches[0]!.routes).toEqual(['/r1']);
+    expect(paths().filter((p) => p === '/r1')).toHaveLength(1);
+    expect(paths()).toHaveLength(1 + 3 + 3);
+  });
+
   it('keeps route frames when only a sidecar file changed during the capture, even without an import graph', async () => {
     eventPaths = [];
     const SC = '.visual-proof/sidecars/home.vp';

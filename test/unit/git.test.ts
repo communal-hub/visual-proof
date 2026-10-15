@@ -205,14 +205,6 @@ describe('changedFiles', () => {
       expect((await changeSet(repo, 'main', { anchor: 'f'.repeat(40) })).range).toBe('HEAD~1..HEAD');
     });
 
-    it('trusts an empty base range on a branch of its own with no commits yet: the parent commit is the base branch\'s', async () => {
-      write(repo, 'src/b.vue', '<template>on main</template>\n');
-      commitAll(repo, 'last commit on main');
-      git(repo, 'checkout', '-q', '-b', 'feature');
-      write(repo, 'dirty.vue', 'd');
-      expect(await changeSet(repo, 'main')).toEqual({ files: ['dirty.vue'], range: 'main...HEAD' });
-    });
-
     it('keeps the base range when it has changes', async () => {
       git(repo, 'checkout', '-q', '-b', 'feature');
       write(repo, 'src/one.vue', '1');

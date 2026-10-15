@@ -504,6 +504,7 @@ async function gather(
     waitMs: opts.waitMs ?? config.finishWaitMs,
     now,
     pollMs: opts.pollMs ?? 200,
+    claimed: claimScreens.length > 0,
     carried: async (route) => {
       const older = timeline.latest(route.route);
       return older !== undefined && (await carrier.check(older, carryTarget(route))).ok;
@@ -932,6 +933,8 @@ interface WaitContext {
   pollMs: number;
   /** v0.13: whether a route's last clean frame, from an earlier tree, still stands at HEAD; such a route is not waited for. */
   carried: (route: RouteProof) => Promise<boolean>;
+  /** v0.13: the claim names screens, so asking the watcher for them first is worth it. */
+  claimed: boolean;
 }
 
 /** A save this recent may still be on its way through the watcher's debounce, barrier and capture. */
@@ -963,7 +966,7 @@ async function waitForDaemon(ctx: WaitContext): Promise<void> {
       const status = readStatusFile(files.status);
       if (!status || status.state === 'stopped' || status.state === 'error' || watcherPid(dirs, status) === null) return;
       if (!(await daemonBusy(config, dirs, ctx.changed, status, timeline))) return;
-      if (!asked) {
+      if (!asked && ctx.claimed) {
         asked = true;
         requestClaimCapture(files.claimRequest, 'finish');
         logLine(dirs, `waiting up to ${Math.round(ctx.waitMs / 1000)} s for ${list.length - settled.size} headline(s); asked the watcher for the claim screens first`);
