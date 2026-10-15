@@ -2,8 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FrameStatus } from './triage.js';
 
-/** Which glob set caused the capture: a screen file changed, a backend file did, a sidecar scenario file did, or `visual-proof params set` asked for it (`params`). */
-export type Trigger = 'screen' | 'backend' | 'sidecar' | 'params';
+/**
+ * Which glob set caused the capture: a screen file changed, a backend file did, a sidecar scenario file did,
+ * `visual-proof params set` asked for it (`params`), or the claim named a screen that had no clean frame (`claim`, v0.12).
+ */
+export type Trigger = 'screen' | 'backend' | 'sidecar' | 'params' | 'claim';
 
 /** Which tier filled a route's params (v0.8); see the brief, "Dynamic route params". */
 export type ParamsFrom = 'session' | 'config' | 'file' | 'source' | 'discovered';

@@ -11,7 +11,8 @@ import { Timeline } from '../../src/timeline.js';
 import type { FsWatchOptions, WatchBatch } from '../../src/trigger/fs-watch.js';
 import type { BarrierResult, HmrState } from '../../src/trigger/vite-hmr.js';
 import { startWatch, type BarrierSource, type BatchEvent, type WatchHandle } from '../../src/watch.js';
-import { tmpDir } from './helpers.js';
+import { workingTreeHash } from '../../src/git.js';
+import { git, tmpDir } from './helpers.js';
 
 const cleanSignals: CaptureSignals = {
   navOk: true,
@@ -103,6 +104,9 @@ let barrier: FakeBarrier;
 let pushBatch: (batch: Partial<WatchBatch>) => void;
 let fireEvent: () => void;
 let fireSession: () => void;
+let fireClaim: () => void;
+/** Paths the fake trigger reports through `eventsSince`; null makes it a trigger that only counts. */
+let eventPaths: string[] | null;
 let triggerStopped: boolean;
 let eventCounter: number;
 let handle: WatchHandle | null;
@@ -131,6 +135,7 @@ beforeEach(() => {
   barrier = new FakeBarrier();
   triggerStopped = false;
   eventCounter = 0;
+  eventPaths = null;
   handle = null;
   batches = [];
   tree = 'a'.repeat(40);
@@ -158,12 +163,17 @@ async function start(overrides: Parameters<typeof startWatch>[1] = {}): Promise<
       fireSession = onChange;
       return { stop: async () => {} };
     },
+    watchClaim: async (_file: string, onChange: () => void) => {
+      fireClaim = onChange;
+      return { stop: async () => {} };
+    },
     startTrigger: async (options: FsWatchOptions) => {
       pushBatch = (batch) =>
         options.onBatch({ screen: [], backend: [], startedAt: Date.now(), ...batch });
       fireEvent = () => options.onEvent?.();
       return {
         eventCount: () => eventCounter,
+        eventsSince: (count: number) => (eventPaths === null ? null : eventPaths.slice(count)),
         stop: async () => {
           triggerStopped = true;
         },
@@ -1719,5 +1729,182 @@ describe('session params (v0.8)', () => {
     expect(capturer.urls).toEqual(['http://app.test/invoices/1', 'http://app.test/invoices/1']);
     expect(logText().match(/warning: session params file is not valid JSON/g)).toHaveLength(1);
     expect(readSessionParams(sessionFile()).error).toBeDefined();
+  });
+});
+
+describe('focus before the claim names a screen (v0.12)', () => {
+  const CALENDAR = 'src/shared/Calendar.vue';
+  const focusGraph: ImportGraph = {
+    fileToRoutes: new Map([
+      ['src/pages/A.vue', ['/a']],
+      ['src/pages/Facility.vue', ['/facilities/:id']],
+      [CALENDAR, ['/a', '/b', '/c', '/d', '/facilities/:id']],
+    ]),
+    routes: [
+      ...['a', 'b', 'c', 'd'].map((n) => ({ path: `/${n}`, routeFile: 'src/router/index.js', component: `src/pages/${n.toUpperCase()}.vue`, layouts: [], dynamic: false })),
+      { path: '/facilities/:id', routeFile: 'src/router/index.js', component: 'src/pages/Facility.vue', layouts: [], dynamic: false },
+    ],
+    unresolved: [],
+  };
+  const claimFile = () => path.join(dirs.statusDir, 'claim.md');
+  const startFocus = () => {
+    config = { ...config, routeParams: { '/facilities/:id': '/facilities/3' }, focus: { mode: 'claim', maxImpact: 1 } };
+    return start({ buildGraph: async () => focusGraph });
+  };
+  const paths = () => capturer.urls.map((u) => u.replace('http://app.test', ''));
+
+  it('captures the changed page and at most maxImpact other routes, and says so once', async () => {
+    await startFocus();
+    pushBatch({ screen: [CALENDAR, 'src/pages/A.vue'] });
+    await nextBatch();
+    expect(paths()[0]).toBe('/a');
+    expect(paths()).toHaveLength(2);
+    pushBatch({ screen: [CALENDAR] });
+    await nextBatch(2);
+    expect(paths()).toHaveLength(3); // no page changed: one impact route
+    const notes = logText().match(/focus: no claim screens yet \(.*claim\.md\); capturing changed pages first and at most 1 other routes\. Name the screens in the claim to pick the headlines\./g);
+    expect(notes).toHaveLength(1);
+    expect(logText()).toContain('impact route(s) over focus.maxImpact (1) not captured');
+  });
+
+  it('a claim written later captures the claim screens that have no clean frame, and only those', async () => {
+    await startFocus();
+    pushBatch({ screen: [CALENDAR, 'src/pages/A.vue'] });
+    await nextBatch();
+    const before = paths().length;
+    const captured = new Set(paths());
+    const missing = ['/b', '/c', '/d'].find((r) => !captured.has(r))!;
+    fs.writeFileSync(claimFile(), `- /a: the calendar on A\n- ${missing}: the calendar spans the column\n- /facilities/3: the booking is visible\nNote: not a screen\n`);
+    fireClaim();
+    await nextBatch(2);
+    expect(paths().slice(before).sort()).toEqual(['/facilities/3', missing].sort());
+    const claimFrames = timeline().list().filter((f) => f.trigger === 'claim');
+    expect(claimFrames.map((f) => [f.route, f.routeKey]).sort()).toEqual([['/facilities/3', '/facilities/:id'], [missing, missing]].sort());
+    expect(logText()).toContain(`claim names `);
+
+    fs.appendFileSync(claimFile(), '- /a: and the header\n'); // same screens: nothing to capture
+    fireClaim();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(batches).toHaveLength(2);
+
+    fs.appendFileSync(claimFile(), '- /a: still\n- /c: x\n- /b: x\n- /d: x\n');
+    fireClaim(); // names screens that now all have clean frames, or get one
+    await nextBatch(3);
+    expect(new Set(paths().slice(before + 2))).toEqual(new Set(['/b', '/c', '/d'].filter((r) => r !== missing && !captured.has(r))));
+  });
+
+  it('a claim that names a sidecar still replays its scenario', async () => {
+    const plans: ScenarioPlan[] = [];
+    capturer.runScenario = async (plan) => {
+      plans.push(plan);
+      return { stills: [{ name: 'open', at: new Date().toISOString(), png: Buffer.from('still'), signals: cleanSignals, renderedFiles: null, steps: [], failed: false }], ms: 1 };
+    };
+    fs.mkdirSync(path.join(repo, '.visual-proof/sidecars'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.visual-proof/sidecars/booking.vp'), 'goto /a\nstill open\n');
+    await startFocus();
+    fs.writeFileSync(claimFile(), 'sidecar booking / open: the booking modal\n');
+    fireClaim();
+    await nextBatch();
+    expect(plans.map((p) => p.file)).toEqual(['.visual-proof/sidecars/booking.vp']);
+    expect(timeline().list()).toEqual([expect.objectContaining({ route: 'sidecar:.visual-proof/sidecars/booking.vp#open', trigger: 'claim' })]);
+  });
+});
+
+describe('changes during a capture (v0.12)', () => {
+  /** A file event the fake trigger reports with its path, as the real one does. */
+  const touch = (rel: string, content?: string) => {
+    if (content !== undefined) fs.writeFileSync(path.join(repo, rel), content);
+    eventPaths!.push(rel);
+    eventCounter++;
+  };
+
+  it('keeps a frame the change cannot reach, drops and re-captures the one it can', async () => {
+    git(repo, 'init', '-q');
+    for (const f of ['src/pages/Home.vue', 'src/pages/Detail.vue', 'src/components/Badge.vue']) {
+      fs.mkdirSync(path.dirname(path.join(repo, f)), { recursive: true });
+      fs.writeFileSync(path.join(repo, f), `<template>${f}</template>\n`);
+    }
+    eventPaths = [];
+    await start({ treeHash: workingTreeHash });
+    const discarded: unknown[] = [];
+    handle!.events.on('discarded', (e) => discarded.push(e));
+    let first = true;
+    capturer.onCapture = () => {
+      if (!first) return;
+      first = false;
+      touch('src/pages/Detail.vue', '<template>edited while capturing</template>\n');
+    };
+    pushBatch({ screen: ['src/components/Badge.vue'] });
+    await nextBatch(2);
+
+    expect(batches.map((b) => b.outcome)).toEqual(['captured', 'captured']);
+    expect(batches[0]!.routes).toEqual(['/']);
+    expect(discarded).toEqual([expect.objectContaining({ routes: ['/invoices/1'], kept: ['/'], requeued: true, events: 1 })]);
+    expect(capturer.urls.filter((u) => u.endsWith('/invoices/1'))).toHaveLength(2);
+    expect(capturer.urls.filter((u) => u === 'http://app.test/')).toHaveLength(1);
+    const after = await workingTreeHash(repo, dirs.scratchDir);
+    expect(timeline().list().map((f) => [f.route, f.treeHash])).toEqual([
+      ['/', after],
+      ['/invoices/1', after],
+    ]);
+    expect(logText()).toMatch(/kept 1 frame\(s\), discarded 1: working tree changed during capture \(\w{8} -> \w{8}\); stale: \/invoices\/1 \(src\/pages\/Detail\.vue\); re-queued/);
+    // The retry waits on the HMR barrier for the file that changed, crediting a message since the capture began.
+    expect(barrier.calls.at(-1)!.files).toEqual(['src/pages/Detail.vue']);
+  });
+
+  it('keeps everything when an unrelated file was touched and the tree did not change', async () => {
+    eventPaths = [];
+    await start();
+    const discarded: unknown[] = [];
+    handle!.events.on('discarded', (e) => discarded.push(e));
+    capturer.onCapture = () => touch('src/pages/Detail.vue');
+    pushBatch({ screen: ['src/pages/Home.vue'] });
+    await nextBatch();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(batches.map((b) => b.outcome)).toEqual(['captured']);
+    expect(discarded).toEqual([]);
+    expect(timeline().list()).toHaveLength(1);
+    expect(logText()).toMatch(/kept 1 frame\(s\), discarded 0: 1 file event\(s\) arrived during capture \(tree unchanged: a{8}\), but nothing they show depends on src\/pages\/Detail\.vue/);
+  });
+
+  it('drops a sidecar run whose own file changed during it, and replays it', async () => {
+    eventPaths = [];
+    const SC = '.visual-proof/sidecars/home.vp';
+    fs.mkdirSync(path.join(repo, '.visual-proof/sidecars'), { recursive: true });
+    fs.writeFileSync(path.join(repo, SC), 'goto /\nstill one\nstill two\n');
+    let runs = 0;
+    capturer.runScenario = async () => {
+      if (runs++ === 0) touch(SC);
+      return {
+        stills: ['one', 'two'].map((name) => ({ name, at: new Date().toISOString(), png: Buffer.from(name), signals: cleanSignals, renderedFiles: null, steps: [], failed: false })),
+        ms: 1,
+      };
+    };
+    await start({ buildGraph: async () => ({ ...graph, routes: [{ path: '/', routeFile: 'src/router/index.js', component: 'src/pages/Home.vue', layouts: [], dynamic: false }] }) });
+    pushBatch({ sidecar: [SC] });
+    await nextBatch(2);
+    expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'captured']);
+    expect(runs).toBe(2);
+    expect(timeline().list().map((f) => f.route)).toEqual([`sidecar:${SC}#one`, `sidecar:${SC}#two`]);
+    expect(logText()).toContain(`kept 0 frame(s), discarded 1: 1 file event(s) arrived during capture`);
+    expect(logText()).toContain(`stale: sidecar ${SC} (${SC})`);
+  });
+
+  it('falls back to discarding the whole batch when there is no import graph', async () => {
+    eventPaths = [];
+    await start({ buildGraph: async () => Promise.reject(new Error('no graph here')) });
+    let first = true;
+    capturer.onCapture = () => {
+      if (first) {
+        first = false;
+        touch('src/pages/Home.vue');
+      }
+    };
+    setSessionParams(path.join(dirs.statusDir, 'session-params.json'), '/invoices/:id', { path: '/invoices/5', params: {}, at: new Date().toISOString() });
+    fireSession();
+    await nextBatch(2);
+    expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'captured']);
+    expect(logText()).toMatch(/discarded 1 frame\(s\): 1 file event\(s\) arrived during capture \(tree unchanged: a{8}\); no import graph/);
+    expect(timeline().list()).toEqual([expect.objectContaining({ route: '/invoices/5', trigger: 'params' })]);
   });
 });

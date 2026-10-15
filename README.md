@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) the v0.9 motion replay (sidecar scenarios recorded as they run) and the v0.11 focus and before/after work (claim-driven headlines, impact smoke, merge-base stills, one model for every decision). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) the v0.9 motion replay (sidecar scenarios recorded as they run) the v0.11 focus and before/after work (claim-driven headlines, impact smoke, merge-base stills, one model for every decision) and the v0.12 run-friction fixes (an impact cap before the claim exists, claim screens captured when the claim is written, frames kept through unrelated mid-capture changes, a quiet `finish --hook` while capture runs). Vite apps only; Chromium only.
 
 ## Install
 
@@ -500,10 +500,20 @@ the import graph, so `finish` splits the routes:
   note). Unfilled params, pages broken for unrelated reasons and anything not captured are counted, not failures.
 
 When nothing qualifies as a headline (no claim screen matched, no page changed, no sidecar touched), every route is a
-headline as before, with a note saying to name the screens in the claim. `focus.mode: "all"` turns focus off.
+headline as before, with a note saying to name the screens in the claim; when some of them have no frame, a hint
+says the same and gives the claim file's path. `focus.mode: "all"` turns focus off.
 
-The watcher follows the same split once the claim exists: claim screens and changed pages are captured first, then at
-most `focus.maxImpact` (default 40) impact routes per batch; the rest are logged as not captured.
+The watcher follows the same split: claim screens and changed pages are captured first, then at most
+`focus.maxImpact` (default 40) impact routes per batch; the rest are logged as not captured. Since v0.12 the cap
+holds before the claim exists too (agents often write it after their first save, and a shared component could
+otherwise queue hundreds of routes): only changed pages are headlines then, and the watcher logs once
+`focus: no claim screens yet (<claim path>); capturing changed pages first and at most N other routes`.
+
+The watcher also watches the claim file. When it names a screen it did not name before, the claim screens without a
+clean frame at the current tree are captured (trigger `claim`): a route key (`/facilities/:id`, filled through the
+params chain), a concrete path (`/facilities/3`) or a `sidecar <name> / <still>` line, whose scenario is replayed.
+Screens that already have a clean frame are not captured again, and an edit that names no new screen captures
+nothing.
 
 ## Before / after (v0.11)
 
@@ -545,6 +555,12 @@ Options: `--config <path>`, `--json` (finish, before, doctor, params list), `--n
 time-capped, always exits 0), `--wait` and `--timeout <s>` (status; params set). Run
 `npx visual-proof --help` for details.
 
+`finish --hook` is meant for a pre-push hook, which runs seconds after the commit, often while the watcher is still
+capturing it. When the watcher is capturing or has a batch pending (or the budget ran out waiting for it), the hook
+prints one line, `visual-proof: capture in progress (N routes queued); run \`npx visual-proof finish\` once the
+watcher is idle`, instead of the failures, and `watcher.log` gets no `finish failure` lines for that run. Without
+`--hook` nothing changes.
+
 `doctor --json --normalize` prints the report with everything that varies between runs and machines
 replaced: `at` becomes `<timestamp>`; the repo, status, scratch and artifact dirs, the temp dir and the home
 dir become `<repo>`, `<status-dir>`, `<scratch-dir>`, `<artifact-dir>`, `<tmp>`, `<home>`; ports after a host
@@ -584,11 +600,25 @@ in `anchors.json` keyed by repo root and branch: a restarted watcher on the same
 earliest anchor while it is still an ancestor of HEAD and less than 24 h old, otherwise it starts
 over from HEAD.
 
+### Changes during a capture
+
+A batch hashes the working tree before and after capturing. Until v0.11 any difference, or any file event while it
+captured, threw the whole batch away and queued it again, so ordinary activity during a long batch (the next edit, a
+commit, a hook reformatting files) could discard hundreds of frames. Since v0.12 the watcher decides per frame, with
+the rules `finish` carries frames forward by: the files that changed (the diff between the two trees, plus every file
+with an event during the capture, so a save reverted before the second hash still counts) are checked against what
+each frame depends on, and a frame goes only when one of them can have changed it. A sidecar run is kept or dropped
+as a whole. Kept frames are recorded at the tree after the capture (nothing they show differs between the two), only
+the dropped routes and scenarios are queued again (waiting on the HMR barrier for the screen files that changed), and
+the log says `kept N frame(s), discarded M: <why>; stale: /a (src/pages/A.vue)`. When this cannot be established (no
+import graph, git cannot compare the trees, a trigger that only counts events) the whole batch is discarded and
+re-queued as before. Either way a batch is re-queued at most twice (`giving up after repeated changes`).
+
 ## Files written
 
 In the status dir:
 
-- `daemon.pid`, `status.json` (state, warm-up, pending work, anchor, last error, last finish)
+- `daemon.pid`, `status.json` (state, warm-up, pending work, `queue` (routes and scenarios in the batch being captured), anchor, last error, last finish)
 - `anchors.json` (the diff anchor per repo root and branch; survives daemon restarts, entries expire after 24 h)
 - `watcher.log` (one line per event)
 - `doctor.json` (last doctor report)

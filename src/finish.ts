@@ -202,6 +202,8 @@ interface State {
   unfilled: UnfilledRoute[];
   impact?: ImpactSummary;
   baseCommit?: string;
+  /** Set when no route qualified as a headline and every route became one (the focus fallback). */
+  focusFallback?: boolean;
 }
 
 /**
@@ -436,8 +438,9 @@ async function gather(
     changed,
   });
   if (selection.fallback) {
+    state.focusFallback = true;
     state.notes.push(
-      'focus: no claim screen, changed page or touched sidecar matched a route, so every route is a headline; name the screens that show the change in the claim (`<route>: <what must be visible>`)',
+      `focus: no claim screen, changed page or touched sidecar matched a route, so every route is a headline; name the screens that show the change in the claim (\`<route>: <what must be visible>\` lines in ${claimPath(config.claimFile, config.repoDir, dirs.statusDir)})`,
     );
   }
   for (const route of selection.headlines) {
@@ -858,6 +861,11 @@ async function addHints(config: Config, dirs: Dirs, state: State): Promise<void>
   if (noFrame && typeof status?.lastError === 'string' && status.lastError !== '') {
     hints.push(`the watcher's last capture problem: ${status.lastError}`);
   }
+  if (noFrame && state.focusFallback) {
+    hints.push(
+      `no route qualified as a headline, so every route the change reaches needs a frame, and the watcher captures at most focus.maxImpact (${config.focus.maxImpact}) of them until the claim names screens: write \`<screen>: <what must be visible>\` lines to ${claimPath(config.claimFile, config.repoDir, dirs.statusDir)}; the watcher captures those screens, the rest become impact routes, then rerun finish`,
+    );
+  }
   if (state.failures.some((f) => /: no frame at HEAD( \(|$)/.test(f))) {
     hints.push('a sidecar scenario has no frame at HEAD: save the sidecar file (or a screen file it visits) with the watcher running to replay it, then rerun finish');
   }
@@ -1188,6 +1196,7 @@ export function recordFinish(
   dirs: Dirs,
   result: Pick<FinishResult, 'ok' | 'failures' | 'summary' | 'proofBlockPath'>,
   at = new Date(),
+  options: { logFailures?: boolean } = {},
 ): void {
   const files = statusFiles(dirs);
   const lastFinish: LastFinish = {
@@ -1205,7 +1214,7 @@ export function recordFinish(
   }
   try {
     const stamp = at.toISOString();
-    const lines = result.ok
+    const lines = result.ok || options.logFailures === false
       ? [`${stamp} finish: ${result.summary}`]
       : [`${stamp} finish: ${result.summary}`, ...result.failures.map((f) => `${stamp} finish failure: ${f}`)];
     fs.appendFileSync(files.log, `${lines.join('\n')}\n`);
@@ -1215,6 +1224,20 @@ export function recordFinish(
 }
 
 // ---- CLI --------------------------------------------------------------------
+
+/**
+ * The calm `--hook` line when the watcher is still busy with the change (capturing, a batch pending, or `finish`
+ * gave up waiting for it), else null.
+ */
+export function captureInProgress(dirs: Dirs, result: Pick<FinishResult, 'failures'>): string | null {
+  const status = readStatusFile(statusFiles(dirs).status);
+  const live = status !== null && status.state !== 'stopped' && status.state !== 'error' && watcherPid(dirs, status) !== null;
+  const busy = live && (status.state === 'capturing' || status.pending === true);
+  const waited = result.failures.some((f) => f.startsWith('capture still in progress'));
+  if (!busy && !waited) return null;
+  const queued = live && typeof status.queue === 'number' && status.queue > 0 ? ` (${plural(status.queue, 'route')} queued)` : '';
+  return `visual-proof: capture in progress${queued}; run \`npx visual-proof finish\` once the watcher is idle`;
+}
 
 export interface FinishCommandContext {
   configPath?: string;
@@ -1255,11 +1278,16 @@ export async function finishCommand(ctx: FinishCommandContext): Promise<number> 
     code = setup ? EXIT.SETUP : EXIT.INTERNAL;
   }
 
-  recordFinish(dirs, result);
   if (ctx.hook) {
+    // A pre-push hook runs seconds after the commit, often while the watcher is still capturing it: what is missing
+    // then is not a failure yet, and listing it sends agents after problems that are about to resolve themselves.
+    const busy = !result.ok ? captureInProgress(dirs, result) : null;
+    if (busy) result.summary = busy;
+    recordFinish(dirs, result, undefined, { logFailures: busy === null });
     out(`${result.summary}\n`);
     return EXIT.OK;
   }
+  recordFinish(dirs, result);
   if (ctx.json) out(`${JSON.stringify(result, null, 2)}\n`);
   else {
     out(`${result.proofBlockPath}\n`);

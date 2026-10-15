@@ -19,11 +19,14 @@ import type { Frame } from './timeline.js';
  *  - is in the component list the frame recorded as rendered (`renderedFiles`);
  *  - is the sidecar file a sidecar frame came from.
  * Files outside `screenGlobs`, `backendGlobs` and `sidecars` (docs, tests, config) never do. Anything that cannot be
- * established (no import graph, a tree git cannot compare) means no carry.
+ * established (no import graph, a tree git cannot compare) means no carry. The watcher applies the same rules to the
+ * files that changed while it was capturing ({@link staleCheck}).
  */
 
+export type CarryConfig = Pick<Config, 'repoDir' | 'screenGlobs' | 'ignoreScreenGlobs' | 'backendGlobs' | 'sidecars' | 'routeFiles' | 'staticRoutes'>;
+
 export interface CarryOptions {
-  config: Pick<Config, 'repoDir' | 'screenGlobs' | 'ignoreScreenGlobs' | 'backendGlobs' | 'sidecars' | 'routeFiles' | 'staticRoutes'>;
+  config: CarryConfig;
   /** The import graph `finish` built, or null when it could not (then nothing is carried). */
   graph: ImportGraph | null;
   /** `HEAD^{tree}`. */
@@ -37,25 +40,57 @@ export interface CarryTarget {
   sidecarFile?: string;
 }
 
+/** What a frame depends on: its {@link CarryTarget} plus the components it rendered. */
+export interface FrameDependencies extends CarryTarget {
+  renderedFiles?: string[] | null;
+}
+
+/**
+ * The file among `files` that can have changed what a frame with these dependencies shows, with why
+ * (`src/S.vue (a backend file)`), or null when none can. The rules are listed at the top of this module; the watcher
+ * uses the same check to keep frames through a change made while it was capturing.
+ */
+export type StaleCheck = (files: Iterable<string>, deps: FrameDependencies) => string | null;
+
+export function staleCheck(config: CarryConfig, graph: ImportGraph): StaleCheck {
+  const cls = classifier(config);
+  const isRouteFile = picomatch(config.routeFiles, { dot: true });
+  return (files, deps) => {
+    const rendered = new Set(deps.renderedFiles ?? []);
+    const keys = new Set(deps.keys);
+    for (const file of files) {
+      if (cls.isSidecar(file)) {
+        if (file === deps.sidecarFile) return file;
+        continue;
+      }
+      if (rendered.has(file)) return `${file} (rendered in it)`;
+      if (cls.isBackend(file)) return `${file} (a backend file)`;
+      if (isRouteFile(file)) return `${file} (a route file)`;
+      if (!cls.isScreen(file)) continue;
+      const routes = graph.fileToRoutes.get(file) ?? config.staticRoutes[file] ?? [];
+      if (routes.length === 0) return `${file} (no route renders it)`;
+      if (routes.some((r) => keys.has(r))) return file;
+    }
+    return null;
+  };
+}
+
 export type CarryResult = { ok: true; fromTree: string } | { ok: false; reason: string };
 
 export class Carrier {
-  private readonly cls;
-  private readonly isRouteFile;
+  private readonly stale: StaleCheck | null;
   private readonly diffs = new Map<string, Promise<string[] | null>>();
 
   constructor(private readonly opts: CarryOptions) {
-    this.cls = classifier(opts.config);
-    this.isRouteFile = picomatch(opts.config.routeFiles, { dot: true });
+    this.stale = opts.graph ? staleCheck(opts.config, opts.graph) : null;
   }
 
   /** Whether `frame` (older than HEAD, clean) still stands at HEAD's tree. */
   async check(frame: Frame, target: CarryTarget): Promise<CarryResult> {
-    const { graph, headTree, config } = this.opts;
+    const { headTree, config } = this.opts;
     const short = frame.treeHash.slice(0, 8);
-    const stale = (why: string): CarryResult => ({ ok: false, reason: `the last clean frame, at tree ${short}, is stale: ${why}` });
     if (frame.status !== 'clean') return { ok: false, reason: '' };
-    if (graph === null) return { ok: false, reason: `the last clean frame is at tree ${short}, but there is no import graph to tell what changed since` };
+    if (this.stale === null) return { ok: false, reason: `the last clean frame is at tree ${short}, but there is no import graph to tell what changed since` };
     if (frame.treeHash === headTree) return { ok: true, fromTree: frame.treeHash };
 
     let diff = this.diffs.get(frame.treeHash);
@@ -63,21 +98,8 @@ export class Carrier {
     const files = await diff;
     if (files === null) return { ok: false, reason: `the last clean frame is at tree ${short}, which git cannot compare with HEAD` };
 
-    const rendered = new Set(frame.renderedFiles ?? []);
-    const keys = new Set(target.keys);
-    for (const file of files) {
-      if (this.cls.isSidecar(file)) {
-        if (file === target.sidecarFile) return stale(`${file} changed since`);
-        continue;
-      }
-      if (rendered.has(file)) return stale(`${file} (rendered in it) changed since`);
-      if (this.cls.isBackend(file)) return stale(`${file} (a backend file) changed since`);
-      if (this.isRouteFile(file)) return stale(`${file} (a route file) changed since`);
-      if (!this.cls.isScreen(file)) continue;
-      const routes = graph.fileToRoutes.get(file) ?? config.staticRoutes[file] ?? [];
-      if (routes.length === 0) return stale(`${file} (no route renders it) changed since`);
-      if (routes.some((r) => keys.has(r))) return stale(`${file} changed since`);
-    }
+    const why = this.stale(files, { ...target, renderedFiles: frame.renderedFiles });
+    if (why !== null) return { ok: false, reason: `the last clean frame, at tree ${short}, is stale: ${why} changed since` };
     return { ok: true, fromTree: frame.treeHash };
   }
 }

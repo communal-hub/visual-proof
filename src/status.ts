@@ -62,6 +62,8 @@ export interface Status {
   /** True from the first file event of a change until its batch (including re-queues) is fully handled. */
   pending: boolean;
   pendingSince: string | null;
+  /** v0.12: routes and sidecar scenarios in the batch being captured; absent while none is. */
+  queue?: number;
   lastError: string | null;
   frames: number;
   /** Absent until the watcher reaches the warm-up step; `state` stays `starting` until it is finished. */

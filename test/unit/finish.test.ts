@@ -943,6 +943,37 @@ describe('finishCommand', () => {
     expect(fs.readFileSync(path.join(dirs.statusDir, 'watcher.log'), 'utf8')).toMatch(/^\S+ finish failure: no frame at HEAD for \/a$/m);
   });
 
+  it('--hook prints one calm line instead of failures while the watcher is still capturing, and exits 0', async () => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    const statusFile = path.join(dirs.statusDir, 'status.json');
+    fs.writeFileSync(statusFile, JSON.stringify({ state: 'capturing', pending: true, pid: process.pid, sessionId: 's-1', queue: 3 }));
+    const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] }, finishBudgetMs: 600 });
+    editAndCommit('src/pages/A.vue');
+
+    const calm = 'visual-proof: capture in progress (3 routes queued); run `npx visual-proof finish` once the watcher is idle';
+    const r = await run(true, file);
+    expect(r).toEqual({ code: 0, stdout: `${calm}\n`, stderr: '' });
+    expect(lastFinish()).toMatchObject({ ok: false, summary: calm });
+    const log = fs.readFileSync(path.join(dirs.statusDir, 'watcher.log'), 'utf8');
+    expect(log).toContain(`finish: ${calm}`);
+    expect(log).not.toContain('finish failure');
+
+    // Without --hook nothing changes: the failures are listed and the exit code is 1.
+    const plain = await run(false, file);
+    expect(plain.code).toBe(1);
+    expect(plain.stdout).toBe(`${blockPath()}\n`);
+    expect(plain.stderr).toMatch(/^visual-proof finish: (capture still in progress|truncated)/);
+  });
+
+  it('--hook says "capture in progress" without a count when the budget ran out waiting on a pending batch', async () => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'ready', pending: true, pid: process.pid, sessionId: 's-1' }));
+    const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] }, finishBudgetMs: 600 });
+    editAndCommit('src/pages/A.vue');
+    const r = await run(true, file);
+    expect(r).toEqual({ code: 0, stdout: 'visual-proof: capture in progress; run `npx visual-proof finish` once the watcher is idle\n', stderr: '' });
+  });
+
   describe('a finish that cannot run still writes a failure block and records lastFinish', () => {
     it('missing config: exit 3, one line on stderr', async () => {
       const r = await run(false, path.join(repo, 'missing.json'));

@@ -125,6 +125,17 @@ describe('focus helpers', () => {
 });
 
 describe('finish with focus', () => {
+  it('with no headline, the fallback note and the hint for missing frames tell the agent to name the claim screens', async () => {
+    editShared();
+    await frame('/users', 'clean');
+    const result = await finish();
+    expect(result.notes.some((n) => n.startsWith('focus: no claim screen') && n.includes(path.join(dirs.statusDir, 'claim.md')))).toBe(true);
+    expect(result.failures).toContain('no frame at HEAD for /edit');
+    const hint = result.hints.find((h) => h.startsWith('no route qualified as a headline'));
+    expect(hint).toContain('focus.maxImpact (40)');
+    expect(hint).toContain(`write \`<screen>: <what must be visible>\` lines to ${path.join(dirs.statusDir, 'claim.md')}`);
+  });
+
   it('shows only the claim screen; impact routes that fail where the change did not render, or have no params, are notes', async () => {
     editShared();
     claim('/facilities/3: the booking spans the full column width\n');
