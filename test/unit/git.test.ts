@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { changedFiles, changeSet, headCommit, headTree, workingTreeHash } from '../../src/git.js';
+import { changedFiles, changeSet, headCommit, headTree, treeBlobs, workingTreeHash } from '../../src/git.js';
+import { blobId } from '../../src/trigger/fs-watch.js';
 import { commitAll, git, initRepo, tmpDir, write } from './helpers.js';
 
 let repo: string;
@@ -265,5 +266,26 @@ describe('changedFiles', () => {
       // From the toplevel the same changes keep their full paths.
       expect(await changedFiles(repo, 'main')).toContain('sub/src/App.vue');
     });
+  });
+});
+
+describe('treeBlobs', () => {
+  it('lists the blob id of every file in a working-tree hash, relative to a subdirectory config, matching blobId', async () => {
+    const repo = initRepo();
+    write(repo, 'app/src/a.vue', 'a\n');
+    write(repo, 'app/lang/en.json', '{"hi":"Hello"}\n');
+    write(repo, 'other/x.txt', 'x');
+    const app = path.join(repo, 'app');
+    const tree = await workingTreeHash(app, tmpDir('vp-scratch-'));
+    const blobs = await treeBlobs(app, tree);
+    expect([...blobs.keys()].sort()).toEqual(['lang/en.json', 'src/a.vue']);
+    expect(blobs.get('src/a.vue')).toBe(blobId(path.join(app, 'src/a.vue')));
+    expect(blobs.get('lang/en.json')).toBe(git(repo, 'hash-object', 'app/lang/en.json'));
+  });
+
+  it('is empty for something that is not a tree', async () => {
+    const repo = initRepo();
+    expect((await treeBlobs(repo, 'not-a-tree')).size).toBe(0);
+    expect((await treeBlobs(repo, 'f'.repeat(40))).size).toBe(0);
   });
 });

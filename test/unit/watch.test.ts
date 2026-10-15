@@ -12,6 +12,7 @@ import type { FsWatchOptions, WatchBatch } from '../../src/trigger/fs-watch.js';
 import type { BarrierResult, HmrState } from '../../src/trigger/vite-hmr.js';
 import { startWatch, type BarrierSource, type BatchEvent, type WatchHandle } from '../../src/watch.js';
 import { workingTreeHash } from '../../src/git.js';
+import { requestClaimCapture } from '../../src/claim-status.js';
 import { git, tmpDir } from './helpers.js';
 
 const cleanSignals: CaptureSignals = {
@@ -105,6 +106,7 @@ let pushBatch: (batch: Partial<WatchBatch>) => void;
 let fireEvent: () => void;
 let fireSession: () => void;
 let fireClaim: () => void;
+let fireRequest: () => void;
 /** Paths the fake trigger reports through `eventsSince`; null makes it a trigger that only counts. */
 let eventPaths: string[] | null;
 let triggerStopped: boolean;
@@ -165,6 +167,10 @@ async function start(overrides: Parameters<typeof startWatch>[1] = {}): Promise<
     },
     watchClaim: async (_file: string, onChange: () => void) => {
       fireClaim = onChange;
+      return { stop: async () => {} };
+    },
+    watchClaimRequest: async (_file: string, onChange: () => void) => {
+      fireRequest = onChange;
       return { stop: async () => {} };
     },
     startTrigger: async (options: FsWatchOptions) => {
@@ -1748,7 +1754,7 @@ describe('focus before the claim names a screen (v0.12)', () => {
   };
   const claimFile = () => path.join(dirs.statusDir, 'claim.md');
   const startFocus = () => {
-    config = { ...config, routeParams: { '/facilities/:id': '/facilities/3' }, focus: { mode: 'claim', maxImpact: 1 } };
+    config = { ...config, routeParams: { '/facilities/:id': '/facilities/3' }, focus: { mode: 'claim', maxImpact: 1, impactConcurrency: 1 } };
     return start({ buildGraph: async () => focusGraph });
   };
   const paths = () => capturer.urls.map((u) => u.replace('http://app.test', ''));
@@ -1906,5 +1912,262 @@ describe('changes during a capture (v0.12)', () => {
     expect(batches.map((b) => b.outcome)).toEqual(['discarded', 'captured']);
     expect(logText()).toMatch(/discarded 1 frame\(s\): 1 file event\(s\) arrived during capture \(tree unchanged: a{8}\); no import graph/);
     expect(timeline().list()).toEqual([expect.objectContaining({ route: '/invoices/5', trigger: 'params' })]);
+  });
+});
+
+describe('claim screens first (v0.13)', () => {
+  const SHARED = 'src/shared/Picker.vue';
+  const ROUTES = Array.from({ length: 12 }, (_, i) => `/r${i}`);
+  const claimGraph: ImportGraph = {
+    fileToRoutes: new Map([[SHARED, ROUTES]]),
+    routes: ROUTES.map((r) => ({ path: r, routeFile: 'src/router/index.js', component: `src/pages/${r.slice(1).toUpperCase()}.vue`, layouts: [], dynamic: false })),
+    unresolved: [],
+  };
+  const claimFile = () => path.join(dirs.statusDir, 'claim.md');
+  const requestFile = () => path.join(dirs.statusDir, 'claim-request.json');
+  const paths = () => capturer.urls.map((u) => u.replace('http://app.test', ''));
+  const startClaim = (overrides: Partial<Config> = {}, focus: Partial<Config['focus']> = {}) => {
+    config = { ...config, ...overrides, focus: { mode: 'claim', maxImpact: 40, impactConcurrency: 1, ...focus } };
+    return start({ buildGraph: async () => claimGraph });
+  };
+  const request = (): number => {
+    const rev = requestClaimCapture(requestFile(), 'test');
+    fireRequest();
+    return rev;
+  };
+  const stillOf = (name: string) => ({ name, at: new Date().toISOString(), png: Buffer.from(name), signals: cleanSignals, renderedFiles: null, steps: [], failed: false });
+
+  it('captures the claim screens first and reports them ready while the impact routes are still being captured', async () => {
+    fs.writeFileSync(claimFile(), '- /r9: the picker opens\n');
+    await startClaim();
+    const seen: Array<{ claim: unknown; remaining: unknown }> = [];
+    capturer.onCapture = () => {
+      const status = statusJson();
+      seen.push({ claim: status.claim, remaining: status.remaining });
+    };
+    pushBatch({ screen: [SHARED] });
+    await nextBatch();
+    expect(paths()[0]).toBe('/r9');
+    expect(paths()).toHaveLength(12);
+    // At the first impact capture the claim round is recorded and ready; the impact routes are still queued.
+    expect(seen[1]!.claim).toMatchObject({ ready: true, current: true, total: 1, captured: 1, screens: [{ screen: '/r9', kind: 'route', state: 'clean' }] });
+    expect(seen[1]!.remaining).toMatchObject({ claim: 0, headline: 0, impact: 11 });
+    expect(seen[0]!.remaining).toMatchObject({ claim: 1, impact: 11 });
+    expect(statusJson().remaining).toBeUndefined();
+    expect(logText()).toContain('claim: 1/1 claim screen(s) ready at tree aaaaaaaa');
+  });
+
+  it('runs a sidecar with a claimed still right after the claim routes, before the impact routes', async () => {
+    const order: string[] = [];
+    capturer.onCapture = (url) => void order.push(url.replace('http://app.test', ''));
+    capturer.runScenario = async (plan) => {
+      order.push(`sidecar ${plan.name}`);
+      return { stills: [stillOf('open')], ms: 1 };
+    };
+    fs.mkdirSync(path.join(repo, '.visual-proof/sidecars'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.visual-proof/sidecars/pick.vp'), 'goto /r1\nstill open\n');
+    fs.writeFileSync(claimFile(), '- /r9: the picker opens\n- sidecar pick / open: the picker modal\n');
+    await startClaim();
+    pushBatch({ screen: [SHARED] });
+    await nextBatch();
+    expect(order.slice(0, 3)).toEqual(['/r9', 'sidecar pick', expect.stringMatching(/^\/r\d+$/)]);
+    expect(statusJson().claim).toMatchObject({ ready: true, total: 2, captured: 2 });
+  });
+
+  it('a claim request moves the claim screens ahead of the impact routes being captured, and the rest resumes after', async () => {
+    await startClaim();
+    let rev = 0;
+    capturer.onCapture = () => {
+      if (capturer.urls.length !== 3) return;
+      fs.writeFileSync(claimFile(), '- /r11: the picker opens\n');
+      rev = request();
+    };
+    pushBatch({ screen: [SHARED] });
+    await nextBatch(2);
+    expect(paths()[3]).toBe('/r11');
+    expect(paths().slice(0, 3)).not.toContain('/r11');
+    expect(new Set(paths()).size).toBe(12);
+    expect(paths()).toHaveLength(12);
+    expect(statusJson().claim).toMatchObject({ ready: true, request: rev, screens: [{ screen: '/r11', state: 'clean' }] });
+    expect(logText()).toContain('claim request from test: capturing the claim screens before the rest of the running batch');
+    expect(logText()).toMatch(/preempted: 9 capture\(s\) of this batch moved behind new work/);
+  });
+
+  it('answers a claim request with nothing to capture by acknowledging it', async () => {
+    fs.writeFileSync(claimFile(), '- /r1: x\n');
+    await startClaim();
+    pushBatch({ screen: [SHARED] });
+    await nextBatch();
+    const rev = request();
+    await nextBatch(2);
+    expect(batches[1]!.outcome).toBe('no-routes');
+    expect(capturer.urls).toHaveLength(12);
+    expect(statusJson().claim).toMatchObject({ ready: true, request: rev, current: true });
+  });
+
+  it('says where each claim screen stands: clean, not clean, unfilled, unmatched', async () => {
+    capturer.signalsFor = (url) => (url.endsWith('/broken') ? { httpStatus: 500 } : {});
+    fs.writeFileSync(claimFile(), '- /r1: the picker\n- /broken: a page that fails\n- /items/:id: an item\nNote: not a screen at all\n');
+    await startClaim({ paramDiscovery: 'off' });
+    request();
+    await nextBatch();
+    const claim = statusJson().claim;
+    expect(claim).toMatchObject({ ready: false, total: 3, captured: 1 });
+    expect(Object.fromEntries(claim.screens.map((s: { screen: string; state: string }) => [s.screen, s.state]))).toEqual({
+      '/r1': 'clean',
+      '/broken': 'not-clean',
+      '/items/:id': 'unfilled',
+      Note: 'unmatched',
+    });
+    expect(claim.screens.find((s: { screen: string }) => s.screen === '/broken').reason).toMatch(/500/);
+  });
+
+  it('a file event makes the claim status stale until the watcher has looked again', async () => {
+    fs.writeFileSync(claimFile(), '- /r1: x\n');
+    await startClaim();
+    request();
+    await nextBatch();
+    expect(statusJson().claim.current).toBe(true);
+    eventCounter++;
+    fireEvent();
+    expect(statusJson().claim.current).toBe(false);
+    pushBatch({ screen: [SHARED] });
+    await nextBatch(2);
+    expect(statusJson().claim).toMatchObject({ current: true, ready: true });
+  });
+
+  it('carries a claim frame across a later change that cannot reach it, without capturing it again', async () => {
+    git(repo, 'init', '-q');
+    for (const f of ['src/pages/Home.vue', 'src/pages/Detail.vue']) {
+      fs.mkdirSync(path.dirname(path.join(repo, f)), { recursive: true });
+      fs.writeFileSync(path.join(repo, f), `<template>${f}</template>\n`);
+    }
+    fs.writeFileSync(claimFile(), '- /: the home page\n');
+    await start({ treeHash: workingTreeHash });
+    request();
+    await nextBatch();
+    expect(capturer.urls).toEqual(['http://app.test/']);
+    fs.writeFileSync(path.join(repo, 'src/pages/Detail.vue'), '<template>changed</template>\n');
+    pushBatch({ screen: ['src/pages/Detail.vue'] });
+    await nextBatch(2);
+    request();
+    await nextBatch(3);
+    expect(capturer.urls).toEqual(['http://app.test/', 'http://app.test/invoices/1']);
+    expect(statusJson().claim).toMatchObject({ ready: true, screens: [{ screen: '/', state: 'carried' }] });
+  });
+
+  it('backendScope "claim": a backend change re-captures the claim screens, not every route of the session', async () => {
+    fs.writeFileSync(claimFile(), '- /r2: x\n');
+    await startClaim({ backendScope: 'claim' });
+    pushBatch({ screen: [SHARED] });
+    await nextBatch();
+    const before = capturer.urls.length;
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(paths().slice(before)).toEqual(['/r2']);
+    expect(timeline().list().at(-1)).toMatchObject({ route: '/r2', trigger: 'backend', sourceFile: 'server/data.json' });
+    expect(logText()).toContain('backendScope "claim", re-capturing the claim screens, not the 12 route(s) captured this session');
+  });
+
+  it('backendScope "claim" without claim screens re-captures the session, and says why', async () => {
+    await startClaim({ backendScope: 'claim' });
+    pushBatch({ screen: [SHARED] });
+    await nextBatch();
+    pushBatch({ backend: ['server/data.json'] });
+    await nextBatch(2);
+    expect(capturer.urls).toHaveLength(24);
+    expect(logText()).toContain('the claim names no screens yet, so every route captured this session is re-captured');
+  });
+
+  it('captures impact routes side by side, at most focus.impactConcurrency at once, and claim screens alone', async () => {
+    fs.writeFileSync(claimFile(), '- /r5: x\n');
+    await startClaim({}, { impactConcurrency: 3 });
+    let inFlight = 0;
+    let most = 0;
+    let duringClaim = 0;
+    capturer.onCapture = async (url) => {
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      if (url.endsWith('/r5')) duringClaim = inFlight;
+      inFlight--;
+    };
+    pushBatch({ screen: [SHARED] });
+    await nextBatch();
+    expect(paths()[0]).toBe('/r5');
+    expect(duringClaim).toBe(1);
+    expect(most).toBe(3);
+    expect(timeline().list()).toHaveLength(12);
+  });
+
+  it('answers a claim request with the reason when its batch fails, so ready --claim does not wait for nothing', async () => {
+    fs.writeFileSync(claimFile(), '- /r1: x\n');
+    let broken = false;
+    await start({
+      buildGraph: async () => claimGraph,
+      treeHash: async () => {
+        if (broken) throw new Error('git is gone');
+        return tree;
+      },
+    });
+    broken = true;
+    const rev = request();
+    await nextBatch();
+    expect(batches[0]!.outcome).toBe('error');
+    expect(statusJson().claim).toMatchObject({ request: rev, ready: false, error: expect.stringContaining('git is gone') });
+  });
+
+  it('an unknown change in the impact round re-queues that round only: the recorded claim screen is not captured again', async () => {
+    fs.writeFileSync(claimFile(), '- /r1: x\n');
+    await startClaim({}, { maxImpact: 3 });
+    let n = 0;
+    capturer.onCapture = () => {
+      if (++n === 2) eventCounter++; // during the first impact capture; this trigger cannot say which file
+    };
+    pushBatch({ screen: [SHARED] });
+    await nextBatch(2);
+    expect(batches.map((b) => b.outcome)).toEqual(['captured', 'captured']);
+    expect(batches[0]!.routes).toEqual(['/r1']);
+    expect(paths().filter((p) => p === '/r1')).toHaveLength(1);
+    expect(paths()).toHaveLength(1 + 3 + 3);
+  });
+
+  it('keeps route frames when only a sidecar file changed during the capture, even without an import graph', async () => {
+    eventPaths = [];
+    const SC = '.visual-proof/sidecars/home.vp';
+    fs.mkdirSync(path.join(repo, '.visual-proof/sidecars'), { recursive: true });
+    fs.writeFileSync(path.join(repo, SC), 'goto /\nstill one\n');
+    await start({ buildGraph: async () => Promise.reject(new Error('no graph here')) });
+    capturer.onCapture = () => {
+      eventPaths!.push(SC);
+      eventCounter++;
+    };
+    setSessionParams(path.join(dirs.statusDir, 'session-params.json'), '/invoices/:id', { path: '/invoices/5', params: {}, at: new Date().toISOString() });
+    fireSession();
+    await nextBatch();
+    expect(batches.map((b) => b.outcome)).toEqual(['captured']);
+    expect(timeline().list()).toEqual([expect.objectContaining({ route: '/invoices/5' })]);
+    expect(logText()).toContain(`kept 1 frame(s), discarded 0: 1 file event(s) arrived during capture (tree unchanged: aaaaaaaa), but nothing they show depends on ${SC}`);
+  });
+});
+
+describe('claim requests made while the watcher starts (v0.13)', () => {
+  const requestFile = () => path.join(dirs.statusDir, 'claim-request.json');
+
+  it('answers a recent request once ready, and ignores an old one', async () => {
+    fs.writeFileSync(path.join(dirs.statusDir, 'claim.md'), '- /: home\n');
+    const rev = requestClaimCapture(requestFile(), 'ready --claim');
+    await start();
+    await nextBatch();
+    expect(capturer.urls).toEqual(['http://app.test/']);
+    expect(statusJson().claim).toMatchObject({ ready: true, request: rev });
+    await handle!.stop();
+    handle = null;
+
+    fs.writeFileSync(requestFile(), JSON.stringify({ rev: rev + 1, from: 'ready --claim', at: new Date(Date.now() - 10 * 60_000).toISOString() }));
+    batches = [];
+    await start();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(batches).toEqual([]);
   });
 });

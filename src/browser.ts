@@ -42,6 +42,8 @@ export interface CaptureTiming {
   settleMs: number;
   /** From the settled page to the PNG: rendered-component walk, preparing the page, the screenshot call. */
   screenshotMs: number;
+  /** v0.13: the network never went quiet; the capture waited the whole `settle.maxWaitMs` (the log says for what). */
+  settleCapped?: boolean;
 }
 
 export interface CaptureResult {
@@ -156,6 +158,8 @@ export interface ScenarioResult {
   /** The step that stopped the scenario, if any. */
   failure?: { line: number; text: string; reason: string };
   ms: number;
+  /** v0.13: how long each step that ran took (ms), in order; the failing step is the last one. */
+  steps?: Array<{ line: number; ms: number }>;
 }
 
 export interface RecordedClip {
@@ -408,7 +412,19 @@ export class Browser implements Capturer {
 
   // ---- lifecycle -----------------------------------------------------------
 
-  private async ensureContext(): Promise<BrowserContext> {
+  /** v0.13: one launch at a time, however many captures ask for the context at once. */
+  private contextInFlight: Promise<BrowserContext> | null = null;
+
+  private ensureContext(): Promise<BrowserContext> {
+    // Not while a launch is under way: its context exists before its routes and clock are installed.
+    if (this.context && !this.contextInFlight && this.browser?.isConnected() !== false) return Promise.resolve(this.context);
+    this.contextInFlight ??= this.doEnsureContext().finally(() => {
+      this.contextInFlight = null;
+    });
+    return this.contextInFlight;
+  }
+
+  private async doEnsureContext(): Promise<BrowserContext> {
     if (this.browser && !this.browser.isConnected()) {
       this.log('browser disconnected; relaunching');
       await this.close();
@@ -483,7 +499,17 @@ export class Browser implements Capturer {
 
   // ---- login ---------------------------------------------------------------
 
-  private async ensureLoggedIn(): Promise<void> {
+  /** v0.13: impact routes are captured side by side; they share one login rather than racing to log in. */
+  private loginInFlight: Promise<void> | null = null;
+
+  private ensureLoggedIn(): Promise<void> {
+    this.loginInFlight ??= this.doEnsureLoggedIn().finally(() => {
+      this.loginInFlight = null;
+    });
+    return this.loginInFlight;
+  }
+
+  private async doEnsureLoggedIn(): Promise<void> {
     if (this.config.login.type !== 'http-hook') return;
     // A scenario that logged in as another role leaves the context on that role until it restores the default.
     if (this.loggedIn && this.sessionEmail === this.config.login.email) return;
@@ -576,7 +602,7 @@ export class Browser implements Capturer {
     for (let attempt = 0; attempt < 4; attempt++) {
       const seen = watched.navigations;
       // No request in flight for `settle.networkIdleMs`, but give up after `settle.maxWaitMs`.
-      await network.wait(this.config.settle.networkIdleMs, maxWaitMs);
+      if (!(await network.wait(this.config.settle.networkIdleMs, maxWaitMs))) this.settleCapped(watched, label, maxWaitMs);
       const settled = await settle(page);
       const read = settled
         ? await readDom(page, this.config.appRoot, this.config.spinnerSelectors, (m) => this.log(`capture ${label}: reading the page failed: ${m}`))
@@ -586,6 +612,26 @@ export class Browser implements Capturer {
       this.log(`capture ${label}: page navigated while settling (attempt ${attempt + 1})`);
     }
     return dom;
+  }
+
+  /** Request lists already logged as keeping a page from settling, so a poll every page makes is said once. */
+  private readonly busyLogged = new Set<string>();
+
+  /**
+   * v0.13: the page did not go quiet within `settle.maxWaitMs`. Each such capture costs the whole window, which is how
+   * a route takes many seconds; say once per distinct set of requests what was still in flight.
+   */
+  private settleCapped(watched: Watched, label: string, maxWaitMs: number): void {
+    watched.settleCapped = true;
+    const busy = watched.network.busy();
+    const key = busy.join(' ');
+    if (this.busyLogged.has(key)) return;
+    this.busyLogged.add(key);
+    this.log(
+      `capture ${label}: the network was still busy after settle.maxWaitMs (${maxWaitMs} ms)` +
+        (busy.length > 0 ? `; in flight: ${busy.join(', ')}` : '') +
+        '. Every capture that does this waits the whole window: if it is a poll or a stream the page never finishes, block its host (blockHosts) or lower settle.maxWaitMs',
+    );
   }
 
   /**
@@ -623,6 +669,7 @@ export class Browser implements Capturer {
         extraNavigations: Math.max(0, watched.navigations - 1),
         network,
         settleMs: Date.now() - settleStart,
+        settleCapped: watched.settleCapped === true,
       };
     } catch (err) {
       this.pages.delete(page);
@@ -644,7 +691,7 @@ export class Browser implements Capturer {
         httpStatus,
         ...(shot.layout ? { layout: shot.layout } : {}),
         renderedFiles: shot.renderedFiles,
-        timing: { settleMs: loaded.settleMs, screenshotMs: shot.ms },
+        timing: { settleMs: loaded.settleMs, screenshotMs: shot.ms, ...(loaded.settleCapped ? { settleCapped: true } : {}) },
         signals: { navOk, httpStatus, consoleErrors, pageErrors, ...signalDom, ...(shot.error ? { screenshotError: shot.error } : {}) },
       };
     } finally {
@@ -785,6 +832,7 @@ export class Browser implements Capturer {
       recorder,
       holdMs: plan.record?.holdMs ?? 0,
       mouse: { x: Math.round(this.config.viewport.width / 2), y: Math.round(this.config.viewport.height / 2) },
+      timings: [],
     };
 
     let clip: RecordedClip | undefined;
@@ -814,7 +862,7 @@ export class Browser implements Capturer {
       await page.close().catch(() => {});
       await this.restoreDefaultLogin();
     }
-    return { stills: run.stills, ...(clip ? { clip } : {}), ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started };
+    return { stills: run.stills, ...(clip ? { clip } : {}), ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started, steps: run.timings };
   }
 
   private async runSteps(run: ScenarioRun): Promise<void> {
@@ -831,7 +879,9 @@ export class Browser implements Capturer {
         if (!run.recorder.started && step.verb !== 'goto' && step.verb !== 'login') await this.beginRecording(run);
         run.recorder.caption(`${run.plan.name} / ${step.text}`);
       }
+      const stepStarted = Date.now();
       const reason = await this.runStep(run, step);
+      run.timings.push({ line: step.line, ms: Date.now() - stepStarted });
       if (run.cancelled) return;
       if (run.recorder && reason === null && step.verb === 'goto') {
         if (!run.recorder.started) await this.beginRecording(run);
@@ -1305,6 +1355,8 @@ interface Watched {
   pageErrors: string[];
   /** Main-frame navigations so far, the initial one included. */
   navigations: number;
+  /** v0.13: settling ran into `settle.maxWaitMs` with requests still in flight. */
+  settleCapped?: boolean;
 }
 
 /** Mutable state of one running scenario. */
@@ -1327,6 +1379,8 @@ interface ScenarioRun {
   holdMs: number;
   /** Where the mouse is (viewport px); glides start here. */
   mouse: Point;
+  /** Time per step that ran. */
+  timings: Array<{ line: number; ms: number }>;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1347,6 +1401,7 @@ interface Loaded {
   extraNavigations: number;
   network: NetworkIdle;
   settleMs: number;
+  settleCapped: boolean;
 }
 
 /**
@@ -1362,6 +1417,8 @@ class NetworkIdle {
       this.lastActivity = Date.now();
     };
     page.on('request', (request) => {
+      // v0.13: an event stream never finishes; it is not loading the page.
+      if (request.resourceType() === 'eventsource') return;
       this.inflight.add(request);
       touch();
     });
@@ -1371,6 +1428,21 @@ class NetworkIdle {
     };
     page.on('requestfinished', done);
     page.on('requestfailed', done);
+  }
+
+  /** `GET /api/poll` for each request in flight (query strings dropped), at most five. */
+  busy(): string[] {
+    const shown = [...this.inflight].slice(0, 5).map((r) => {
+      let where = r.url();
+      try {
+        const url = new URL(where);
+        where = `${url.host}${url.pathname}`;
+      } catch {
+        // not a URL: keep it as it is
+      }
+      return `${r.method()} ${where}`;
+    });
+    return [...new Set(shown)].sort();
   }
 
   /** Resolves true once nothing has been in flight for `idleMs`, false when `maxMs` ran out first. */

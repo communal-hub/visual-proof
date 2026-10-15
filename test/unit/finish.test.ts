@@ -552,11 +552,11 @@ describe('runFinish while the daemon is still working', () => {
   });
 
   it('gives up with "capture still in progress" inside the budget instead of a bare truncation', async () => {
-    writeStatus({ state: 'capturing', pending: true });
-    const result = await quick({ budgetMs: 700 });
+    writeStatus({ state: 'capturing', pending: true, remaining: { claim: 0, headline: 1, impact: 31 } });
+    const result = await quick({ budgetMs: 300, waitMs: 700 });
     expect(result.truncated).toBe(false);
     expect(result.failures).toHaveLength(2);
-    expect(result.failures[0]).toMatch(/^capture still in progress after \d+\.\d s$/);
+    expect(result.failures[0]).toMatch(/^capture still in progress after 0\.\d s \(waiting for \/a; headlines: 1 queued; impact: 31 queued\)$/);
     expect(result.failures[1]).toBe('no frame at HEAD for /a');
   });
 
@@ -584,6 +584,68 @@ describe('runFinish while the daemon is still working', () => {
     const t0 = Date.now();
     expect((await quick({ budgetMs: 5000 })).failures).toEqual(['no frame at HEAD for /a']);
     expect(Date.now() - t0).toBeLessThan(1500);
+  });
+});
+
+describe('runFinish waiting for the watcher (v0.13)', () => {
+  const writeStatus = (extra: Record<string, unknown>): void => {
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dirs.statusDir, 'status.json'),
+      JSON.stringify({ state: 'capturing', sessionId: 's-test', pid: process.pid, pending: true, lastEventAt: null, ...extra }),
+    );
+  };
+
+  it('waits past finishBudgetMs, up to finishWaitMs: the wait does not eat the budget', async () => {
+    editAndCommit('src/pages/A.vue');
+    writeStatus({});
+    setTimeout(() => void frame('/a'), 600);
+    const result = await finish({ pollMs: 15, budgetMs: 300, waitMs: 5000 });
+    expect(result).toMatchObject({ ok: true, truncated: false });
+  });
+
+  it('asks the watcher for the claim screens while it waits, once, when the claim names screens', async () => {
+    editAndCommit('src/pages/A.vue');
+    writeStatus({});
+    setTimeout(() => void frame('/a'), 200);
+    await finish({ pollMs: 15, waitMs: 5000 });
+    expect(fs.existsSync(path.join(dirs.statusDir, 'claim-request.json'))).toBe(false); // no claim: nothing to ask for
+    fs.writeFileSync(path.join(dirs.statusDir, 'claim.md'), '- /a: the page\n');
+    editAndCommit('src/pages/A.vue');
+    setTimeout(() => void frame('/a'), 300);
+    await finish({ pollMs: 15, waitMs: 5000 });
+    const request = JSON.parse(fs.readFileSync(path.join(dirs.statusDir, 'claim-request.json'), 'utf8'));
+    expect(request).toMatchObject({ from: 'finish' });
+    expect(fs.readFileSync(path.join(dirs.statusDir, 'watcher.log'), 'utf8')).toMatch(/finish: waiting up to 5 s for 1 headline\(s\); asked the watcher for the claim screens first/);
+  });
+
+  it('does not wait for a headline whose earlier frame carries to HEAD, however busy the watcher is with impact routes', async () => {
+    write(repo, 'src/pages/A.vue', '<template>A2</template>\n');
+    write(repo, 'src/pages/C.vue', '<template>C2</template>\n');
+    commitAll(repo, 'both');
+    const first = (await headTree(repo))!;
+    await frame('/a', 'clean', { tree: first });
+    await frame('/c', 'clean', { tree: first });
+    editAndCommit('README.md', '# docs only\n');
+    writeStatus({ remaining: { claim: 0, headline: 0, impact: 31 } });
+    const t0 = Date.now();
+    const result = await finish({ pollMs: 15, waitMs: 5000 });
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(result.ok).toBe(true);
+    expect(result.routes.filter((r) => r.role !== 'impact').every((r) => r.carriedFrom === first)).toBe(true);
+  });
+
+  it('never waits for impact routes', async () => {
+    editAndCommit('src/shared/S.vue');
+    fs.mkdirSync(dirs.statusDir, { recursive: true });
+    fs.writeFileSync(path.join(dirs.statusDir, 'claim.md'), '- /a: the shared part\n');
+    await frame('/a');
+    writeStatus({ remaining: { claim: 0, headline: 0, impact: 1 } });
+    const t0 = Date.now();
+    const result = await finish({ pollMs: 15, waitMs: 5000 });
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(result.ok).toBe(true);
+    expect(result.impact).toMatchObject({ total: 1, notCaptured: [{ route: '/c', reason: 'no frame at HEAD' }] });
   });
 });
 
@@ -947,7 +1009,7 @@ describe('finishCommand', () => {
     fs.mkdirSync(dirs.statusDir, { recursive: true });
     const statusFile = path.join(dirs.statusDir, 'status.json');
     fs.writeFileSync(statusFile, JSON.stringify({ state: 'capturing', pending: true, pid: process.pid, sessionId: 's-1', queue: 3 }));
-    const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] }, finishBudgetMs: 600 });
+    const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] }, finishBudgetMs: 600, finishWaitMs: 600 });
     editAndCommit('src/pages/A.vue');
 
     const calm = 'visual-proof: capture in progress (3 routes queued); run `npx visual-proof finish` once the watcher is idle';
@@ -968,7 +1030,7 @@ describe('finishCommand', () => {
   it('--hook says "capture in progress" without a count when the budget ran out waiting on a pending batch', async () => {
     fs.mkdirSync(dirs.statusDir, { recursive: true });
     fs.writeFileSync(path.join(dirs.statusDir, 'status.json'), JSON.stringify({ state: 'ready', pending: true, pid: process.pid, sessionId: 's-1' }));
-    const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] }, finishBudgetMs: 600 });
+    const file = writeConfig({ staticRoutes: { 'src/pages/A.vue': ['/a'] }, finishBudgetMs: 600, finishWaitMs: 600 });
     editAndCommit('src/pages/A.vue');
     const r = await run(true, file);
     expect(r).toEqual({ code: 0, stdout: 'visual-proof: capture in progress; run `npx visual-proof finish` once the watcher is idle\n', stderr: '' });

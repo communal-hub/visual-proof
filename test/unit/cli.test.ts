@@ -28,8 +28,31 @@ describe('parseArgs', () => {
     expect(parseArgs(['doctor', '--json'])).toMatchObject({ command: 'doctor', json: true });
     expect(parseArgs(['doctor'])).toMatchObject({ json: false });
     expect(parseArgs(['params', 'list', '--json'])).toMatchObject({ command: 'params', paramsAction: 'list', json: true });
-    expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish, before, doctor and params list/);
-    expect(() => parseArgs(['params', 'clear', '--json'])).toThrow(/only valid with the finish, before, doctor and params list/);
+    expect(parseArgs(['classify', '--json'])).toMatchObject({ command: 'classify', json: true });
+    expect(parseArgs(['sidecar', 'try', 'a.vp', '--json'])).toMatchObject({ command: 'sidecar', json: true });
+    expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish, before, doctor, params list, classify and sidecar try/);
+    expect(() => parseArgs(['params', 'clear', '--json'])).toThrow(/only valid with the finish, before, doctor, params list, classify and sidecar try/);
+  });
+
+  it('parses --claim for status --wait, ready and before (v0.13)', () => {
+    expect(parseArgs(['ready', '--claim'])).toMatchObject({ command: 'ready', claim: true });
+    expect(parseArgs(['status', '--wait', '--claim', '--timeout', '60'])).toMatchObject({ command: 'status', wait: true, claim: true, timeoutSec: 60 });
+    expect(parseArgs(['before', '--claim', '--working-tree-sidecars'])).toMatchObject({ command: 'before', claim: true, workingTreeSidecars: true });
+    expect(parseArgs(['ready'])).toMatchObject({ claim: false });
+    expect(() => parseArgs(['status', '--claim'])).toThrow(/--claim is only valid with status --wait, ready and before/);
+    expect(() => parseArgs(['finish', '--claim'])).toThrow(/--claim is only valid/);
+    expect(() => parseArgs(['ready', '--working-tree-sidecars'])).toThrow(/--working-tree-sidecars is only valid with the before command/);
+  });
+
+  it('parses classify with any number of paths, and sidecar try with one file (v0.13)', () => {
+    expect(parseArgs(['classify'])).toMatchObject({ command: 'classify', paths: [] });
+    expect(parseArgs(['classify', 'src/a.vue', 'lang/en.json'])).toMatchObject({ paths: ['src/a.vue', 'lang/en.json'] });
+    expect(parseArgs(['sidecar', 'try', '.visual-proof/sidecars/a.vp'])).toMatchObject({ command: 'sidecar', sidecarAction: 'try', sidecarFile: '.visual-proof/sidecars/a.vp' });
+    expect(() => parseArgs(['sidecar'])).toThrow(/sidecar needs an action: try <file>/);
+    expect(() => parseArgs(['sidecar', 'try'])).toThrow(/sidecar try needs a sidecar file/);
+    expect(() => parseArgs(['sidecar', 'run', 'a.vp'])).toThrow(/unknown sidecar action: run/);
+    expect(() => parseArgs(['sidecar', 'try', 'a.vp', 'b.vp'])).toThrow(/takes one file/);
+    expect(() => parseArgs(['status', 'x'])).toThrow(/unexpected argument: x/);
   });
 
   it('parses --normalize for doctor --json only', () => {

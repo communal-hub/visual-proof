@@ -163,6 +163,26 @@ export async function treeDiff(repoDir: string, fromTree: string, toTree: string
   return splitNul(result.stdout).flatMap((file) => relativeTo(prefix, file));
 }
 
+/**
+ * Blob id of every file in a tree object, keyed by path relative to `repoDir` (POSIX). Empty when git cannot read
+ * the tree. The watcher uses it as the content baseline that tells a real change from a touch.
+ */
+export async function treeBlobs(repoDir: string, tree: string): Promise<Map<string, string>> {
+  const blobs = new Map<string, string>();
+  if (!/^[0-9a-f]{40,64}$/.test(tree)) return blobs;
+  const result = await git(repoDir, ['ls-tree', '-r', '-z', '--full-tree', tree], {}, true);
+  if (!result.ok) return blobs;
+  const prefix = await showPrefix(repoDir);
+  for (const entry of splitNul(result.stdout)) {
+    // `<mode> blob <id>\t<path>`
+    const tab = entry.indexOf('\t');
+    const [, type, id] = entry.slice(0, tab).split(' ');
+    if (type !== 'blob' || !id) continue;
+    for (const file of relativeTo(prefix, entry.slice(tab + 1))) blobs.set(file, id);
+  }
+  return blobs;
+}
+
 /** A file's content at HEAD (`repoDir`-relative path), or null when HEAD does not have it. */
 export async function showAtHead(repoDir: string, file: string): Promise<string | null> {
   const result = await git(repoDir, ['show', `HEAD:./${file}`], {}, true);

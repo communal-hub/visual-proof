@@ -9,8 +9,8 @@ export interface RuntimeOptions {
   configDir: string;
   /** Replaces the real client (tests). Counts as having a key. */
   client?: DecisionsApi;
-  /** An absolute time (ms) no decision phase may run past (finish's own deadline). */
-  capAt?: number;
+  /** An absolute time (ms) no decision phase may run past (finish's own deadline, which can move while it waits). */
+  capAt?: number | (() => number);
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -68,7 +68,8 @@ export class DecisionRuntime {
    */
   async phase<T>(fn: (budget: DecisionBudget) => Promise<T>): Promise<T> {
     const left = Math.max(0, this.options.config.budgetMs - this.spentMs);
-    const budget = new DecisionBudget(left, this.now, this.options.capAt);
+    const { capAt } = this.options;
+    const budget = new DecisionBudget(left, this.now, typeof capAt === 'function' ? capAt() : capAt);
     budget.start();
     try {
       return await fn(budget);

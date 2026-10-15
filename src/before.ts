@@ -10,14 +10,15 @@ import { BEFORE_SCRATCH, mergeBase, type MergeBase } from './before-base.js';
 import { Browser, type Capturer, type ScenarioPlan } from './browser.js';
 import { CONFIG_FILE_NAME, ConfigError, loadConfig, type Config } from './config.js';
 import { EXIT } from './exit.js';
+import { claimPath, readClaim } from './decisions/claim.js';
 import { runFinish } from './finish.js';
-import { scenarioHash } from './focus.js';
+import { normalizeScreen, parseExpectations, scenarioHash, screenLabels } from './focus.js';
 import { headTree, showAtHead } from './git.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { loadLayeredParams } from './resolve/param-tiers.js';
 import { hasParams } from './resolve/route-pattern.js';
 import { concretePath, joinUrl } from './resolve/routes.js';
-import { parseSidecar, sidecarRoute } from './sidecar.js';
+import { findSidecarFiles, gotoRouteKeys, parseSidecar, sidecarRoute } from './sidecar.js';
 import { readStatusFile } from './status.js';
 import { describeError } from './text.js';
 import { Timeline } from './timeline.js';
@@ -45,6 +46,13 @@ export interface BeforeOptions {
   startServer?: (config: Config, base: MergeBase, dirs: Dirs) => Promise<DevServer>;
   /** Replaces the browser (tests). */
   launch?: (config: Config, devServer: DevServer) => Promise<Capturer>;
+  /**
+   * v0.13: capture the screens the claim names instead of the headlines of the diff, so it works before any edit (an
+   * empty diff) and can run in the background while the agent codes.
+   */
+  claim?: boolean;
+  /** v0.13: replay sidecars as they are in the working tree, not as committed (uncommitted ones are skipped otherwise). */
+  workingTreeSidecars?: boolean;
 }
 
 export interface BeforeCapture {
@@ -52,6 +60,8 @@ export interface BeforeCapture {
   status: string;
   frameId?: string;
   error?: string;
+  /** v0.13: the frame was captured by an earlier run at the same merge-base; nothing was captured now. */
+  already?: boolean;
 }
 
 export interface BeforeResult {
@@ -80,21 +90,30 @@ export async function runBefore(config: Config, opts: BeforeOptions = {}): Promi
   if (!base) return { ...result, error: `no merge-base with ${config.baseRef}` };
   result.base = base;
 
-  const plan = await runFinish(config, { dirs, env: opts.env, planOnly: true });
-  if (plan.noScreenChanges) return { ...result, ok: true, notes: ['no screen changes: nothing to compare'] };
-  const tree = await headTree(config.repoDir);
   const head = new Timeline(dirs.scratchDir, config.maxFrames);
-  const headlines = plan.routes.filter((r) => r.role !== 'impact');
-  const failingImpact = plan.routes
-    .filter((r) => r.role === 'impact' && r.via === 'screen')
-    .filter((r) => {
-      const frame = tree ? head.latestAtTree(r.route, tree) : undefined;
-      return frame && frame.status !== 'clean' && Array.isArray(frame.renderedFiles) && r.sourceFiles.some((f) => frame.renderedFiles!.includes(f));
-    });
-  if (failingImpact.length > MAX_IMPACT_BEFORE) result.notes.push(`${failingImpact.length - MAX_IMPACT_BEFORE} failing impact route(s) over ${MAX_IMPACT_BEFORE} not captured`);
-  const routes = [...headlines.filter((r) => !r.scenario), ...failingImpact.slice(0, MAX_IMPACT_BEFORE)];
-  const scenarioFiles = [...new Set(headlines.flatMap((r) => (r.scenario ? [r.scenario.file] : [])))];
-  if (routes.length === 0 && scenarioFiles.length === 0) return { ...result, ok: true, notes: ['no headlines to capture'] };
+  let routes: Array<{ route: string; routeKey: string; sourceFiles: string[] }>;
+  let scenarioFiles: string[];
+  if (opts.claim) {
+    const picked = claimTargets(config, dirs);
+    if ('error' in picked) return { ...result, error: picked.error };
+    ({ routes, scenarioFiles } = picked);
+    result.notes.push(...picked.notes);
+  } else {
+    const plan = await runFinish(config, { dirs, env: opts.env, planOnly: true });
+    if (plan.noScreenChanges) return { ...result, ok: true, notes: ['no screen changes: nothing to compare (before --claim captures the claim screens whatever the diff)'] };
+    const tree = await headTree(config.repoDir);
+    const headlines = plan.routes.filter((r) => r.role !== 'impact');
+    const failingImpact = plan.routes
+      .filter((r) => r.role === 'impact' && r.via === 'screen')
+      .filter((r) => {
+        const frame = tree ? head.latestAtTree(r.route, tree) : undefined;
+        return frame && frame.status !== 'clean' && Array.isArray(frame.renderedFiles) && r.sourceFiles.some((f) => frame.renderedFiles!.includes(f));
+      });
+    if (failingImpact.length > MAX_IMPACT_BEFORE) result.notes.push(`${failingImpact.length - MAX_IMPACT_BEFORE} failing impact route(s) over ${MAX_IMPACT_BEFORE} not captured`);
+    routes = [...headlines.filter((r) => !r.scenario), ...failingImpact.slice(0, MAX_IMPACT_BEFORE)];
+    scenarioFiles = [...new Set(headlines.flatMap((r) => (r.scenario ? [r.scenario.file] : [])))];
+  }
+  if (routes.length === 0 && scenarioFiles.length === 0) return { ...result, ok: true, notes: [...result.notes, opts.claim ? 'the claim names no screens to capture' : 'no headlines to capture'] };
 
   const seed = loadLayeredParams(config, statusFiles(dirs).sessionParams);
   const concrete = (route: string): string | null => {
@@ -104,9 +123,43 @@ export async function runBefore(config: Config, opts: BeforeOptions = {}): Promi
     return head.latest(route)?.route ?? null; // filled by discovery or a list endpoint at HEAD: the same record
   };
 
+  const timeline = new Timeline(path.join(dirs.scratchDir, BEFORE_SCRATCH), config.maxFrames);
+  // v0.13: a scenario's text, committed or (with workingTreeSidecars) as it is now; an uncommitted one is said, not skipped silently.
+  const scenarios: Array<{ file: string; text: string }> = [];
+  for (const file of scenarioFiles) {
+    const text = opts.workingTreeSidecars ? readFile(config, file) : await showAtHead(config.repoDir, file);
+    if (text === null) {
+      result.notes.push(
+        opts.workingTreeSidecars ? `sidecar ${file}: cannot read it; skipped` : `sidecar ${file} is not committed; skipped (commit it, or use --working-tree-sidecars)`,
+      );
+      continue;
+    }
+    scenarios.push({ file, text });
+  }
+  // v0.13: a before frame at the merge-base tree is already the answer (an earlier \`before\`, or \`before --claim\` run
+  // while the agent coded); the merge-base does not move with the agent's commits.
+  const todoRoutes = routes.filter((route) => {
+    const target = concrete(route.route);
+    const frame = target === null ? undefined : (timeline.latestAtTree(target, base.tree) ?? timeline.latestAtTree(route.routeKey, base.tree));
+    if (frame) result.captures.push({ label: route.route, status: frame.status, frameId: frame.id, already: true });
+    return !frame;
+  });
+  const todoScenarios = scenarios.filter(({ file, text }) => {
+    const sidecar = parseSidecar(text, file);
+    const hash = scenarioHash(text);
+    const frames = sidecar.stills.map((still) => timeline.latestAtTree(sidecarRoute(file, still), base.tree));
+    if (sidecar.stills.length === 0 || frames.some((f) => !f || f.scenarioHash !== hash)) return true;
+    sidecar.stills.forEach((still, i) => result.captures.push({ label: `sidecar ${sidecar.name} / ${still}`, status: frames[i]!.status, frameId: frames[i]!.id, already: true }));
+    return false;
+  });
+  if (todoRoutes.length === 0 && todoScenarios.length === 0) {
+    result.ok = true;
+    result.notes.push(`every screen already has a before frame at merge-base ${base.commit.slice(0, 8)}`);
+    return result;
+  }
+
   let server: DevServer | null = null;
   let browser: Capturer | null = null;
-  const timeline = new Timeline(path.join(dirs.scratchDir, BEFORE_SCRATCH), config.maxFrames);
   const sessionId = `before-${Date.now().toString(36)}`;
   try {
     log(`before: serving the frontend at ${base.commit.slice(0, 8)}`);
@@ -114,7 +167,7 @@ export async function runBefore(config: Config, opts: BeforeOptions = {}): Promi
     browser = await (opts.launch ?? launchBrowser)(config, server);
     await browser.warm();
 
-    for (const route of routes) {
+    for (const route of todoRoutes) {
       const label = route.route;
       const target = concrete(route.route);
       if (target === null) {
@@ -145,9 +198,8 @@ export async function runBefore(config: Config, opts: BeforeOptions = {}): Promi
       }
     }
 
-    for (const file of scenarioFiles) {
-      const text = await showAtHead(config.repoDir, file);
-      if (text === null || !browser.runScenario) continue;
+    for (const { file, text } of todoScenarios) {
+      if (!browser.runScenario) continue;
       const sidecar = parseSidecar(text, file);
       const gotos: ScenarioPlan['gotos'] = new Map();
       for (const step of sidecar.steps) {
@@ -192,6 +244,53 @@ export async function runBefore(config: Config, opts: BeforeOptions = {}): Promi
   // that produced nothing counts against the run.
   result.ok = result.error === undefined && result.captures.every((c) => c.frameId !== undefined || c.status === 'skipped');
   return result;
+}
+
+/**
+ * v0.13 `before --claim`: the routes and sidecars the claim names. A route key is filled at capture time; a concrete
+ * path is matched to its route key through the import graph's keys when it can be.
+ */
+function claimTargets(
+  config: Config,
+  dirs: Dirs,
+): { routes: Array<{ route: string; routeKey: string; sourceFiles: string[] }>; scenarioFiles: string[]; notes: string[] } | { error: string } {
+  const file = claimPath(config.claimFile, config.repoDir, dirs.statusDir);
+  const claim = readClaim(file);
+  if (!('text' in claim)) return { error: `no claim at ${file}: write \`<screen>: <what must be visible>\` lines there first` };
+  const screens = [...parseExpectations(claim.text).keys()].map(normalizeScreen);
+  const notes: string[] = [];
+  const known = Object.values(config.staticRoutes).flat();
+  const routes = screens
+    .filter((s) => s.startsWith('/'))
+    .map((route) => ({ route, routeKey: hasParams(route) ? route : (gotoRouteKeys(route, known)[0] ?? route), sourceFiles: [] }));
+  const scenarioFiles: string[] = [];
+  const others = screens.filter((s) => !s.startsWith('/'));
+  if (others.length > 0) {
+    const matched = new Set<string>();
+    for (const sidecarFile of findSidecarFiles(config.repoDir, config.sidecars)) {
+      const text = readFile(config, sidecarFile);
+      if (text === null) continue;
+      const sidecar = parseSidecar(text, sidecarFile);
+      for (const still of sidecar.stills) {
+        const labels = screenLabels({ route: '', routeKey: '', sourceFiles: [], via: 'sidecar', scenario: { file: sidecarFile, name: sidecar.name, still } }).map(normalizeScreen);
+        for (const screen of others) {
+          if (!labels.includes(screen)) continue;
+          matched.add(screen);
+          if (!scenarioFiles.includes(sidecarFile)) scenarioFiles.push(sidecarFile);
+        }
+      }
+    }
+    for (const screen of others) if (!matched.has(screen)) notes.push(`claim line "${screen}" names no route or sidecar still; not captured`);
+  }
+  return { routes, scenarioFiles, notes };
+}
+
+function readFile(config: Config, file: string): string | null {
+  try {
+    return fs.readFileSync(path.join(config.repoDir, file), 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 async function launchBrowser(config: Config, devServer: DevServer): Promise<Capturer> {
@@ -321,13 +420,20 @@ async function stopChild(child: ChildProcess): Promise<void> {
 export interface BeforeCommandContext {
   configPath?: string;
   json?: boolean;
+  /** v0.13 `--claim`: capture the claim screens, whatever the diff. */
+  claim?: boolean;
+  /** v0.13 `--working-tree-sidecars`: replay sidecars as they are on disk. */
+  workingTreeSidecars?: boolean;
   env: NodeJS.ProcessEnv;
   cwd?: string;
   out?: (text: string) => void;
   err?: (text: string) => void;
 }
 
-/** `visual-proof before [--json]`: 0 when every headline has a before frame, 1 when one could not be captured, 3 setup error. */
+/**
+ * `visual-proof before [--claim] [--working-tree-sidecars] [--json]`: 0 when every headline (with `--claim`, every claim
+ * screen) has a before frame, 1 when one could not be captured, 3 setup error.
+ */
 export async function beforeCommand(ctx: BeforeCommandContext): Promise<number> {
   const out = ctx.out ?? ((t) => process.stdout.write(t));
   const err = ctx.err ?? ((t) => process.stderr.write(t));
@@ -339,12 +445,17 @@ export async function beforeCommand(ctx: BeforeCommandContext): Promise<number> 
     err(`visual-proof before: ${describeError(e)}\n`);
     return e instanceof ConfigError ? EXIT.SETUP : EXIT.INTERNAL;
   }
-  const result = await runBefore(config, { env: ctx.env, log: (m) => err(`visual-proof ${m}\n`) });
+  const result = await runBefore(config, {
+    env: ctx.env,
+    log: (m) => err(`visual-proof ${m}\n`),
+    ...(ctx.claim ? { claim: true } : {}),
+    ...(ctx.workingTreeSidecars ? { workingTreeSidecars: true } : {}),
+  });
   if (ctx.json) {
     out(`${JSON.stringify(result, null, 2)}\n`);
   } else {
     const at = result.base ? ` at merge-base ${result.base.commit.slice(0, 8)}` : '';
-    for (const c of result.captures) out(`before ${c.label}${at}: ${c.status}${c.error ? ` (${c.error})` : ''}\n`);
+    for (const c of result.captures) out(`before ${c.label}${at}: ${c.status}${c.error ? ` (${c.error})` : ''}${c.already ? ' (captured earlier)' : ''}\n`);
     for (const note of result.notes) out(`note: ${note}\n`);
   }
   if (result.error) {

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import type { ClaimStatus, RemainingWork } from './claim-status.js';
 import { statusFiles, type Dirs } from './paths.js';
 
 export type DaemonState = 'starting' | 'ready' | 'capturing' | 'error' | 'stopped';
@@ -64,6 +65,12 @@ export interface Status {
   pendingSince: string | null;
   /** v0.12: routes and sidecar scenarios in the batch being captured; absent while none is. */
   queue?: number;
+  /** v0.13: what is left of the batch being captured, by tier (claim screens first, impact last); absent while idle. */
+  remaining?: RemainingWork;
+  /** v0.13: whether the claim screens have clean frames at the current tree (`ready --claim` waits on it). */
+  claim?: ClaimStatus;
+  /** v0.13: the directory of the config the watcher runs with. */
+  repoDir?: string;
   lastError: string | null;
   frames: number;
   /** Absent until the watcher reaches the warm-up step; `state` stays `starting` until it is finished. */
