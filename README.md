@@ -494,7 +494,7 @@ the import graph, so `finish` splits the routes:
   screens the claim names (`<route>: <what must be visible>` or `sidecar <name> / <still>` lines), routes whose own
   page component or layout changed, and the stills of sidecar scenarios the branch touched.
 - **Impact routes** are every other route the change reaches. They are smoke-checked, never shown: one summary line,
-  plus a folded list of the ones that were not clean or not captured. An impact route fails `finish` only when it is
+  plus a folded list of the ones that were not clean or have no frame. An impact route fails `finish` only when it is
   not clean *and* a changed file rendered on it (`renderedFiles`) *and* it was clean at the merge-base (or there is no
   merge-base frame yet; `visual-proof before` captures up to 10 such routes, and one that fails there too becomes a
   note). Unfilled params, pages broken for unrelated reasons and anything not captured are counted, not failures.

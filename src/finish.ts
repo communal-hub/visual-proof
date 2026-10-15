@@ -1110,19 +1110,19 @@ function renderProofBlock(state: State): string {
 const IMPACT_LINES = 25;
 const IMPACT_REASON_CHARS = 160;
 
-/** One summary line for the impact routes, then the ones that were not clean or not captured, folded away. */
+/** One summary line for the impact routes, then the ones that were not clean or have no frame, folded away. */
 function renderImpact(impact: ImpactSummary): string[] {
   const lines = [
-    `**Impact smoke** · ${plural(impact.total, 'other route')} ${impact.total === 1 ? 'reaches' : 'reach'} the change · ${impact.clean} clean (${impact.rendered} rendered a changed file) · ${impact.unrelated.length} not clean where the change did not render or also failed at the merge-base · ${impact.notCaptured.length} not captured`,
+    `**Impact smoke** · ${plural(impact.total, 'other route')} ${impact.total === 1 ? 'reaches' : 'reach'} the change · ${impact.clean} clean (${impact.rendered} rendered a changed file) · ${impact.unrelated.length} not clean where the change did not render or also failed at the merge-base · ${impact.notCaptured.length} without a frame`,
   ];
   const detail = [
     ...impact.unrelated.map((u) => `- \`${u.route}\` ${u.status}: ${clip(u.reason)}`),
-    ...impact.notCaptured.map((n) => `- \`${n.route}\` not captured: ${n.reason}`),
+    ...impact.notCaptured.map((n) => `- \`${n.route}\` without a frame: ${n.reason}`),
   ];
   if (detail.length === 0) return lines;
   const shown = detail.slice(0, IMPACT_LINES);
   if (detail.length > shown.length) shown.push(`- and ${detail.length - shown.length} more (finish --json lists them all)`);
-  return [...lines, '', '<details><summary>Impact routes not clean or not captured</summary>', '', ...shown, '', '</details>'];
+  return [...lines, '', '<details><summary>Impact routes not clean or without a frame</summary>', '', ...shown, '', '</details>'];
 }
 
 function clip(text: string): string {
