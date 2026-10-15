@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { ConsoleConfig } from './console.js';
 import { parseDecisions, type DecisionsConfig } from './decisions/config.js';
@@ -477,9 +478,13 @@ function parseRoles(raw: Record<string, string> | undefined, errors: string[]): 
 }
 
 export const DEFAULT_MAX_IMPACT = 40;
-export const DEFAULT_IMPACT_CONCURRENCY = 3;
 /** Most impact captures that may run side by side; more only starves the dev server. */
 export const MAX_IMPACT_CONCURRENCY = 4;
+/**
+ * Impact captures side by side when the config does not say: half the cores, 1 to {@link MAX_IMPACT_CONCURRENCY}. Most
+ * of a capture is waiting for the network to go quiet, but the dev server and the backend share the machine.
+ */
+export const DEFAULT_IMPACT_CONCURRENCY = Math.min(MAX_IMPACT_CONCURRENCY, Math.max(1, Math.floor(os.availableParallelism() / 2)));
 export const DEFAULT_FINISH_BUDGET_MS = 25_000;
 export const DEFAULT_FINISH_WAIT_MS = 150_000;
 export const DEFAULT_BEFORE_START_TIMEOUT_MS = 180_000;
