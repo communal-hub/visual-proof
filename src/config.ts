@@ -171,6 +171,32 @@ export interface Config {
   decisions: DecisionsConfig;
   /** File holding the claim the change is meant to prove (bullet lines are criteria); relative to `repoDir`. Default `<statusDir>/claim.md`. */
   claimFile?: string;
+  /** Which routes get stills (headlines) and which are only smoke-checked (impact); see "Focus" in the README. */
+  focus: FocusConfig;
+  /** The same headlines captured with the frontend at the merge-base, shown beside the HEAD stills; see "Before / after". */
+  before: BeforeConfig;
+}
+
+export type FocusMode = 'claim' | 'all';
+
+export interface FocusConfig {
+  /** `claim` (default): claim screens, page components that changed and touched sidecars are headlines, the rest impact. `all`: every route is a headline. */
+  mode: FocusMode;
+  /** At most this many impact routes are captured per batch (headlines always are); `0` captures none. */
+  maxImpact: number;
+}
+
+export type BeforeMode = 'require' | 'warn' | 'off';
+
+export interface BeforeConfig {
+  /** What a headline without a before frame does at `finish`: `require` fails, `warn` (default) adds a note, `off` shows no before column. */
+  mode: BeforeMode;
+  /** Repo-relative paths symlinked from the checkout into the merge-base worktree (dependencies, env files). */
+  links: string[];
+  /** Vite config file of the app, relative to the repo; undefined picks the first `vite.config.{ts,mts,js,mjs,cjs}`. */
+  viteConfig?: string;
+  /** How long the merge-base Vite server may take to answer. */
+  startTimeoutMs: number;
 }
 
 export class ConfigError extends Error {
@@ -294,6 +320,8 @@ export function parseConfig(
     baseRef: v.string('baseRef') ?? 'main',
     decisions: parseDecisions(raw.decisions, errors),
     claimFile: v.string('claimFile'),
+    focus: parseFocus(raw.focus, errors),
+    before: parseBefore(raw.before, errors),
   };
 
   if (errors.length > 0) {
@@ -426,6 +454,55 @@ function parseRoles(raw: Record<string, string> | undefined, errors: string[]): 
     }
   }
   return roles;
+}
+
+export const DEFAULT_MAX_IMPACT = 40;
+export const DEFAULT_BEFORE_START_TIMEOUT_MS = 180_000;
+
+function parseFocus(value: unknown, errors: string[]): FocusConfig {
+  const focus: FocusConfig = { mode: 'claim', maxImpact: DEFAULT_MAX_IMPACT };
+  if (value === undefined) return focus;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    errors.push('"focus" must be an object');
+    return focus;
+  }
+  const { mode, maxImpact } = value as Record<string, unknown>;
+  if (mode !== undefined) {
+    if (mode === 'claim' || mode === 'all') focus.mode = mode;
+    else errors.push(`"focus.mode" must be "claim" or "all", got ${JSON.stringify(mode)}`);
+  }
+  if (maxImpact !== undefined) {
+    if (Number.isInteger(maxImpact) && (maxImpact as number) >= 0) focus.maxImpact = maxImpact as number;
+    else errors.push(`"focus.maxImpact" must be a non-negative integer, got ${JSON.stringify(maxImpact)}`);
+  }
+  return focus;
+}
+
+function parseBefore(value: unknown, errors: string[]): BeforeConfig {
+  const before: BeforeConfig = { mode: 'warn', links: ['node_modules', '.env'], startTimeoutMs: DEFAULT_BEFORE_START_TIMEOUT_MS };
+  if (value === undefined) return before;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    errors.push('"before" must be an object');
+    return before;
+  }
+  const { mode, links, viteConfig, startTimeoutMs } = value as Record<string, unknown>;
+  if (mode !== undefined) {
+    if (mode === 'require' || mode === 'warn' || mode === 'off') before.mode = mode;
+    else errors.push(`"before.mode" must be "require", "warn" or "off", got ${JSON.stringify(mode)}`);
+  }
+  if (links !== undefined) {
+    if (Array.isArray(links) && links.every((l) => typeof l === 'string' && l !== '' && !path.isAbsolute(l) && !l.split(/[\\/]/).includes('..'))) before.links = links as string[];
+    else errors.push('"before.links" must be an array of repo-relative paths');
+  }
+  if (viteConfig !== undefined) {
+    if (typeof viteConfig === 'string' && viteConfig !== '') before.viteConfig = viteConfig;
+    else errors.push('"before.viteConfig" must be a non-empty string');
+  }
+  if (startTimeoutMs !== undefined) {
+    if (Number.isInteger(startTimeoutMs) && (startTimeoutMs as number) > 0) before.startTimeoutMs = startTimeoutMs as number;
+    else errors.push(`"before.startTimeoutMs" must be a positive integer, got ${JSON.stringify(startTimeoutMs)}`);
+  }
+  return before;
 }
 
 function parseRenderCheck(value: string | undefined, errors: string[]): RenderCheckMode {

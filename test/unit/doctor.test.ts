@@ -499,8 +499,8 @@ describe('paramTiers', () => {
 });
 
 describe('decisions', () => {
-  const probe = (over: Partial<{ triage: { ok: boolean; ms: number; resolved?: string; error?: string }; text: { ok: boolean; ms: number; resolved?: string; error?: string } }> = {}) => ({
-    triage: { model: 'openai/gpt-6-luna-decisions-20261006', ok: true, ms: 230, resolved: 'openai/gpt-6-luna-decisions-20261006', ...over.triage },
+  const probe = (over: Partial<{ image: { ok: boolean; ms: number; resolved?: string; error?: string }; text: { ok: boolean; ms: number; resolved?: string; error?: string } }> = {}) => ({
+    image: { model: 'typesafe/jev-1.13', ok: true, ms: 230, resolved: 'typesafe/jev-1.13-20260917', ...over.image },
     text: { model: 'typesafe/jev-1.13', ok: true, ms: 160, resolved: 'typesafe/jev-1.13-20260917', ...over.text },
   });
   const KEY = { OPENROUTER_API_KEY: 'sk-test' };
@@ -532,7 +532,7 @@ describe('decisions', () => {
     const report = await doctor(configure(), { env: KEY, probes: { appUp: async () => true, probeDecisions: async () => (probed++, probe()) } });
     expect(probed).toBe(1);
     expect(report.capabilities.decisions).toMatchObject({ tier: 'openrouter', status: 'ok' });
-    expect(report.capabilities.decisions.detail).toContain('triage openai/gpt-6-luna-decisions-20261006 ok (230 ms)');
+    expect(report.capabilities.decisions.detail).toContain('image typesafe/jev-1.13 -> typesafe/jev-1.13-20260917 ok (230 ms)');
     expect(report.capabilities.decisions.detail).toContain('text typesafe/jev-1.13 -> typesafe/jev-1.13-20260917 ok (160 ms)');
   });
 

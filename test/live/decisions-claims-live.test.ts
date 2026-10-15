@@ -7,12 +7,13 @@ import { readDom } from '../../src/browser.js';
 import { checkClaim, type ClaimPage } from '../../src/decisions/claim.js';
 import { DecisionsClient } from '../../src/decisions/client.js';
 import { DecisionBudget } from '../../src/decisions/budget.js';
-import { DEFAULT_TRIAGE_MODEL } from '../../src/decisions/config.js';
+import { DEFAULT_MODEL } from '../../src/decisions/config.js';
 import { renderClaimSection } from '../../src/decisions/finish.js';
 import { checkImages } from '../../src/decisions/image-check.js';
+import { comparePairs } from '../../src/decisions/compare.js';
 import { LIVE_KEY } from '../live.js';
 
-describe.skipIf(!LIVE_KEY)('Luna claim evidence regressions (real pixels and real API)', () => {
+describe.skipIf(!LIVE_KEY)('Jev claim evidence regressions (real pixels and real API)', () => {
   it('sees teleported warnings, icons and tall page content, and rejects claims contradicted by an empty state', async () => {
     const dir = process.env.VP_CLAIM_PROOF_DIR ?? fs.mkdtempSync(path.join(os.tmpdir(), 'vp-claim-proof-'));
     fs.mkdirSync(dir, { recursive: true });
@@ -53,8 +54,8 @@ describe.skipIf(!LIVE_KEY)('Luna claim evidence regressions (real pixels and rea
     ].join('\n');
     try {
       const [report, checks] = await Promise.all([
-        checkClaim({ source: 'regression-claim.md', claim, pages, role: 'anonymous' }, { client, model: DEFAULT_TRIAGE_MODEL, budget }),
-        checkImages([pages[2]!, pages[3]!].map((p) => ({ png: p.png, name: p.route })), { client, model: DEFAULT_TRIAGE_MODEL, mode: 'fail', budget }),
+        checkClaim({ source: 'regression-claim.md', claim, pages, role: 'anonymous' }, { client, model: DEFAULT_MODEL, budget }),
+        checkImages([pages[2]!, pages[3]!].map((p) => ({ png: p.png, name: p.route })), { client, model: DEFAULT_MODEL, mode: 'fail', budget }),
       ]);
       fs.writeFileSync(path.join(dir, 'report.json'), `${JSON.stringify({ claim: report, imageChecks: checks, stats: client.stats, budgetMs: 20_000, elapsedMs: budget.elapsedMs() }, null, 2)}\n`);
       fs.writeFileSync(path.join(dir, 'claim-check.md'), `${renderClaimSection(report).join('\n')}\n`);
@@ -66,5 +67,48 @@ describe.skipIf(!LIVE_KEY)('Luna claim evidence regressions (real pixels and rea
       expect(checks.map((c) => c.label)).toEqual(['clean', 'clean']);
       expect(client.stats.failed).toBe(0);
     } finally { budget.dispose(); }
+  });
+});
+
+describe.skipIf(!LIVE_KEY)('Jev before/after comparison (real pixels and real API)', () => {
+  it('sees a booking go from the right half to the full column, and no change when nothing changed', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vp-compare-'));
+    const browser = await chromium.launch();
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+    const calendar = (left: string, width: string) => `<style>body{font:16px system-ui;margin:0;background:#fff}</style>
+      <div style="padding:24px"><h1>Proof Facility · Tuesday</h1>
+        <div style="position:relative;width:320px;height:600px;border:1px solid #cbd5e1;background:repeating-linear-gradient(#fff 0 59px,#e2e8f0 59px 60px)">
+          <div style="position:absolute;top:290px;left:0;right:0;height:10px;background:repeating-linear-gradient(45deg,#94a3b8 0 4px,#fff 4px 8px)"></div>
+          <div style="position:absolute;top:300px;left:${left};width:${width};height:60px;background:#2563eb;color:#fff;padding:4px;box-sizing:border-box">Booking 1:00–2:00</div>
+          <div style="position:absolute;top:360px;left:0;right:0;height:10px;background:repeating-linear-gradient(45deg,#94a3b8 0 4px,#fff 4px 8px)"></div>
+        </div></div>`;
+    const shots: Record<string, string> = {};
+    try {
+      for (const [name, html] of [['offset', calendar('50%', '50%')], ['full', calendar('0', '100%')]] as const) {
+        await page.setContent(html);
+        shots[name] = path.join(dir, `${name}.png`);
+        await page.screenshot({ path: shots[name] });
+      }
+    } finally {
+      await browser.close();
+    }
+    const client = new DecisionsClient({ apiKey: LIVE_KEY!, timeoutMs: 15_000 });
+    const budget = new DecisionBudget(20_000);
+    const expected = 'the blue booking spans the full width of the facility column, between the hatched buffers, instead of only its right half';
+    try {
+      const [changed, unchanged] = await comparePairs(
+        [
+          { name: 'fixed', before: shots.offset!, after: shots.full!, expected },
+          { name: 'not fixed', before: shots.offset!, after: shots.offset!, expected },
+        ],
+        { client, model: DEFAULT_MODEL, budget },
+      );
+      console.log(`compare: changed ${changed!.probability}, unchanged ${unchanged!.probability}; ${dir}`);
+      expect(changed!.result).toBe('changed');
+      expect(unchanged!.result).toBe('unchanged');
+      expect(client.stats.failed).toBe(0);
+    } finally {
+      budget.dispose();
+    }
   });
 });

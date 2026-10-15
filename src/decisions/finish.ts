@@ -6,6 +6,7 @@ import type { RouteResolution } from '../resolve/routes.js';
 import type { DecisionBudget } from './budget.js';
 import { classifyChange, pickCaptions, readRouteTitle, type CaptionSubject, type CaptionResult } from './captions.js';
 import { checkClaim, claimPath, readClaim, type ClaimPage, type ClaimReport } from './claim.js';
+import { comparePairs, describeCompare, type CompareCheck } from './compare.js';
 import { fileDiff, trim } from './diff.js';
 import { checkImages, describeImageCheck, imageCheckMessage, type ImageCheck } from './image-check.js';
 import { pruneRoutes, type PruneOutcome } from './prune.js';
@@ -23,12 +24,18 @@ export interface DecisionHeadline {
   /** Absolute path of the frame's PNG. */
   png: string;
   renderedFiles: string[] | null;
+  /** v0.11: absolute path of the merge-base frame's PNG, when there is one. */
+  beforePng?: string;
+  /** v0.11: the claim line for this screen (`<screen>: <what must be visible>`), when there is one. */
+  expected?: string;
 }
 
 /** What the decisions added to one route of the proof block. */
 export interface RouteDecisions {
   imageCheck?: ImageCheck;
   caption?: string;
+  /** v0.11: did the after show the claimed change where the before did not (advisory). */
+  compare?: CompareCheck;
 }
 
 /** `decisions: N requests, M ms, $cost` and what was skipped. */
@@ -106,6 +113,7 @@ export async function runFinishDecisions(input: FinishDecisionsInput): Promise<F
     if (decisions.triage !== 'off') tasks.push(imageTask(input, budget, out, forRoute));
     if (decisions.verdict) tasks.push(claimTask(input, budget, out));
     if (decisions.captions) tasks.push(captionTask(input, budget, out, forRoute));
+    if (decisions.verdict) tasks.push(compareTask(input, budget, out, forRoute));
     await Promise.all(tasks.map((t) => t.catch((err: Error) => out.notes.push(`decisions: ${err.message.split('\n')[0]}`))));
     if (budget.expired()) out.notes.push(`decisions: unfinished work was skipped at the ${decisions.budgetMs} ms budget`);
   });
@@ -123,7 +131,7 @@ async function imageTask(
   if (mode === 'off') return;
   const checks = await checkImages(
     headlines.map((h) => ({ png: h.png, name: h.route })),
-    { client: runtime.client!, model: config.decisions.models.triage, mode, budget, log: runtime.log },
+    { client: runtime.client!, model: config.decisions.model, mode, budget, log: runtime.log },
   );
   const unknown = new Map<string, string[]>();
   headlines.forEach((h, i) => {
@@ -161,9 +169,28 @@ async function claimTask(input: FinishDecisionsInput, budget: DecisionBudget, ou
   if (noText.length > 0) out.notes.push(`claim check: no page text was captured for ${noText.join(', ')} (frames from an older capture)`);
   out.claim = await checkClaim(
     { source: shown, claim: claim.text, pages, role: config.login.type === 'http-hook' && config.login.email ? config.login.email : 'anonymous' },
-    { client: runtime.client!, model: config.decisions.models.triage, budget, log: runtime.log },
+    { client: runtime.client!, model: config.decisions.model, budget, log: runtime.log },
   );
   if (out.claim.note) out.notes.push(`claim check: ${out.claim.note}`);
+}
+
+async function compareTask(
+  input: FinishDecisionsInput,
+  budget: DecisionBudget,
+  out: FinishDecisions,
+  forRoute: (route: string) => RouteDecisions,
+): Promise<void> {
+  const pairs = input.headlines.filter((h) => h.beforePng && h.expected);
+  if (pairs.length === 0) return;
+  const checks = await comparePairs(
+    pairs.map((h) => ({ name: h.route, before: h.beforePng!, after: h.png, expected: h.expected! })),
+    { client: input.runtime.client!, model: input.config.decisions.model, budget },
+  );
+  pairs.forEach((h, i) => {
+    const check = checks[i]!;
+    forRoute(h.route).compare = check;
+    if (check.result === 'unknown' && check.note) out.notes.push(`before/after check for ${h.route}: ${check.note}`);
+  });
 }
 
 async function captionTask(
@@ -196,7 +223,7 @@ async function captionTask(
   });
   const { captions, note } = await pickCaptions(subjects, {
     client: runtime.client,
-    model: config.decisions.models.text,
+    model: config.decisions.model,
     budget,
     diff: trim(diff, 4000),
     log: runtime.log,
@@ -225,9 +252,12 @@ export function renderFooter(summary: DecisionsSummary): string {
   return `decisions: ${summary.requests} request${summary.requests === 1 ? '' : 's'}, ${summary.ms} ms, $${summary.cost.toFixed(6)}`;
 }
 
-/** The status line of a still, extended with the image check when there was one. */
+/** The status line of a still, extended with the image check and the before/after check when there were any. */
 export function stillLine(base: string, decisions: RouteDecisions | undefined): string {
-  return decisions?.imageCheck ? `${base} · ${describeImageCheck(decisions.imageCheck)}` : base;
+  const parts = [base];
+  if (decisions?.imageCheck) parts.push(describeImageCheck(decisions.imageCheck));
+  if (decisions?.compare) parts.push(`${describeCompare(decisions.compare)} (advisory)`);
+  return parts.join(' · ');
 }
 
 /** The "Claim check (advisory)" section as markdown lines. */

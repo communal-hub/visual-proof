@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { DecisionBudget } from '../../src/decisions/budget.js';
 import { DecisionsClient, noulAnswer } from '../../src/decisions/client.js';
-import { DEFAULT_TEXT_MODEL, DEFAULT_TRIAGE_MODEL } from '../../src/decisions/config.js';
+import { DEFAULT_MODEL } from '../../src/decisions/config.js';
 import { probeModels } from '../../src/decisions/doctor.js';
 import { IMAGE_TOKEN_GUARD, checkImages } from '../../src/decisions/image-check.js';
 import { LIVE_KEY, still } from '../live.js';
@@ -30,7 +30,7 @@ afterAll(() => {
   console.log(`live decisions: ${client.stats.requests} requests, $${client.stats.cost.toFixed(6)} (this client), see ${path.join(os.tmpdir(), 'vp-live-report.json')}`);
 });
 
-live('Luna frame triage on real fixture stills', () => {
+live('Jev frame triage on real fixture stills', () => {
   const expectations = [
     ['clean', 'clean'],
     ['error', 'error'],
@@ -40,18 +40,18 @@ live('Luna frame triage on real fixture stills', () => {
 
   it.each(expectations)('%s still is read as %s with confidence >= 0.7, in one cheap request', async (name, label) => {
     const t0 = Date.now();
-    const [check] = await checkImages([{ png: still(name), name }], { client, model: DEFAULT_TRIAGE_MODEL, mode: 'fail', budget: budget() });
+    const [check] = await checkImages([{ png: still(name), name }], { client, model: DEFAULT_MODEL, mode: 'fail', budget: budget() });
     lat[`triage ${name}`] = Date.now() - t0;
     expect(check).toMatchObject({ label });
     expect(check!.confidence).toBeGreaterThanOrEqual(0.7);
     expect(check!.action).toBe(label === 'clean' ? 'none' : 'fail');
-    expect(check!.model).toBe(DEFAULT_TRIAGE_MODEL);
+    expect(check!.model).toMatch(/^typesafe\/jev-1\.13/);
     expect(lat[`triage ${name}`]).toBeLessThan(10_000);
   });
 
   it('keeps an image request near 1.2k input tokens (the encoding guard stays well clear of the limit)', async () => {
     const before = client.stats.inputTokens;
-    await checkImages([{ png: still('error'), name: 'error' }], { client, model: DEFAULT_TRIAGE_MODEL, mode: 'fail', budget: budget() });
+    await checkImages([{ png: still('error'), name: 'error' }], { client, model: DEFAULT_MODEL, mode: 'fail', budget: budget() });
     const tokens = client.stats.inputTokens - before;
     report.imageInputTokens = tokens;
     expect(tokens).toBeGreaterThan(300);
@@ -63,7 +63,7 @@ live('Luna frame triage on real fixture stills', () => {
     const before = client.stats.requests;
     const checks = await checkImages(expectations.map(([name]) => ({ png: still(name), name })), {
       client,
-      model: DEFAULT_TRIAGE_MODEL,
+      model: DEFAULT_MODEL,
       mode: 'fail',
       budget: budget(),
     });
@@ -76,11 +76,12 @@ live('Luna frame triage on real fixture stills', () => {
 
 live('Jev text decisions', () => {
   it('resolves the configured ids and answers a tiny noul (doctor\'s probe)', async () => {
-    const probe = await probeModels(client, { triage: DEFAULT_TRIAGE_MODEL, text: DEFAULT_TEXT_MODEL }, 8000);
+    const probe = await probeModels(client, DEFAULT_MODEL, 8000);
     report.probe = probe;
-    lat['probe triage'] = probe.triage.ms;
+    lat['probe image'] = probe.image.ms;
     lat['probe text'] = probe.text.ms;
-    expect(probe.triage).toMatchObject({ ok: true, resolved: DEFAULT_TRIAGE_MODEL });
+    expect(probe.image.ok).toBe(true);
+    expect(probe.image.resolved).toMatch(/^typesafe\/jev-1\.13/);
     expect(probe.text.ok).toBe(true);
     expect(probe.text.resolved).toMatch(/^typesafe\/jev-1\.13/);
   });
@@ -97,7 +98,7 @@ live('Jev text decisions', () => {
     };
     const t0 = Date.now();
     const result = await client.decide({
-      model: DEFAULT_TEXT_MODEL,
+      model: DEFAULT_MODEL,
       state,
       questions: {
         r0: { type: 'noul', instructions: 'Does this change visibly affect what /manage/invoices/:id renders?', criteria: { true: 'the diff changes markup, styles or logic used by the page', false: 'the diff touches nothing the page renders' } },

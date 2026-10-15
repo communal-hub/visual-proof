@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) and the v0.9 motion replay (sidecar scenarios recorded as they run). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) the v0.9 motion replay (sidecar scenarios recorded as they run) and the v0.11 focus and before/after work (claim-driven headlines, impact smoke, merge-base stills, one model for every decision). Vite apps only; Chromium only.
 
 ## Install
 
@@ -83,7 +83,9 @@ Only `appUrl` is required.
 | `maxFrames` | `200` | oldest frames are evicted beyond this |
 | `finishBudgetMs` | `25000` | how long `finish` waits for in-flight captures |
 | `baseRef` | `main` | branch that `finish` diffs against |
-| `decisions` | see "Model decisions" | OpenRouter-backed checks at bounded decision points: `enabled`, `models`, `triage`, `prune`, `verdict`, `captions`, `budgetMs` |
+| `decisions` | see "Model decisions" | OpenRouter-backed checks at bounded decision points: `enabled`, `model`, `triage`, `prune`, `verdict`, `captions`, `budgetMs` |
+| `focus` | `{ "mode": "claim", "maxImpact": 40 }` | which routes get stills (headlines) and which are only smoke-checked (impact); see "Focus: headlines and impact" |
+| `before` | `{ "mode": "warn", "links": ["node_modules", ".env"] }` | before/after pairs from the merge-base frontend: `mode` (`require`, `warn`, `off`), `links`, `viteConfig`, `startTimeoutMs`; see "Before / after" |
 | `claimFile` | `<statusDir>/claim.md` | the claim the change should prove (bullet or numbered lines are criteria); relative to the config dir |
 
 ### Route params from a seed file
@@ -483,6 +485,48 @@ Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `VISUAL_PROOF_SCRATCH_DIR`,
 `VISUAL_PROOF_APP_URL`, `VISUAL_PROOF_VITE_URL`.
 
+## Focus: headlines and impact (v0.11)
+
+A change to a shared component reaches every route that imports it, often hundreds. Proof is about the change, not
+the import graph, so `finish` splits the routes:
+
+- **Headlines** get a still (and a before/after pair, below) in the proof block and the self-review table: the
+  screens the claim names (`<route>: <what must be visible>` or `sidecar <name> / <still>` lines), routes whose own
+  page component or layout changed, and the stills of sidecar scenarios the branch touched.
+- **Impact routes** are every other route the change reaches. They are smoke-checked, never shown: one summary line,
+  plus a folded list of the ones that were not clean or not captured. An impact route fails `finish` only when it is
+  not clean *and* a changed file rendered on it (`renderedFiles`) *and* it was clean at the merge-base (or there is no
+  merge-base frame yet; `visual-proof before` captures up to 10 such routes, and one that fails there too becomes a
+  note). Unfilled params, pages broken for unrelated reasons and anything not captured are counted, not failures.
+
+When nothing qualifies as a headline (no claim screen matched, no page changed, no sidecar touched), every route is a
+headline as before, with a note saying to name the screens in the claim. `focus.mode: "all"` turns focus off.
+
+The watcher follows the same split once the claim exists: claim screens and changed pages are captured first, then at
+most `focus.maxImpact` (default 40) impact routes per batch; the rest are logged as not captured.
+
+## Before / after (v0.11)
+
+A still of the change is easier to judge next to the same screen without it. `npx visual-proof before` (after
+committing, with the app running) captures every headline again with the frontend at the merge-base of `baseRef` and
+HEAD:
+
+1. a git worktree at the merge-base in the scratch dir (reused next time), with `before.links` (default `node_modules`
+   and `.env`) symlinked from the checkout;
+2. its own Vite on a free port, from the app's Vite config (`before.viteConfig`, else the first `vite.config.*`),
+   with HMR off and `server.origin` set to `viteUrl`, so module URLs match the running app's;
+3. a browser whose requests to `viteUrl`'s host are answered by that server (the login hook excepted), against the
+   same backend, data and login. Sidecar stills replay the scenario as it is at HEAD.
+
+Frames go to their own timeline keyed by the merge-base tree; a sidecar's before frame also records a hash of the
+scenario, so an edited scenario needs a new `before`. `finish` then shows each headline as a two-column
+Before | After table (the before image's alt is `<label> (before)`), and with decisions on asks the model whether the
+after shows the claim line where the before did not (advisory; see "Model decisions").
+
+A headline without a before frame is a note (`before.mode: "warn"`, the default) or a failure (`"require"`).
+`"off"` shows no before column. A before frame that shows an error is still shown: the screen may not have existed
+yet. Exit codes: 0 every headline captured, 1 one could not be, 3 setup (no merge-base, no Vite config).
+
 ## Commands
 
 ```sh
@@ -490,13 +534,14 @@ npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes
 npx visual-proof start      # start the watcher (reattaches if running); prints status JSON
 npx visual-proof status     # status JSON; a dead watcher is reported as stale
 npx visual-proof status --wait [--timeout <s>]   # block until ready (alias: npx visual-proof ready)
+npx visual-proof before     # capture the headlines with the frontend at the merge-base (before/after pairs)
 npx visual-proof finish     # after committing: write the proof block, print its path
 npx visual-proof params set '<routeKey>' key=value ...   # use these route params now (captures at once); also: params list, params clear
 npx visual-proof stop
 npx visual-proof watch      # run the watcher in the foreground
 ```
 
-Options: `--config <path>`, `--json` (finish, doctor, params list), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
+Options: `--config <path>`, `--json` (finish, before, doctor, params list), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
 time-capped, always exits 0), `--wait` and `--timeout <s>` (status; params set). Run
 `npx visual-proof --help` for details.
 
@@ -585,7 +630,7 @@ retry on 429/5xx (honoring `retry-after`); the key never appears in logs, notes 
 {
   "decisions": {
     "enabled": true,
-    "models": { "triage": "openai/gpt-6-luna-decisions-20261006", "text": "typesafe/jev-1.13" },
+    "model": "typesafe/jev-1.13",
     "triage": "warn",
     "prune": { "above": 6, "keep": 4 },
     "verdict": true,
@@ -599,22 +644,22 @@ retry on 429/5xx (honoring `retry-after`); the key never appears in logs, notes 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | on when a key exists | `false` never makes a request (cached prune decisions still apply); `true` without a key adds a note to the proof block |
-| `models.triage` | `openai/gpt-6-luna-decisions-20261006` | vision model (pinned) for the image check and claim criteria |
-| `models.text` | `typesafe/jev-1.13` | text model (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the dated id is what answers) for pruning and captions |
+| `model` | `typesafe/jev-1.13` | the one model for every decision, text and images alike: image check, claim check, before/after check, pruning, captions (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the dated id is what answers). The old `models` object is rejected with a pointer to `model` |
 | `triage` | `warn` | `fail`, `warn` or `off`: what a non-clean image check does; `off` disables frame triage; claims still use images when `verdict` is on |
 | `prune` | `{ above: 6, keep: 4 }` | prune when one changed file fans out to more than `above` routes, keeping the `keep` likeliest; `false` disables |
 | `verdict` | `true` | advisory claim check against `claimFile` |
 | `captions` | `true` | a caption under each headline still |
 | `budgetMs` | `20000` | time all decisions of one `finish` share; unfinished work is skipped with a note |
 
-**Image check.** Each headline frame the DOM heuristics call `clean` is shown to the image model as a `choice`
+**Image check.** Each headline frame the DOM heuristics call `clean` is shown to the model as a `choice`
 between `clean`, `loading`, `error` and `blank` (DOM says fine, the pixels may not). One request per frame, up to 6
 at a time. A non-clean answer with confidence 0.7 or more fails `finish` with
 `<route> looks <label> to the image check (<confidence>)` (`triage: "fail"`) or becomes a note (`"warn"`, the
 default). The answer is recorded on the route in the proof block and in `--json` (`routes[].imageCheck`). An empty
 state with an explicit message ("No invoices yet") counts as clean for page health. It can still contradict a claim.
-Stills taller than 1600 px or wider than 1280 px are sent as a readable top-of-viewport crop (up to 1280×800)
-plus a resized full page (fits 1280×1600). The saved proof PNG stays at its original resolution. Corrupt PNGs,
+The model rejects an image with a side over 1568 px or under about 260 px ("Invalid image dimensions"), so a still
+with a side over 1568 px is sent as a readable top-of-viewport crop (up to 1280×800) plus a resized full page (fits
+1568×1568), and any side under 280 px is padded with white. The saved proof PNG stays at its original resolution. Corrupt PNGs,
 files over 20 MiB and decoded images over 64 megapixels are rejected before a request. Only wildly inflated
 image-check usage (over 16,000 input tokens) is ignored and logged; normal tall stills are checked.
 
@@ -628,8 +673,7 @@ nothing. Pruned routes are listed in the notes.
 **Claim check (advisory).** `finish` reads the claim (`claimFile`, default `<statusDir>/claim.md`; missing means a
 note), splits it into criteria in code (bullet or numbered lines; otherwise the whole text is one criterion) and asks
 one `noul` and a typed reason per criterion against **every clean headline screenshot** and visible page text.
-Claims use `models.triage` (Luna), including when frame triage is off; Jev remains the text model for pruning
-and captions. Text includes visible dialogs and other body overlays outside `appRoot`, deduplicated with overlay
+Claims use the same model as everything else, including when frame triage is off. Text includes visible dialogs and other body overlays outside `appRoot`, deduplicated with overlay
 text first, capped at 8 KiB per frame and 24 KiB across claim pages. Component filenames provide context, never
 proof of visible behavior. Colors, layout and icon-only controls are judged from pixels.
 
@@ -644,17 +688,23 @@ The shared decision budget defaults to 20 s; the claim request gets at most 15 s
 own deadline. Other requests retain the 8 s timeout. Claims exceeding 128 prepared images or 64 MiB of encoded
 state are skipped with an explicit note.
 
+**Before/after check (advisory, v0.11).** For each headline that has a before frame and a claim line, one request
+shows the model the before and the after and asks (`noul`) whether the after shows the claim line where the before
+did not. 0.70 or more is `changed as claimed`, below 0.30 `no change matching the claim`, else `unclear`; the result
+is added to the still's status line and `routes[].compare` in `--json`. It runs when `verdict` is on and never fails
+`finish`.
+
 **Captions.** Three to five candidate captions are built in code (route title from the route file's `title`, else the
-path; changed file names; style, template or script change from the diff); the text model picks one, shown under
+path; changed file names; style, template or script change from the diff); the model picks one, shown under
 the still. Without a key, or on failure, the first template is used.
 
 **Accounting.** The proof block ends with `decisions: N requests, M ms, $cost` (M is wall time inside decision phases,
-which run concurrently). One finish makes one image request per headline frame plus one vision claim request and at most two text requests
-(prune on a cache miss, captions), about 1.2k input tokens and $0.00012 per image and about $0.00002 per
-text request.
+which run concurrently). One finish makes one image request per headline frame, one claim request, one before/after
+request per paired headline with a claim line, and at most two text requests (prune on a cache miss, captions),
+about 1.2k input tokens and $0.00013 per image and about $0.00002 per text request.
 
 `doctor` has a `decisions` row: key present (and from where), the mode summary, and, with `doctor --probe-decisions`
-or when the app answers, one tiny probe per model (bounded to 5 s) with the resolved model id and latency.
+or when the app answers, two tiny probes of the model (an image, then text; bounded to 5 s) with the resolved model id and latency.
 Tests and the known-bad corpus run with `decisions.enabled: false` so they stay offline and deterministic; the live
 tests (`test/live`) run only when a key is available.
 

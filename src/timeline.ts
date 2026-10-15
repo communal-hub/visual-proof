@@ -50,6 +50,11 @@ export interface Frame {
    * dir, `clips/<id>`). Every still of one run shares it.
    */
   clip?: string;
+  /**
+   * Before frames of sidecar stills only: hash of the scenario text the run used, so an edited scenario's old
+   * before frame is not shown beside a still the new one took.
+   */
+  scenarioHash?: string;
   /** Path of the PNG relative to the scratch dir. */
   png: string;
 }

@@ -85,7 +85,7 @@ describe('finish without decisions', () => {
     expect(result.ok).toBe(true);
     expect(result.decisions).toBeUndefined();
     expect(result.claim).toBeUndefined();
-    expect(result.notes.filter((n) => /decisions|image check|claim/.test(n))).toEqual([]);
+    expect(result.notes.filter((n) => /decisions|image check|claim check/.test(n))).toEqual([]);
     const block = fs.readFileSync(result.proofBlockPath, 'utf8');
     expect(block).not.toMatch(/decisions:|Claim check|image check/);
     expect(result.routes[0]!.imageCheck).toBeUndefined();
@@ -192,7 +192,7 @@ describe('claim verdict, captions and accounting at finish', () => {
     const configPath = path.join(repo, 'visual-proof.config.json');
     fs.writeFileSync(configPath, JSON.stringify(config));
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({
-      model: config.decisions.models.triage, answers: { c0: noul(0.02), reason0: choice('empty_state') },
+      model: config.decisions.model, answers: { c0: noul(0.02), reason0: choice('empty_state') },
       usage: { input_tokens: 1200, output_tokens: 0, cost: 0.00012 },
     }), { status: 200 }));
     const env = { OPENROUTER_API_KEY: 'test-key', VISUAL_PROOF_STATUS_DIR: dirs.statusDir, VISUAL_PROOF_ARTIFACT_DIR: dirs.artifactDir, VISUAL_PROOF_SCRATCH_DIR: dirs.scratchDir };
@@ -251,7 +251,7 @@ describe('claim verdict, captions and accounting at finish', () => {
 
     // The claim and what the model saw: the sidecar text, not index.jsonl.
     const claimCall = client.calls.find((c) => 'reason0' in c.questions)!;
-    expect(claimCall.model).toBe(config.decisions.models.triage);
+    expect(claimCall.model).toBe(config.decisions.model);
     expect((claimCall.state as Array<{ type?: string }>).filter((p) => p.type === 'image_url')).toHaveLength(2);
     const claimState = JSON.parse((claimCall.state as string[])[0]!) as { pages: Array<{ route: string; visibleText: string }> };
     expect(claimState.pages.find((p) => p.route === '/a')!.visibleText).toBe('Alpha page total 12');

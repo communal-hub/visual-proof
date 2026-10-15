@@ -209,6 +209,12 @@ export interface BrowserOptions {
   scenarioTimeoutMs?: number;
   /** How long a sidecar step waits for its selector. Default 5 s. */
   stepTimeoutMs?: number;
+  /**
+   * v0.11 `visual-proof before`: answer every request to the app's dev server (`viteUrl`'s host, or `host`) from
+   * `target` instead, so the page runs another checkout's frontend against the same backend. Its HMR socket is
+   * answered by a silent stand-in.
+   */
+  devServer?: { host: string; target: string };
 }
 
 export const SCENARIO_TIMEOUT_MS = 60_000;
@@ -429,6 +435,29 @@ export class Browser implements Capturer {
 
   /** Abort requests to blocked hosts before any page navigates. */
   private async installRoutes(context: BrowserContext): Promise<void> {
+    const dev = this.options.devServer;
+    if (dev) {
+      const target = dev.target.replace(/\/+$/, '');
+      // The login hook is the backend's: it stays where it is, even when the dev server also serves the app.
+      const loginPath = this.config.login.type === 'http-hook' && this.config.login.url ? new URL(this.config.login.url, this.config.appUrl).pathname : null;
+      await context.route(
+        (url) => url.host === dev.host && url.pathname !== loginPath,
+        async (route) => {
+          const from = new URL(route.request().url());
+          try {
+            const response = await route.fetch({ url: `${target}${from.pathname}${from.search}`, maxRedirects: 0 });
+            await route.fulfill({ response });
+          } catch (err) {
+            this.log(`dev server ${from.pathname}: ${(err as Error).message.split('\n')[0]}`);
+            await route.abort().catch(() => {});
+          }
+        },
+      );
+      await context.routeWebSocket(
+        (url) => url.host === dev.host,
+        () => {},
+      );
+    }
     if (this.config.blockHosts.length === 0) return;
     await context.route(
       (url) => this.isBlocked(url.href),

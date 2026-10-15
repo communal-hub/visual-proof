@@ -1,5 +1,6 @@
 import { API_KEY_ENV, DecisionsClient, choiceAnswer, imageState, noulAnswer, loadApiKey, type DecisionsApi } from './client.js';
 import { describeMode, type DecisionsConfig } from './config.js';
+import { probeImage } from './images.js';
 
 /** Result of one cheap probe of one model. */
 export interface ModelProbe {
@@ -12,43 +13,38 @@ export interface ModelProbe {
   error?: string;
 }
 
+/** The one model, probed once with an image and once with text. */
 export interface DecisionsProbe {
-  triage: ModelProbe;
+  image: ModelProbe;
   text: ModelProbe;
 }
 
-/** A 1x1 white PNG: the cheapest image that still goes through the image encoding. */
-const TINY_PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-  'base64',
-);
-
-/** One tiny request per model, bounded by `timeoutMs` in total; they run side by side. */
-export async function probeModels(client: DecisionsApi, models: DecisionsConfig['models'], timeoutMs: number): Promise<DecisionsProbe> {
+/** Two tiny requests to the model (an image, then text), bounded by `timeoutMs` in total; they run side by side. */
+export async function probeModels(client: DecisionsApi, model: string, timeoutMs: number): Promise<DecisionsProbe> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const [triage, text] = await Promise.all([
+    const [image, text] = await Promise.all([
       client
         .decide({
-          model: models.triage,
-          state: imageState(TINY_PNG),
+          model,
+          state: imageState(await probeImage()),
           questions: { frame: { type: 'choice', instructions: 'Is this image blank?', criteria: { yes: 'a blank image', no: 'not blank' } } },
           signal: controller.signal,
           timeoutMs,
         })
-        .then((r) => toProbe(models.triage, r, choiceAnswer(r, 'frame') !== undefined)),
+        .then((r) => toProbe(model, r, choiceAnswer(r, 'frame') !== undefined)),
       client
         .decide({
-          model: models.text,
+          model,
           state: 'ping',
           questions: { ping: { type: 'noul', instructions: 'Is the state the word ping?' } },
           signal: controller.signal,
           timeoutMs,
         })
-        .then((r) => toProbe(models.text, r, noulAnswer(r, 'ping') !== undefined)),
+        .then((r) => toProbe(model, r, noulAnswer(r, 'ping') !== undefined)),
     ]);
-    return { triage, text };
+    return { image, text };
   } finally {
     clearTimeout(timer);
   }
@@ -61,10 +57,10 @@ function toProbe(model: string, r: Awaited<ReturnType<DecisionsApi['decide']>>, 
 }
 
 /** The default doctor probe: a real client from the environment's key. Rejects when there is no key. */
-export async function probeWithKey(env: NodeJS.ProcessEnv, configDir: string, models: DecisionsConfig['models'], timeoutMs: number): Promise<DecisionsProbe> {
+export async function probeWithKey(env: NodeJS.ProcessEnv, configDir: string, model: string, timeoutMs: number): Promise<DecisionsProbe> {
   const key = loadApiKey(env, configDir);
   if (!key) throw new Error(`${API_KEY_ENV} is not set`);
-  return probeModels(new DecisionsClient({ apiKey: key.key, timeoutMs }), models, timeoutMs);
+  return probeModels(new DecisionsClient({ apiKey: key.key, timeoutMs }), model, timeoutMs);
 }
 
 export interface DecisionsCapability {
@@ -91,7 +87,7 @@ export function describeDecisions(
     const id = p.resolved && p.resolved !== p.model ? `${p.model} -> ${p.resolved}` : p.model;
     return p.ok ? `${label} ${id} ok (${p.ms} ms)` : `${label} ${id} FAILED: ${p.error ?? 'no answer'}`;
   };
-  const detail = `key from the ${where}; ${line('triage', probe.triage)}; ${line('text', probe.text)}; ${mode}`;
-  if (probe.triage.ok && probe.text.ok) return { tier: 'openrouter', status: 'ok', detail };
+  const detail = `key from the ${where}; ${line('image', probe.image)}; ${line('text', probe.text)}; ${mode}`;
+  if (probe.image.ok && probe.text.ok) return { tier: 'openrouter', status: 'ok', detail };
   return { tier: 'degraded', status: 'warn', detail };
 }

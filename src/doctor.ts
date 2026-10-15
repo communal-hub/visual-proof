@@ -524,7 +524,7 @@ const defaultProbes: Probes = {
     }
   },
 
-  probeDecisions: (config, env, timeoutMs) => probeWithKey(env, config.repoDir, config.decisions.models, timeoutMs),
+  probeDecisions: (config, env, timeoutMs) => probeWithKey(env, config.repoDir, config.decisions.model, timeoutMs),
   ffmpeg: (env) => probeFfmpeg(env),
 
   async getJson(config, paths, timeoutMs) {
