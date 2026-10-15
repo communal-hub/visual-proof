@@ -31,8 +31,10 @@ shared component, batches thrown away by a regenerated file). Consumers that set
   decisions, replay). `finish --hook` waits at most `finishBudgetMs`.
 - `backendScope` (`"session"` default, or `"claim"`): with `"claim"`, a backend change re-captures the claim screens
   and the batch's own routes instead of every route and sidecar captured this session.
-- `focus.impactConcurrency` (default 2, 1 to 4): impact routes captured side by side. Claim screens and other
-  headlines are captured one at a time and first.
+- `focus.impactConcurrency` (default half the machine's cores, 1 to 4): impact routes captured side by side. Claim
+  screens and other headlines are captured one at a time and first. On the 200-route benchmark a shared-component
+  batch (claim screen + 40 impact routes) went from 18.2 s (v0.12) to 6.5 s, and the claim screen is recorded
+  0.7 s after the save instead of at the end of the batch.
 
 ### Watcher
 
@@ -51,6 +53,9 @@ shared component, batches thrown away by a regenerated file). Consumers that set
 - A change during a capture that touched only sidecar files never discards route frames, even without an import graph.
 - Claim screens whose clean frame is at an earlier tree that nothing changed since can reach are not re-captured.
 - The browser shares one login and one context launch between concurrent captures.
+- Settle diagnostics: a capture that waits the whole `settle.maxWaitMs` is marked `timing.settleCapped` and the log
+  names the requests still in flight (once per distinct set). EventSource streams no longer hold settle open.
+- `scripts/bench-impact.sh`: the benchmark behind these numbers (200-route fixture, one shared-component save).
 
 ### finish
 

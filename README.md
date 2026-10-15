@@ -86,7 +86,7 @@ Only `appUrl` is required.
 | `finishWaitMs` | `150000` | how long `finish` waits for the watcher to capture the headlines (impact routes are never waited for). With the default budget, `finish` stays under a 280 s agent shell limit |
 | `baseRef` | `main` | branch that `finish` diffs against |
 | `decisions` | see "Model decisions" | OpenRouter-backed checks at bounded decision points: `enabled`, `model`, `triage`, `prune`, `verdict`, `captions`, `budgetMs` |
-| `focus` | `{ "mode": "claim", "maxImpact": 40, "impactConcurrency": 2 }` | which routes get stills (headlines) and which are only smoke-checked (impact); `impactConcurrency` (1 to 4) impact routes are captured side by side; see "Focus: headlines and impact" and "Claim first" |
+| `focus` | `{ "mode": "claim", "maxImpact": 40, "impactConcurrency": <half the cores, 1 to 4> }` | which routes get stills (headlines) and which are only smoke-checked (impact); `impactConcurrency` (1 to 4) impact routes are captured side by side; see "Focus: headlines and impact" and "Claim first" |
 | `before` | `{ "mode": "warn", "links": ["node_modules", ".env"] }` | before/after pairs from the merge-base frontend: `mode` (`require`, `warn`, `off`), `links`, `viteConfig`, `startTimeoutMs`; see "Before / after" |
 | `claimFile` | `<statusDir>/claim.md` | the claim the change should prove (bullet or numbered lines are criteria); relative to the config dir |
 
@@ -502,7 +502,32 @@ than that (a debounced search, a fetch started from a timer) can settle too earl
 window when in doubt.
 
 Every frame record carries `timing: { settleMs, screenshotMs }` (see the brief) to show where a slow
-capture spent its time.
+capture spent its time. Since v0.13 a frame that waited the whole `settle.maxWaitMs` also has
+`settleCapped: true`, and the log says once per distinct set of requests what was still in flight:
+`capture <url>: the network was still busy after settle.maxWaitMs (5000 ms); in flight: GET api.example.test/notifications/poll`.
+That is the usual reason a route takes many seconds: every capture of such a page pays the whole window.
+Block a poll's host (`blockHosts`) or lower `settle.maxWaitMs` for it. Event streams (`EventSource`) never
+finish and no longer count as loading.
+
+**Where a capture's time goes (v0.13).** One capture on the 200-route fixture, alone: 444 ms, of which
+the network-idle window 236, navigation to `load` 114, the screenshot 41, opening the page 31, fonts and two
+frames 14; reading the DOM, the rendered-component walk and preparing the page 1 to 2 ms each. Most of it is
+waiting, so impact routes are captured side by side. Save of a component shared by 200 routes, the claim
+screen plus 40 impact routes (`scripts/bench-impact.sh`, `test/integration/impact-bench.test.ts`, median of 3
+saves on a 10-core machine):
+
+| | claim screen captured after the save | whole batch |
+| --- | --- | --- |
+| v0.12 (one at a time, frames recorded at the end of the batch) | 18.2 s | 18.2 s |
+| v0.13, `impactConcurrency` 1 | 0.7 s | 18.4 s |
+| v0.13, 2 | 0.7 s | 9.6 s |
+| v0.13, 3 | 0.7 s | 7.8 s |
+| v0.13, 4 (the default on this machine) | 0.7 s | 6.5 s |
+
+Past 4 the dev server becomes the bottleneck (every navigation asks Vite for the app's whole module graph) and
+screenshots slow down: 6 measured 5.7 s with the screenshot time doubled. On a real app every page also loads the
+backend, so the cap stays at 4, and the default is half the cores so a small agent VM keeps room for the dev server
+and the backend.
 
 Environment: `VISUAL_PROOF_STATUS_DIR` (default `/tmp/cursor/visual-proof`),
 `VISUAL_PROOF_ARTIFACT_DIR` (default `/opt/cursor/artifacts`), `VISUAL_PROOF_SCRATCH_DIR`,
@@ -548,7 +573,7 @@ reported as soon as they are captured.
 a still the claim names) are the first round; the watcher hashes the tree, records them and updates
 `status.json` before anything else is captured. The second round is the other headlines (changed pages, `params set`
 routes, changed sidecars), then the impact routes and the scenarios replayed for them. Impact routes run
-`focus.impactConcurrency` at a time (default 2, at most 4) as pages of one browser context; claim screens and
+`focus.impactConcurrency` at a time (default: half the machine's cores, 1 to 4) as pages of one browser context; claim screens and
 headlines run one at a time, and a scenario never runs next to another capture (`login <role>` switches the shared
 session).
 

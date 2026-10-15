@@ -42,6 +42,8 @@ export interface CaptureTiming {
   settleMs: number;
   /** From the settled page to the PNG: rendered-component walk, preparing the page, the screenshot call. */
   screenshotMs: number;
+  /** v0.13: the network never went quiet; the capture waited the whole `settle.maxWaitMs` (the log says for what). */
+  settleCapped?: boolean;
 }
 
 export interface CaptureResult {
@@ -599,7 +601,7 @@ export class Browser implements Capturer {
     for (let attempt = 0; attempt < 4; attempt++) {
       const seen = watched.navigations;
       // No request in flight for `settle.networkIdleMs`, but give up after `settle.maxWaitMs`.
-      await network.wait(this.config.settle.networkIdleMs, maxWaitMs);
+      if (!(await network.wait(this.config.settle.networkIdleMs, maxWaitMs))) this.settleCapped(watched, label, maxWaitMs);
       const settled = await settle(page);
       const read = settled
         ? await readDom(page, this.config.appRoot, this.config.spinnerSelectors, (m) => this.log(`capture ${label}: reading the page failed: ${m}`))
@@ -609,6 +611,26 @@ export class Browser implements Capturer {
       this.log(`capture ${label}: page navigated while settling (attempt ${attempt + 1})`);
     }
     return dom;
+  }
+
+  /** Request lists already logged as keeping a page from settling, so a poll every page makes is said once. */
+  private readonly busyLogged = new Set<string>();
+
+  /**
+   * v0.13: the page did not go quiet within `settle.maxWaitMs`. Each such capture costs the whole window, which is how
+   * a route takes many seconds; say once per distinct set of requests what was still in flight.
+   */
+  private settleCapped(watched: Watched, label: string, maxWaitMs: number): void {
+    watched.settleCapped = true;
+    const busy = watched.network.busy();
+    const key = busy.join(' ');
+    if (this.busyLogged.has(key)) return;
+    this.busyLogged.add(key);
+    this.log(
+      `capture ${label}: the network was still busy after settle.maxWaitMs (${maxWaitMs} ms)` +
+        (busy.length > 0 ? `; in flight: ${busy.join(', ')}` : '') +
+        '. Every capture that does this waits the whole window: if it is a poll or a stream the page never finishes, block its host (blockHosts) or lower settle.maxWaitMs',
+    );
   }
 
   /**
@@ -646,6 +668,7 @@ export class Browser implements Capturer {
         extraNavigations: Math.max(0, watched.navigations - 1),
         network,
         settleMs: Date.now() - settleStart,
+        settleCapped: watched.settleCapped === true,
       };
     } catch (err) {
       this.pages.delete(page);
@@ -667,7 +690,7 @@ export class Browser implements Capturer {
         httpStatus,
         ...(shot.layout ? { layout: shot.layout } : {}),
         renderedFiles: shot.renderedFiles,
-        timing: { settleMs: loaded.settleMs, screenshotMs: shot.ms },
+        timing: { settleMs: loaded.settleMs, screenshotMs: shot.ms, ...(loaded.settleCapped ? { settleCapped: true } : {}) },
         signals: { navOk, httpStatus, consoleErrors, pageErrors, ...signalDom, ...(shot.error ? { screenshotError: shot.error } : {}) },
       };
     } finally {
@@ -1331,6 +1354,8 @@ interface Watched {
   pageErrors: string[];
   /** Main-frame navigations so far, the initial one included. */
   navigations: number;
+  /** v0.13: settling ran into `settle.maxWaitMs` with requests still in flight. */
+  settleCapped?: boolean;
 }
 
 /** Mutable state of one running scenario. */
@@ -1375,6 +1400,7 @@ interface Loaded {
   extraNavigations: number;
   network: NetworkIdle;
   settleMs: number;
+  settleCapped: boolean;
 }
 
 /**
@@ -1390,6 +1416,8 @@ class NetworkIdle {
       this.lastActivity = Date.now();
     };
     page.on('request', (request) => {
+      // v0.13: an event stream never finishes; it is not loading the page.
+      if (request.resourceType() === 'eventsource') return;
       this.inflight.add(request);
       touch();
     });
@@ -1399,6 +1427,21 @@ class NetworkIdle {
     };
     page.on('requestfinished', done);
     page.on('requestfailed', done);
+  }
+
+  /** `GET /api/poll` for each request in flight (query strings dropped), at most five. */
+  busy(): string[] {
+    const shown = [...this.inflight].slice(0, 5).map((r) => {
+      let where = r.url();
+      try {
+        const url = new URL(where);
+        where = `${url.host}${url.pathname}`;
+      } catch {
+        // not a URL: keep it as it is
+      }
+      return `${r.method()} ${where}`;
+    });
+    return [...new Set(shown)].sort();
   }
 
   /** Resolves true once nothing has been in flight for `idleMs`, false when `maxMs` ran out first. */

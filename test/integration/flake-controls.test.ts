@@ -45,6 +45,11 @@ const routes: Record<string, (req: http.IncomingMessage, res: http.ServerRespons
   '/hang': (_req, res) => html(res, page(`<p>hanging</p><script>fetch('/api/never').catch(() => {});</script>`)),
   '/api/slow': (_req, res) => setTimeout(() => res.end('late'), 50),
   '/api/never': () => {},
+  '/stream': (_req, res) => html(res, page(`<p>streaming</p><script>new EventSource('/api/events');</script>`)),
+  '/api/events': (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    res.write('data: hello\n\n'); // and never ends
+  },
   '/login': (_req, res) => {
     res.writeHead(204, { 'set-cookie': 'sid=ok; Path=/; HttpOnly' });
     res.end();
@@ -210,6 +215,20 @@ describe('settle', () => {
     expect(Date.now() - t0).toBeLessThan(4000);
     expect(result.timing!.settleMs).toBeGreaterThanOrEqual(600);
     expect(result.signals.text).toContain('hanging');
+    // v0.13: the frame says it waited the whole window, and the log says once what kept it busy.
+    expect(result.timing!.settleCapped).toBe(true);
+    await capped.capture(url('/hang'));
+    const said = logs.filter((l) => l.includes('the network was still busy after settle.maxWaitMs (700 ms)'));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain(`in flight: GET localhost:${port}/api/never`);
+  });
+
+  it('an event stream that never ends does not hold the settle open (v0.13)', async () => {
+    const browser = await launch({ settle: { networkIdleMs: 100, maxWaitMs: 3000 } });
+    const result = await browser.capture(url('/stream'));
+    expect(result.signals.text).toContain('streaming');
+    expect(result.timing!.settleCapped).toBeUndefined();
+    expect(result.timing!.settleMs).toBeLessThan(2000);
   });
 
   it('reports where the time went', async () => {

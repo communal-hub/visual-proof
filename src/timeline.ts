@@ -38,7 +38,7 @@ export interface Frame {
    */
   renderedFiles?: string[] | null;
   /** Where the capture spent its time (ms), to tune `settle`; absent on frames from older versions. */
-  timing?: { settleMs: number; screenshotMs: number; discoveryMs?: number };
+  timing?: { settleMs: number; screenshotMs: number; discoveryMs?: number; settleCapped?: boolean };
   /**
    * Sidecar frames only: every step executed from the start of the scenario up to and including the `still`
    * (for an error frame, up to and including the step that failed). Absent on route frames.
