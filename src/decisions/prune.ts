@@ -31,7 +31,7 @@ export interface PruneDecision {
 }
 
 export interface PruneContext {
-  config: Pick<DecisionsConfig, 'prune' | 'models'>;
+  config: Pick<DecisionsConfig, 'prune' | 'model'>;
   /** Null: only cached decisions apply (no key, decisions off, nothing computed). */
   client: DecisionsApi | null;
   budget: DecisionBudget;
@@ -53,7 +53,7 @@ export interface PruneOutcome {
 }
 
 /**
- * When one changed file fans out to more than `prune.above` routes, ask the text model which of them the change
+ * When one changed file fans out to more than `prune.above` routes, ask the model which of them the change
  * visibly affects, keep the `prune.keep` most likely (and any at 0.5 or more) and drop the rest. Decisions are
  * cached per (file, content hash, route set) in the status dir, so the watcher and `finish` agree on the set
  * without a second request. A cache hit applies even when decisions are off now. A failed request prunes nothing.
@@ -143,7 +143,7 @@ async function decide(file: string, hash: string, keys: string[], keep: number, 
       },
     ]),
   );
-  const call = client.decide({ model: ctx.config.models.text, state, questions, signal: ctx.budget.signal });
+  const call = client.decide({ model: ctx.config.model, state, questions, signal: ctx.budget.signal });
   const result = await ctx.budget.race(call);
   if (result === 'timeout' || !result.ok) {
     ctx.log?.(`decisions: prune for ${file} failed: ${result === 'timeout' ? 'budget exhausted' : result.error}`);
@@ -175,7 +175,7 @@ async function decide(file: string, hash: string, keys: string[], keep: number, 
 }
 
 /** The route's page component or one of its layouts is the changed file itself. */
-function directlyTouches(graph: ImportGraph, routeKey: string, file: string): boolean {
+export function directlyTouches(graph: ImportGraph, routeKey: string, file: string): boolean {
   return graph.routes.some((r) => r.path === routeKey && (r.component === file || r.layouts.includes(file)));
 }
 

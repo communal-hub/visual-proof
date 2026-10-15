@@ -17,10 +17,10 @@ export const IMAGE_INSTRUCTIONS =
   'Classify what this screenshot of a web application page shows. The page was just loaded in a headless browser; judge only what is visible in the pixels.';
 
 export const IMAGE_CRITERIA: Record<ImageLabel, string> = {
-  clean: 'a normally rendered page with real content (text, tables, forms, charts) in the main area; an intentional empty-state message such as "No invoices yet" counts as clean',
+  clean: 'a rendered page with real content (a heading plus text, tables, forms or charts) in the main area, however sparse, plain or unstyled, and however much white space is left below it; an intentional empty-state message such as "No invoices yet" counts as clean',
   loading: 'a loading state: a spinner, skeleton placeholders or "Loading..." text where the content should be',
   error: 'an error state: an error message or banner, a crash or stack trace, "something went wrong", a 404 or 500 page',
-  blank: 'an empty page: nothing but navigation or header chrome, or a plain white page, with no content in the main area',
+  blank: 'an empty page: nothing but navigation or header chrome, or a plain white page, with no heading and no text at all in the main area',
 };
 
 /** What the image check concluded about one frame; recorded on the route in the proof block. */

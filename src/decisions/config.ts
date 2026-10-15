@@ -1,9 +1,10 @@
 import { API_KEY_ENV } from './client.js';
 
-/** Pinned: the image model that answers "what does this frame show". */
-export const DEFAULT_TRIAGE_MODEL = 'openai/gpt-6-luna-decisions-20261006';
-/** The text model (resolves to a dated id such as `typesafe/jev-1.13-20260917`; the answer reports which). */
-export const DEFAULT_TEXT_MODEL = 'typesafe/jev-1.13';
+/**
+ * The one model every decision uses, text and images alike (resolves to a dated id such as
+ * `typesafe/jev-1.13-20260917`; the answer reports which).
+ */
+export const DEFAULT_MODEL = 'typesafe/jev-1.13';
 export const DEFAULT_BUDGET_MS = 20_000;
 export const DEFAULT_PRUNE_ABOVE = 6;
 export const DEFAULT_PRUNE_KEEP = 4;
@@ -14,7 +15,8 @@ export type TriageMode = 'fail' | 'warn' | 'off';
 export interface DecisionsConfig {
   /** Explicit switch; undefined means "on when an API key exists". `false` never makes a request. */
   enabled?: boolean;
-  models: { triage: string; text: string };
+  /** Model id for every decision: image check, claim check, pruning, captions, before/after comparison. */
+  model: string;
   /** What a non-clean answer from the image check does: fail finish, add a note, or nothing (and no image requests). */
   triage: TriageMode;
   /** Prune routes when one changed file fans out to more than `above`, keeping the `keep` most likely affected; `false` disables. */
@@ -29,7 +31,7 @@ export interface DecisionsConfig {
 
 export function defaultDecisions(): DecisionsConfig {
   return {
-    models: { triage: DEFAULT_TRIAGE_MODEL, text: DEFAULT_TEXT_MODEL },
+    model: DEFAULT_MODEL,
     triage: 'warn',
     prune: { above: DEFAULT_PRUNE_ABOVE, keep: DEFAULT_PRUNE_KEEP },
     verdict: true,
@@ -52,27 +54,19 @@ export function parseDecisions(raw: unknown, errors: string[]): DecisionsConfig 
     errors.push(`"decisions.${key}" must be ${expected}, got ${JSON.stringify(value)}`);
   };
   for (const key of Object.keys(raw)) {
-    if (!['enabled', 'models', 'triage', 'prune', 'verdict', 'captions', 'budgetMs'].includes(key)) {
-      errors.push(`"decisions.${key}" is not a known setting (enabled, models, triage, prune, verdict, captions, budgetMs)`);
+    if (key === 'models') {
+      errors.push('"decisions.models" was replaced by "decisions.model": one model (default typesafe/jev-1.13) answers text and image decisions');
+    } else if (!['enabled', 'model', 'triage', 'prune', 'verdict', 'captions', 'budgetMs'].includes(key)) {
+      errors.push(`"decisions.${key}" is not a known setting (enabled, model, triage, prune, verdict, captions, budgetMs)`);
     }
   }
   if (raw.enabled !== undefined) {
     if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled;
     else bad('enabled', 'a boolean', raw.enabled);
   }
-  if (raw.models !== undefined) {
-    if (!isRecord(raw.models)) bad('models', 'an object { triage?, text? }', raw.models);
-    else {
-      for (const key of ['triage', 'text'] as const) {
-        const value = raw.models[key];
-        if (value === undefined) continue;
-        if (typeof value === 'string' && value.trim() !== '') out.models[key] = value.trim();
-        else bad(`models.${key}`, 'a non-empty model id', value);
-      }
-      for (const key of Object.keys(raw.models)) {
-        if (key !== 'triage' && key !== 'text') errors.push(`"decisions.models.${key}" is not a known model slot (triage, text)`);
-      }
-    }
+  if (raw.model !== undefined) {
+    if (typeof raw.model === 'string' && raw.model.trim() !== '') out.model = raw.model.trim();
+    else bad('model', 'a non-empty model id', raw.model);
   }
   if (raw.triage !== undefined) {
     if (raw.triage === 'fail' || raw.triage === 'warn' || raw.triage === 'off') out.triage = raw.triage;

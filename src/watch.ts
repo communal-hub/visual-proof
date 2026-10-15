@@ -31,6 +31,9 @@ import { type DecisionsApi } from './decisions/client.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { writeTextSidecar } from './decisions/sidecar.js';
 import { pruneForWatch } from './decisions/watch.js';
+import { claimPath, readClaim } from './decisions/claim.js';
+import { directlyTouches } from './decisions/prune.js';
+import { normalizeScreen, parseExpectations } from './focus.js';
 // v0.8 dynamic params hooks: the tiers, discovery and the session file live in src/resolve/param-*.ts and session-*.ts.
 import { ParamDiscoverer, writeDiscoveryCache, type DiscoveryOutcome } from './resolve/param-discovery.js';
 import { ParamFiller, type FillOutcome } from './resolve/param-fill.js';
@@ -948,6 +951,22 @@ class Watcher {
     );
     for (const file of resolution.unmapped) this.log(`no route for ${file}`);
     for (const skip of resolution.skipped) this.log(`skipped route ${skip.routeKey}: ${skip.reason}`);
+    // v0.11 focus: claim screens and changed pages first; the other routes the change reaches are capped at maxImpact.
+    const isHeadline = this.headlineTest(graph);
+    if (isHeadline) {
+      const byFocus = <T extends { path?: string; routeKey: string; sourceFiles: string[] }>(list: T[]): T[] => [
+        ...list.filter((r) => isHeadline(r)),
+        ...list.filter((r) => !isHeadline(r)),
+      ];
+      let impactLeft = this.config.focus.maxImpact;
+      const keep = <T extends { path?: string; routeKey: string; sourceFiles: string[] }>(r: T): boolean => isHeadline(r) || impactLeft-- > 0;
+      const routes = byFocus(resolution.routes).filter(keep);
+      const skipped = byFocus(resolution.skipped).filter(keep);
+      const dropped = resolution.routes.length + resolution.skipped.length - routes.length - skipped.length;
+      if (dropped > 0) this.log(`focus: ${dropped} impact route(s) over focus.maxImpact (${this.config.focus.maxImpact}) not captured`);
+      resolution.routes = routes;
+      resolution.skipped = skipped;
+    }
     const targets: Target[] = resolution.routes.map((r) => ({
       path: r.path,
       routeKey: r.routeKey,
@@ -979,6 +998,22 @@ class Watcher {
       });
     }
     return { targets, unmapped: resolution.unmapped };
+  }
+
+  /**
+   * Whether a route is a headline (a claim screen, or a page whose own component or layout changed), or null when
+   * focus does not apply: `focus.mode` is `all`, or the claim names no screen (every route is then a headline, as
+   * `finish` falls back to).
+   */
+  private headlineTest(graph: ImportGraph): ((r: { path?: string; routeKey: string; sourceFiles: string[] }) => boolean) | null {
+    if (this.config.focus.mode !== 'claim') return null;
+    const claim = readClaim(claimPath(this.config.claimFile, this.config.repoDir, this.dirs.statusDir));
+    const screens = new Set([...parseExpectations('text' in claim ? claim.text : undefined).keys()].map(normalizeScreen));
+    if (screens.size === 0) return null;
+    return (r) =>
+      (r.path !== undefined && screens.has(normalizeScreen(r.path))) ||
+      screens.has(normalizeScreen(r.routeKey)) ||
+      r.sourceFiles.some((file) => directlyTouches(graph, r.routeKey, file));
   }
 
   /** Fill a route key from its `paramSources` entry and record the outcome in `status.json` for `finish`. */

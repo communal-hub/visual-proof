@@ -22,13 +22,14 @@ describe('parseArgs', () => {
     expect(parseArgs(['watch', '--config=b.json']).configPath).toBe('b.json');
   });
 
-  it('parses --json for finish, doctor and params list only', () => {
+  it('parses --json for finish, before, doctor and params list only', () => {
     expect(parseArgs(['finish', '--json'])).toMatchObject({ command: 'finish', json: true });
+    expect(parseArgs(['before', '--json'])).toMatchObject({ command: 'before', json: true });
     expect(parseArgs(['doctor', '--json'])).toMatchObject({ command: 'doctor', json: true });
     expect(parseArgs(['doctor'])).toMatchObject({ json: false });
     expect(parseArgs(['params', 'list', '--json'])).toMatchObject({ command: 'params', paramsAction: 'list', json: true });
-    expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish, doctor and params list/);
-    expect(() => parseArgs(['params', 'clear', '--json'])).toThrow(/only valid with the finish, doctor and params list/);
+    expect(() => parseArgs(['status', '--json'])).toThrow(/only valid with the finish, before, doctor and params list/);
+    expect(() => parseArgs(['params', 'clear', '--json'])).toThrow(/only valid with the finish, before, doctor and params list/);
   });
 
   it('parses --normalize for doctor --json only', () => {

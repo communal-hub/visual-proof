@@ -12,6 +12,7 @@ import {
   describeImageCheck,
   imageCheckMessage,
 } from '../../src/decisions/image-check.js';
+import { MAX_IMAGE_SIDE, MIN_IMAGE_SIDE } from '../../src/decisions/images.js';
 import { CLEAN_PNG, FakeClient, choice, hang, okResult } from './decisions-helpers.js';
 import { tmpDir } from './helpers.js';
 
@@ -77,8 +78,26 @@ describe('image check', () => {
     expect(parts).toHaveLength(2);
     const dimensions = await Promise.all(parts.map((p) => sharp(Buffer.from(p.image_url!.url.split(',')[1]!, 'base64')).metadata()));
     expect(dimensions[0]).toMatchObject({ width: 1280, height: 800 });
-    expect(dimensions[1]).toMatchObject({ height: 1600 });
+    expect(dimensions[1]).toMatchObject({ height: 1568 });
     expect(dimensions[1]!.width).toBeLessThan(1280);
+  });
+
+  it('keeps every side within what the model accepts: tiny stills are padded, very tall ones fitted', async () => {
+    const tiny = path.join(dir, 'tiny.png');
+    const towering = path.join(dir, 'towering.png');
+    await sharp({ create: { width: 200, height: 100, channels: 3, background: '#ffffff' } }).png().toFile(tiny);
+    await sharp({ create: { width: 1280, height: 12_000, channels: 3, background: '#ffffff' } }).png().toFile(towering);
+    const client = new FakeClient(() => okResult({ frame: choice('clean', 1) }));
+    await checkImages([{ png: tiny, name: '/tiny' }, { png: towering, name: '/towering' }], opts(client));
+    const sides = await Promise.all(
+      client.calls.flatMap((c) => (c.state as Array<{ type?: string; image_url?: { url: string } }>).filter((p) => p.type === 'image_url'))
+        .map(async (p) => sharp(Buffer.from(p.image_url!.url.split(',')[1]!, 'base64')).metadata()),
+    );
+    expect(sides.length).toBe(3);
+    for (const { width, height } of sides) {
+      expect(Math.min(width!, height!)).toBeGreaterThanOrEqual(MIN_IMAGE_SIDE);
+      expect(Math.max(width!, height!)).toBeLessThanOrEqual(MAX_IMAGE_SIDE);
+    }
   });
 
   it('rejects a corrupt screenshot before a model call', async () => {

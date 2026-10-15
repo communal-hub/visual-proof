@@ -5,6 +5,7 @@ import { runWatch, startDaemon, stopDaemon } from './daemon.js';
 import { doctorCommand } from './doctor.js';
 import { EXIT } from './exit.js';
 import { finishCommand } from './finish.js';
+import { beforeCommand } from './before.js';
 import { pathsInfo, resolveDirs } from './paths.js';
 // v0.8 dynamic params: `params set|list|clear` lives in params.ts.
 import { DEFAULT_SET_TIMEOUT_S, PARAMS_ACTIONS, paramsCommand, type ParamsAction } from './params.js';
@@ -12,9 +13,9 @@ import { DEFAULT_READY_TIMEOUT_S, waitForReady } from './ready.js';
 import { readLiveStatus } from './status.js';
 import { firstLine } from './text.js';
 
-export type Command = 'start' | 'stop' | 'status' | 'ready' | 'watch' | 'finish' | 'doctor' | 'params';
+export type Command = 'start' | 'stop' | 'status' | 'ready' | 'watch' | 'finish' | 'before' | 'doctor' | 'params';
 
-const COMMANDS: readonly Command[] = ['start', 'stop', 'status', 'ready', 'watch', 'finish', 'doctor', 'params'];
+const COMMANDS: readonly Command[] = ['start', 'stop', 'status', 'ready', 'watch', 'finish', 'before', 'doctor', 'params'];
 
 export { readLiveStatus };
 
@@ -50,13 +51,14 @@ Commands:
   ready      alias for "status --wait"
   watch      run the watcher in the foreground
   finish     assemble headline stills and the proof block for HEAD
+  before     capture the headlines with the frontend at the merge-base, for finish's before/after pairs
   doctor     check the browser, change trigger, barrier, login, routes, route params, sidecars and replay
   params     set, list or clear route params for this session (see below)
 
 Options:
   --config <path>   config file (default: ./visual-proof.config.json)
   --hook            finish only: quiet, time-capped, always exits 0
-  --json            finish, doctor, params list: print the result as JSON on stdout
+  --json            finish, before, doctor, params list: print the result as JSON on stdout
   --normalize       doctor --json: strip ports, absolute paths, hashes, timings and
                     versions, so the report can be checked in as a golden file
   --probe-decisions doctor only: send one tiny request to each decisions model (needs
@@ -103,6 +105,7 @@ Exit codes:
   0   ok (finish: every changed screen has a clean frame at HEAD, or there are none;
       status --wait / ready: the watcher is ready)
   1   finish: proof failures, listed on stderr and in the proof block
+      before: a headline could not be captured at the merge-base
       status --wait / ready: not ready (one line on stderr with the reason and paths)
       doctor: the browser or the change trigger is missing
   2   usage error
@@ -160,8 +163,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (parsed.hook && parsed.command !== 'finish' && !parsed.help) {
     throw new UsageError('--hook is only valid with the finish command');
   }
-  if (parsed.json && parsed.command !== 'finish' && parsed.command !== 'doctor' && !(parsed.command === 'params' && parsed.paramsAction === 'list') && !parsed.help) {
-    throw new UsageError('--json is only valid with the finish, doctor and params list commands');
+  if (parsed.json && parsed.command !== 'finish' && parsed.command !== 'before' && parsed.command !== 'doctor' && !(parsed.command === 'params' && parsed.paramsAction === 'list') && !parsed.help) {
+    throw new UsageError('--json is only valid with the finish, before, doctor and params list commands');
   }
   if (parsed.normalize && !parsed.help && (parsed.command !== 'doctor' || !parsed.json)) {
     throw new UsageError('--normalize is only valid with doctor --json');
@@ -215,6 +218,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     if (args.command === 'finish') {
       return await finishCommand({ configPath: args.configPath, hook: args.hook, json: args.json, env });
     }
+    if (args.command === 'before') return await beforeCommand({ configPath: args.configPath, json: args.json, env });
     if (args.command === 'params') {
       return await paramsCommand({ configPath: args.configPath, action: args.paramsAction!, args: args.paramsArgs, json: args.json, timeoutSec: args.timeoutSec, env });
     }
@@ -245,7 +249,7 @@ if (entry && import.meta.url === pathToFileURL(entry).href) {
   // The foreground watcher owns a browser and sockets; do not let a stray handle keep it alive after shutdown.
   if (argv.includes('watch')) process.exit(code);
   // finish and doctor are time-boxed: a step that outlived its budget must not keep the process (or the agent) waiting.
-  if (argv.includes('finish') || argv.includes('doctor')) {
+  if (argv.includes('finish') || argv.includes('doctor') || argv.includes('before')) {
     await new Promise<void>((resolve) => process.stdout.write('', () => resolve()));
     await new Promise<void>((resolve) => process.stderr.write('', () => resolve()));
     process.exit(code);

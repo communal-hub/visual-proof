@@ -40,6 +40,12 @@ import { DecisionRuntime } from './decisions/runtime.js';
 // v0.8 dynamic params hooks: tiers, provenance and the unfilled-route message live in src/resolve/param-tiers.ts.
 import { explainUnfilled, loadLayeredParams, seedCandidates, unfilledMessage, type LayeredParams, type SeedCandidate, type UnfilledRoute } from './resolve/param-tiers.js';
 import { hasParams } from './resolve/route-pattern.js';
+// Focus and before/after (v0.11): which routes are headlines, and the merge-base frames shown beside them.
+import { normalizeScreen, parseExpectations, scenarioHash, selectHeadlines, type HeadlineReason } from './focus.js';
+import type { CompareCheck } from './decisions/compare.js';
+
+export { parseExpectations };
+import { BEFORE_SCRATCH, mergeBase, type MergeBase } from './before-base.js';
 
 export interface FinishOptions {
   env?: NodeJS.ProcessEnv;
@@ -53,6 +59,11 @@ export interface FinishOptions {
   pollMs?: number;
   /** Replaces the OpenRouter Decisions client (tests). */
   decisionsClient?: DecisionsApi;
+  /**
+   * Stop once the expected routes are split into headlines and impact routes: no waiting, no frames read, no proof
+   * block written. `visual-proof before` uses it to capture exactly the headlines `finish` will show.
+   */
+  planOnly?: boolean;
 }
 
 /** One expected route and what `finish` found for it. */
@@ -76,12 +87,43 @@ export interface RouteProof {
   artifact?: string;
   /** A4: what the image check made of the still (absent when decisions did not run for it). */
   imageCheck?: ImageCheck;
-  /** A4: the caption shown under the still (chosen by the text model, else the first template). */
+  /** A4: the caption shown under the still (chosen by the model, else the first template). */
   caption?: string;
+  /** v0.11: whether the after shows the claimed change where the before did not (advisory). */
+  compare?: CompareCheck;
   /** v0.8: which tier filled the route's params (session, config, file, source, discovered); absent for a route without params. */
   paramsFrom?: ParamsFrom;
   /** v0.8: with `paramsFrom: "discovered"`, the page whose links gave the id. */
   paramsFoundOn?: string;
+  /** v0.11: `headline` routes get a still in the proof block; `impact` routes are only smoke-checked. */
+  role?: 'headline' | 'impact';
+  /** v0.11, headlines only: why the route is one. */
+  headlineReason?: HeadlineReason;
+  /** v0.11, headlines only: the frame captured with the frontend at the merge-base (`visual-proof before`). */
+  before?: BeforeProof;
+}
+
+/** The before half of a before/after pair. */
+export interface BeforeProof {
+  /** Absolute path of the copied PNG. */
+  artifact: string;
+  status: FrameStatus;
+  reasons: string[];
+  frameId: string;
+  /** Merge-base commit the frontend was served from. */
+  commit: string;
+}
+
+/** What the impact routes (smoke-checked, no stills) came to. */
+export interface ImpactSummary {
+  total: number;
+  clean: number;
+  /** Clean frames whose mounted components include a changed file. */
+  rendered: number;
+  /** Not clean, on a page where no changed file rendered (or that could not say): not counted against the change. */
+  unrelated: Array<{ route: string; status: string; reason: string }>;
+  /** Not captured: params unfilled, over `focus.maxImpact`, or no frame at HEAD. */
+  notCaptured: Array<{ route: string; reason: string }>;
 }
 
 export interface FinishResult {
@@ -111,6 +153,10 @@ export interface FinishResult {
   unfilled: UnfilledRoute[];
   /** v0.8: routes filled by session params or link discovery; candidates for the app's seeder. Empty when none. */
   seedCandidates: SeedCandidate[];
+  /** v0.11: the smoke check of the impact routes; absent when every route was a headline. */
+  impact?: ImpactSummary;
+  /** v0.11: the merge-base commit before frames are expected from; absent when `before.mode` is off or it is unknown. */
+  baseCommit?: string;
 }
 
 /** `/manage/invoices/1` -> `manage-invoices-1`; the root route is `root`. Only `[A-Za-z0-9._-]` survive. */
@@ -154,6 +200,8 @@ interface State {
   claimText?: string;
   /** v0.8: routes left unfilled (see {@link FinishResult.unfilled}). */
   unfilled: UnfilledRoute[];
+  impact?: ImpactSummary;
+  baseCommit?: string;
 }
 
 /**
@@ -210,7 +258,7 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
       `truncated: finish budget of ${budgetMs} ms exceeded after ${state.routes.length} of ${state.expectedCount} route(s)`,
     );
   }
-  return finalize(dirs, state);
+  return finalize(dirs, state, !opts.planOnly);
 }
 
 async function collect(
@@ -300,14 +348,16 @@ async function gather(
       reasons: [],
     });
   }
-  // A changed screen that cannot be tied to a capturable route is unproven, which is a failure, not a note.
+  // A changed screen that cannot be tied to a capturable route is unproven: a failure for a headline, a note for an
+  // impact route (decided once the claim and the sidecars are known).
+  const unfilledKeys: RouteProof[] = [];
   for (const skip of resolution.skipped) {
     if (watcherFills(config, skip.routeKey)) {
       // The watcher fills this one from a list endpoint or the links of its parent page; its frame (or why not) tells what happened.
       expected.set(skip.routeKey, { route: skip.routeKey, routeKey: skip.routeKey, sourceFiles: skip.sourceFiles, via: 'screen', reasons: [] });
       continue;
     }
-    failUnfilled(config, dirs, state, seed, skip.routeKey, status);
+    unfilledKeys.push({ route: skip.routeKey, routeKey: skip.routeKey, sourceFiles: skip.sourceFiles, via: 'screen', reasons: [] });
   }
   for (const file of graphFailed ? [] : resolution.unmapped) {
     // (with no graph every file is unmapped; the graph failure above already says why)
@@ -333,7 +383,7 @@ async function gather(
       }
       const concrete = concretePath(routeKey, seed.params);
       if (!concrete.ok && !watcherFills(config, routeKey)) {
-        failUnfilled(config, dirs, state, seed, routeKey, status);
+        unfilledKeys.push({ route: routeKey, routeKey, sourceFiles: backendFiles, via: 'backend', reasons: [] });
         continue;
       }
       expected.set(routeKey, {
@@ -350,9 +400,11 @@ async function gather(
   const knownKeys = new Set([...graph.routes.map((r) => r.path), ...Object.values(config.staticRoutes).flat(), ...expected.keys()]);
   const scenarios: ExpectedScenario[] = [];
   const sidecarStills: RouteProof[] = [];
+  const scenarioHashes = new Map<string, string>();
   for (const file of (await headFiles(config.repoDir)).filter((f) => isSidecar(f)).sort()) {
     const text = await showAtHead(config.repoDir, file);
     if (text === null) continue;
+    scenarioHashes.set(file, scenarioHash(text));
     const sidecar = parseSidecar(text, file);
     const touched = changed.includes(file);
     const visits = scenarioRouteKeys(sidecar, knownKeys).filter((key) => expected.has(key));
@@ -369,13 +421,50 @@ async function gather(
       sidecarStills.push({ route, routeKey: route, sourceFiles: [file], via: 'sidecar', reasons: [], scenario: { file, name: sidecar.name, still } });
     }
   }
-  if (expected.size === 0 && sidecarStills.length === 0 && state.failures.length === 0 && screenFiles.length === 0 && backendFiles.length === 0) {
+  if (expected.size === 0 && sidecarStills.length === 0 && unfilledKeys.length === 0 && state.failures.length === 0 && screenFiles.length === 0 && backendFiles.length === 0) {
     // Only sidecar files changed, and none of them exists at HEAD any more (deleted): nothing to prove.
     state.noScreenChanges = true;
     return;
   }
 
-  const list = [...expected.values(), ...sidecarStills];
+  // v0.11 focus: claim screens, changed pages and touched sidecars are headlines; every other route is impact.
+  const claimScreens = [...parseExpectations(state.claimText).keys()];
+  const selection = selectHeadlines([...expected.values(), ...sidecarStills, ...unfilledKeys], {
+    focus: config.focus,
+    claimScreens,
+    graph,
+    changed,
+  });
+  if (selection.fallback) {
+    state.notes.push(
+      'focus: no claim screen, changed page or touched sidecar matched a route, so every route is a headline; name the screens that show the change in the claim (`<route>: <what must be visible>`)',
+    );
+  }
+  for (const route of selection.headlines) {
+    route.role = 'headline';
+    route.headlineReason = selection.reasons.get(route);
+  }
+  for (const route of selection.impact) route.role = 'impact';
+  const unfilledSet = new Set(unfilledKeys);
+  for (const route of unfilledKeys) if (route.role === 'headline') failUnfilled(config, dirs, state, seed, route.routeKey, status);
+  const list = selection.headlines.filter((r) => !unfilledSet.has(r));
+  const impactList = selection.impact.filter((r) => !unfilledSet.has(r));
+  const impact: ImpactSummary | undefined =
+    selection.impact.length > 0
+      ? {
+          total: selection.impact.length,
+          clean: 0,
+          rendered: 0,
+          unrelated: [],
+          notCaptured: selection.impact.filter((r) => unfilledSet.has(r)).map((r) => ({ route: r.routeKey, reason: 'params unfilled' })),
+        }
+      : undefined;
+  if (impact) state.impact = impact;
+  if (opts.planOnly) {
+    state.routes.push(...selection.headlines, ...impactList);
+    return;
+  }
+
   state.expectedCount = list.length;
   await waitForDaemon({
     config,
@@ -394,6 +483,11 @@ async function gather(
   const shortTree = tree.slice(0, SHORT_TREE);
   const used = new Set<string>();
   const headlines = new Map<RouteProof, Frame>();
+  const base = config.before.mode === 'off' ? null : await mergeBase(config.repoDir, config.baseRef, status?.anchor);
+  if (state.closed) return;
+  if (base) state.baseCommit = base.commit;
+  else if (config.before.mode !== 'off') state.notes.push(`before/after: no merge-base with ${config.baseRef}, so there is nothing to compare against`);
+  const beforeTimeline = base ? new Timeline(path.join(dirs.scratchDir, BEFORE_SCRATCH), config.maxFrames) : null;
   const carrier = new Carrier({ config, graph: graphFailed ? null : graph, headTree: tree });
   const scenarioKeys = new Map(scenarios.map((sc) => [sc.file, sc.keys]));
   for (const route of list) {
@@ -458,6 +552,7 @@ async function gather(
     const target = path.join(dirs.artifactDir, `${name}.png`);
     fs.copyFileSync(source, target);
     route.artifact = target;
+    if (base) attachBefore(route, base, beforeTimeline!, scenario ? scenarioHashes.get(scenario.file) : undefined, slug, used, dirs);
 
     if (frame.status !== 'clean') {
       const why = frame.reasons.length > 0 ? `: ${frame.reasons.join('; ')}` : '';
@@ -480,10 +575,105 @@ async function gather(
     }
   }
 
+  const cleanFrames = new Map(headlines);
+  if (impact) smokeImpact({ state, impact, impactList, timeline, tree, screenFiles, cleanFrames, base, beforeTimeline });
+  if (base && config.before.mode !== 'off') checkBefore(config, state, list, base);
+
   noteProvenance(state, list);
-  checkRendered(config, state, list, headlines);
+  checkRendered(config, state, [...list, ...impactList], cleanFrames);
   if (!state.closed && !state.truncated) await decide(config, dirs, state, runtime, graph, timeline, headlines);
   if (!state.closed && state.failures.length === 0 && list.length > 0) await addReplay(config, dirs, opts, state, timeline, status?.sessionId, shortTree, deadline, now);
+}
+
+// ---- focus and before/after (v0.11) ---------------------------------------------
+
+/** Copy the merge-base frame of a headline next to its HEAD still, when `visual-proof before` captured one. */
+function attachBefore(route: RouteProof, base: MergeBase, timeline: Timeline, hash: string | undefined, slug: string, used: Set<string>, dirs: Dirs): void {
+  const frame = timeline.latestAtTree(route.route, base.tree) ?? timeline.latestAtTree(route.routeKey, base.tree);
+  if (!frame || (route.scenario && frame.scenarioHash !== hash)) return;
+  const source = timeline.pngPath(frame);
+  if (!fs.existsSync(source)) return;
+  const short = base.commit.slice(0, SHORT_TREE);
+  let name = `${slug}-before-${short}`;
+  for (let n = 2; used.has(name); n++) name = `${slug}-before-${n}-${short}`;
+  used.add(name);
+  const target = path.join(dirs.artifactDir, `${name}.png`);
+  fs.copyFileSync(source, target);
+  route.before = { artifact: target, status: frame.status, reasons: frame.reasons, frameId: frame.id, commit: base.commit };
+}
+
+/** Headline stills without a before frame: a failure with `before.mode: "require"`, else a note. */
+function checkBefore(config: Config, state: State, list: RouteProof[], base: MergeBase): void {
+  const missing = list.filter((r) => r.artifact && !r.before).map((r) => `\`${stillLabel(r)}\``);
+  if (missing.length === 0) return;
+  const message = `no before frame at merge-base ${base.commit.slice(0, SHORT_TREE)} for ${missing.join(', ')}`;
+  const hint = 'run `npx visual-proof before` to capture the headlines with the frontend at the merge-base, then rerun finish';
+  if (config.before.mode === 'require') {
+    state.failures.push(message);
+    state.hints.push(hint);
+  } else {
+    state.notes.push(`${message}; ${hint}`);
+  }
+}
+
+interface SmokeContext {
+  state: State;
+  impact: ImpactSummary;
+  impactList: RouteProof[];
+  timeline: Timeline;
+  tree: string;
+  screenFiles: string[];
+  /** Clean frames by route, for the render check; impact routes are added here. */
+  cleanFrames: Map<RouteProof, Frame>;
+  base: MergeBase | null;
+  beforeTimeline: Timeline | null;
+}
+
+/**
+ * Impact routes are smoke-checked: no still, and a frame that is not clean only fails `finish` when a changed file
+ * rendered on it and the merge-base frame (when there is one) was clean. Everything else is counted in the summary.
+ */
+function smokeImpact(ctx: SmokeContext): void {
+  const { state, impact, timeline, tree, base, beforeTimeline } = ctx;
+  let hinted = false;
+  for (const route of ctx.impactList) {
+    state.routes.push(route);
+    const frame = timeline.latestAtTree(route.route, tree);
+    if (!frame) {
+      impact.notCaptured.push({ route: route.route, reason: 'no frame at HEAD' });
+      continue;
+    }
+    if (route.route === route.routeKey) route.route = frame.route;
+    route.status = frame.status;
+    route.reasons = frame.reasons;
+    route.frameId = frame.id;
+    route.sessionId = frame.sessionId;
+    const rendered = Array.isArray(frame.renderedFiles)
+      ? route.sourceFiles.filter((f) => ctx.screenFiles.includes(f) && frame.renderedFiles!.includes(f))
+      : [];
+    if (frame.status === 'clean') {
+      impact.clean++;
+      if (rendered.length > 0) impact.rendered++;
+      ctx.cleanFrames.set(route, frame);
+      continue;
+    }
+    const why = frame.reasons.join('; ');
+    if (rendered.length === 0) {
+      impact.unrelated.push({ route: route.route, status: frame.status, reason: why });
+      continue;
+    }
+    const before = base && beforeTimeline ? (beforeTimeline.latestAtTree(route.route, base.tree) ?? null) : null;
+    const short = base?.commit.slice(0, SHORT_TREE) ?? '';
+    if (before && before.status !== 'clean') {
+      impact.unrelated.push({ route: route.route, status: frame.status, reason: `also ${before.status} at merge-base ${short}; ${why}` });
+      continue;
+    }
+    state.failures.push(`${route.route} final frame is ${frame.status} where ${rendered.join(', ')} renders${before ? ` (clean at merge-base ${short})` : ''}: ${why}`);
+    if (!before && !hinted) {
+      hinted = true;
+      state.hints.push('an impact route fails where the change renders: run `npx visual-proof before` to check it at the merge-base too (failing there as well makes it a note), or fix it');
+    }
+  }
 }
 
 // ---- dynamic params (v0.8) ----------------------------------------------------
@@ -524,6 +714,7 @@ async function decide(
   headlines: Map<RouteProof, Frame>,
 ): Promise<void> {
   if (!runtime.active) return;
+  const expected = parseExpectations(state.claimText);
   const result = await runFinishDecisions({
     config,
     runtime,
@@ -537,6 +728,8 @@ async function decide(
       via: route.via,
       png: timeline.pngPath(frame),
       renderedFiles: frame.renderedFiles ?? null,
+      ...(route.before ? { beforePng: route.before.artifact } : {}),
+      ...(expectationFor(route, expected) ? { expected: expectationFor(route, expected) } : {}),
     })),
   });
   if (state.closed) return; // finish gave up while the decisions were running: the result is already final
@@ -544,6 +737,7 @@ async function decide(
     const entry = result.routes.get(route.route);
     if (entry?.imageCheck) route.imageCheck = entry.imageCheck;
     if (entry?.caption) route.caption = entry.caption;
+    if (entry?.compare) route.compare = entry.compare;
   }
   state.failures.push(...result.failures);
   state.notes.push(...result.notes);
@@ -578,8 +772,10 @@ async function addReplay(
 ): Promise<void> {
   if (!config.replay.enabled) return;
   const session = typeof sessionId === 'string' && sessionId !== '' ? sessionId : undefined;
+  // The replay shows the headlines: impact routes are smoke-checked, not part of the story.
+  const impactKeys = new Set(state.routes.filter((r) => r.role === 'impact').flatMap((r) => [r.route, r.routeKey]));
   const outcome = await buildReplay({
-    frames: timeline.list({ sessionId: session }),
+    frames: timeline.list({ sessionId: session }).filter((f) => !impactKeys.has(f.route) && !impactKeys.has(f.routeKey)),
     pngPath: (frame) => timeline.pngPath(frame),
     clipDir: (frame) => timeline.clipPath(frame),
     config,
@@ -762,13 +958,13 @@ async function daemonBusy(
   }
 }
 
-function finalize(dirs: Dirs, state: State): FinishResult {
+function finalize(dirs: Dirs, state: State, write = true): FinishResult {
   const proofBlockPath = statusFiles(dirs).proofBlock;
   let proofBlock = state.noScreenChanges
     ? `<!-- visual-proof: no screen changes (diffed ${describeRange(state.range)}) -->\n`
     : renderProofBlock(state);
   try {
-    writeProofBlock(proofBlockPath, proofBlock);
+    if (write) writeProofBlock(proofBlockPath, proofBlock);
   } catch (err) {
     // A proof nobody can read is not a proof.
     state.failures.push(`could not write the proof block to ${proofBlockPath}: ${describeError(err)}`);
@@ -779,7 +975,7 @@ function finalize(dirs: Dirs, state: State): FinishResult {
   let summary: string;
   if (state.noScreenChanges && ok) summary = 'visual-proof: no screen changes';
   else if (!ok) summary = `visual-proof: ${plural(state.failures.length, 'failure')}, see ${proofBlockPath}`;
-  else summary = `visual-proof: ${plural(state.routes.length, 'route')} ok`;
+  else summary = `visual-proof: ${plural(state.routes.filter((r) => r.role !== 'impact').length, 'route')} ok${state.impact ? `, ${state.impact.total} impact` : ''}`;
 
   return {
     ok,
@@ -799,6 +995,8 @@ function finalize(dirs: Dirs, state: State): FinishResult {
     ...(state.claim ? { claim: state.claim } : {}),
     unfilled: state.unfilled,
     seedCandidates: seedCandidates(state.routes.filter((r) => r.status !== undefined)),
+    ...(state.impact ? { impact: state.impact } : {}),
+    ...(state.baseCommit ? { baseCommit: state.baseCommit } : {}),
   };
 }
 
@@ -873,10 +1071,22 @@ function renderProofBlock(state: State): string {
     if (!route.artifact || !route.status) continue;
     // Sidecar stills come after the route stills (the list is built in that order), labeled scenario / still.
     const label = route.scenario ? `sidecar ${route.scenario.name} / ${route.scenario.still}` : route.route;
-    lines.push('', `<img src="${escapeAttr(route.artifact)}" alt="${escapeAttr(label)}">`, '');
+    const after = `<img src="${escapeAttr(route.artifact)}" alt="${escapeAttr(label)}">`;
+    if (route.before) {
+      const base = route.before.commit.slice(0, SHORT_TREE);
+      const before = `<img src="${escapeAttr(route.before.artifact)}" alt="${escapeAttr(`${label} (before)`)}">`;
+      lines.push('', `**\`${label}\`**`, '', `| Before · merge-base \`${base}\` · ${route.before.status} | After · tree \`${short}\` · ${route.status} |`, '| --- | --- |', `| ${before} | ${after} |`, '');
+    } else {
+      lines.push('', after, '');
+    }
     if (route.caption) lines.push(`_${escapeCaption(route.caption)}_`, '');
     lines.push(stillLine(`\`${label}\` · ${route.status} · tree ${short}${route.scenario ? ` · ${route.scenario.file}` : ''}`, route));
   }
+  if (state.baseCommit && state.routes.some((r) => r.before)) {
+    lines.push('', `_Before: the frontend at merge-base \`${state.baseCommit.slice(0, SHORT_TREE)}\`, against the current backend and seed data._`);
+  }
+
+  if (state.impact) lines.push('', ...renderImpact(state.impact));
 
   lines.push(...renderSelfReview(state));
 
@@ -896,19 +1106,34 @@ function renderProofBlock(state: State): string {
   return `${lines.join('\n')}\n`;
 }
 
+/** Most impact lines the proof block lists; the rest are counted. */
+const IMPACT_LINES = 25;
+const IMPACT_REASON_CHARS = 160;
+
+/** One summary line for the impact routes, then the ones that were not clean or have no frame, folded away. */
+function renderImpact(impact: ImpactSummary): string[] {
+  const lines = [
+    `**Impact smoke** · ${plural(impact.total, 'other route')} ${impact.total === 1 ? 'reaches' : 'reach'} the change · ${impact.clean} clean (${impact.rendered} rendered a changed file) · ${impact.unrelated.length} not clean where the change did not render or also failed at the merge-base · ${impact.notCaptured.length} without a frame`,
+  ];
+  const detail = [
+    ...impact.unrelated.map((u) => `- \`${u.route}\` ${u.status}: ${clip(u.reason)}`),
+    ...impact.notCaptured.map((n) => `- \`${n.route}\` without a frame: ${n.reason}`),
+  ];
+  if (detail.length === 0) return lines;
+  const shown = detail.slice(0, IMPACT_LINES);
+  if (detail.length > shown.length) shown.push(`- and ${detail.length - shown.length} more (finish --json lists them all)`);
+  return [...lines, '', '<details><summary>Impact routes not clean or without a frame</summary>', '', ...shown, '', '</details>'];
+}
+
+function clip(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > IMPACT_REASON_CHARS ? `${flat.slice(0, IMPACT_REASON_CHARS - 1)}…` : flat;
+}
+
 function stillLabel(route: RouteProof): string {
   return route.scenario ? `sidecar ${route.scenario.name} / ${route.scenario.still}` : route.route;
 }
 
-/** `<screen>: <what must be visible>` lines of the claim, keyed by screen; bullets and numbering are tolerated. */
-export function parseExpectations(text: string | undefined): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const raw of (text ?? '').split(/\r?\n/)) {
-    const m = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?(.+?):\s+(\S.*)$/.exec(raw);
-    if (m && !out.has(m[1]!.trim())) out.set(m[1]!.trim(), m[2]!.trim());
-  }
-  return out;
-}
 
 function cell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
@@ -921,13 +1146,19 @@ function renderSelfReview(state: State): string[] {
   const expected = parseExpectations(state.claimText);
   const lines = ['', '**Agent self-review**', '', '| Screen | Expected | Seen | PASS/FAIL |', '| --- | --- | --- | --- |'];
   for (const route of stills) {
-    const keys = route.scenario
-      ? [stillLabel(route), `${route.scenario.name} / ${route.scenario.still}`, route.scenario.still]
-      : [route.route];
-    const exp = keys.map((k) => expected.get(k)).find((v) => v !== undefined) ?? '';
+    const exp = expectationFor(route, expected) ?? '';
     lines.push(`| ${cell(`\`${stillLabel(route)}\``)} | ${cell(exp)} | _TODO_ | _TODO_ |`);
   }
   return lines;
+}
+
+/** The claim line for a still: by its label, `name / still` or still name for a sidecar, by path or key for a route. */
+function expectationFor(route: RouteProof, expected: Map<string, string>): string | undefined {
+  const keys = route.scenario
+    ? [stillLabel(route), `${route.scenario.name} / ${route.scenario.still}`, route.scenario.still]
+    : [route.route, route.routeKey];
+  const normalized = new Map([...expected].map(([k, v]) => [normalizeScreen(k), v]));
+  return keys.map((k) => normalized.get(normalizeScreen(k))).find((v) => v !== undefined);
 }
 
 /** A path as a markdown link target: spaces and parentheses would end the link early. */

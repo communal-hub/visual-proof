@@ -270,7 +270,7 @@ export function choiceConfidence(answer: ChoiceAnswer): number | null {
   return typeof p === 'number' ? p : null;
 }
 
-/** A `state` holding one PNG as an `image_url` part, the only encoding the image model reads as an image. */
+/** A `state` holding one PNG as an `image_url` part, the only encoding the model reads as an image. */
 export function imageState(png: Buffer): unknown[] {
   return [{ type: 'image_url', image_url: { url: `data:image/png;base64,${png.toString('base64')}` } }];
 }

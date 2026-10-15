@@ -181,7 +181,7 @@ describe('finish with sidecars', () => {
     ]);
   });
 
-  it('the render check passes when a scenario that visits the route renders the modal; stills are listed after route stills', async () => {
+  it('the render check passes when a scenario that visits the route renders the modal; the touched scenario is the headline, the route only smoke-checked', async () => {
     h = await createHarness();
     await h.start();
     const file = h.writeSidecar('modal', MODAL_SIDECAR);
@@ -195,15 +195,15 @@ describe('finish with sidecars', () => {
     const result = await h.finish();
     expect(result.failures).toEqual([]);
     expect(result.ok).toBe(true);
-    // Route stills first, then sidecar stills, labeled with the scenario and the still.
-    expect(result.routes.map((r) => r.via)).toEqual(['screen', 'sidecar']);
+    // The modal is not the route's page: the touched scenario shows it, and the route is an impact route without a still.
+    expect(result.routes.map((r) => [r.via, r.role])).toEqual([['sidecar', 'headline'], ['screen', 'impact']]);
+    expect(result.impact).toMatchObject({ total: 1, clean: 1 });
     expect(result.notes).toContain(`${MODAL_FILE} rendered in sidecar ${file} still modal-open`);
     const block = fs.readFileSync(result.proofBlockPath, 'utf8');
     const short = result.treeHash!.slice(0, 8);
-    const routeAt = block.indexOf(`alt="${INTERACT}"`);
-    const sidecarAt = block.indexOf('alt="sidecar modal / modal-open"');
-    expect(routeAt).toBeGreaterThan(-1);
-    expect(sidecarAt).toBeGreaterThan(routeAt);
+    expect(block).not.toContain(`alt="${INTERACT}"`);
+    expect(block).toContain('alt="sidecar modal / modal-open"');
+    expect(block).toContain('**Impact smoke** · 1 other route reaches the change · 1 clean');
     expect(block).toContain(`\`sidecar modal / modal-open\` · clean · tree ${short} · ${file}`);
     const artifact = path.join(h.dirs.artifactDir, `sidecar-modal-modal-open-${short}.png`);
     expect(block).toContain(`<img src="${artifact}"`);

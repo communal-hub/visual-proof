@@ -22,7 +22,7 @@ const graph = (entries: Record<string, string[]>): ImportGraph => ({
   routes: [...new Set(Object.values(entries).flat())].map((p) => ({
     path: p,
     routeFile: 'src/router.js',
-    component: null,
+    component: Object.keys(entries).find((file) => file.startsWith('src/pages/') && entries[file]!.includes(p)) ?? null,
     layouts: [],
     dynamic: false,
   })),

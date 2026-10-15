@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-/** Most characters of diff sent to the text model (it has a 32k-token window and is weak at long inputs). */
+/** Most characters of diff sent to the model (it has a 32k-token window and is weak at long inputs). */
 export const DIFF_LIMIT = 6000;
 
 /** SHA-1 of the working-tree content of a repo-relative file, or null when it cannot be read (deleted). */

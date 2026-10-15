@@ -9,7 +9,7 @@ import type { DecisionRuntime } from './runtime.js';
 export const WATCH_PRUNE_BUDGET_MS = 5000;
 
 /**
- * Watch's hook into route pruning: drop the routes of a high fan-out file the text model says the change cannot
+ * Watch's hook into route pruning: drop the routes of a high fan-out file the model says the change cannot
  * reach. The decision is cached in the status dir, so `finish` expects exactly the routes that were captured.
  * Any failure keeps every route.
  */
