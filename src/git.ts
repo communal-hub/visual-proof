@@ -127,7 +127,8 @@ export async function isAncestorOfHead(repoDir: string, ancestor: string): Promi
  *
  * An empty `base...HEAD` is not trusted (working directly on the base branch makes it empty even
  * though commits were made), hence 2 and 3. A single-commit window is a guess, but it is the only
- * commit we can assume belongs to this task.
+ * commit we can assume belongs to this task. On a named branch other than the base, an empty
+ * `base...HEAD` is trusted: the branch has no commits of its own yet (v0.13).
  */
 export async function changeSet(repoDir: string, baseRef: string, options: ChangeOptions = {}): Promise<ChangeSet> {
   const prefix = await showPrefix(repoDir);
@@ -161,6 +162,26 @@ export async function treeDiff(repoDir: string, fromTree: string, toTree: string
   if (!result.ok) return null;
   const prefix = await showPrefix(repoDir);
   return splitNul(result.stdout).flatMap((file) => relativeTo(prefix, file));
+}
+
+/**
+ * Blob id of every file in a tree object, keyed by path relative to `repoDir` (POSIX). Empty when git cannot read
+ * the tree. The watcher uses it as the content baseline that tells a real change from a touch.
+ */
+export async function treeBlobs(repoDir: string, tree: string): Promise<Map<string, string>> {
+  const blobs = new Map<string, string>();
+  if (!/^[0-9a-f]{40,64}$/.test(tree)) return blobs;
+  const result = await git(repoDir, ['ls-tree', '-r', '-z', '--full-tree', tree], {}, true);
+  if (!result.ok) return blobs;
+  const prefix = await showPrefix(repoDir);
+  for (const entry of splitNul(result.stdout)) {
+    // `<mode> blob <id>\t<path>`
+    const tab = entry.indexOf('\t');
+    const [, type, id] = entry.slice(0, tab).split(' ');
+    if (type !== 'blob' || !id) continue;
+    for (const file of relativeTo(prefix, entry.slice(tab + 1))) blobs.set(file, id);
+  }
+  return blobs;
 }
 
 /** A file's content at HEAD (`repoDir`-relative path), or null when HEAD does not have it. */
@@ -200,6 +221,10 @@ async function committedChanges(
       const files = splitNul((await git(repoDir, ['diff', '--name-only', '-z', ref, 'HEAD'], {}, true)).stdout);
       if (files.length > 0) return { files, range: `${ref}..HEAD` };
     }
+    // v0.13: on a branch of its own that has no commits past the base yet, there is nothing committed to look at (the
+    // parent commit belongs to the base branch, not to this task).
+    const branch = await currentBranch(repoDir);
+    if (branch !== null && branch !== '(detached)' && branch !== baseRef && branch !== ref) return { files: [], range: `${ref}...HEAD` };
     break; // the base resolved but gave nothing: do not trust the emptiness, look at the anchor / parent
   }
   if (anchor && (await refExists(repoDir, anchor))) {

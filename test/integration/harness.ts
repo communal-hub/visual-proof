@@ -73,6 +73,8 @@ export interface HarnessOptions {
   config?: Record<string, unknown>;
   /** Give the dev server its own empty dependency cache, so its first page load really is a cold start. */
   freshViteCache?: boolean;
+  /** Change the fixture copy before its first commit (so the change is on `main`, not part of the work). */
+  prepare?: (dir: string) => void;
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -84,6 +86,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
   fs.mkdirSync(artifactDir);
 
   copyFixture(dir);
+  options.prepare?.(dir);
   git(dir, 'init', '-q', '-b', 'main');
   git(dir, 'config', 'user.name', 'Harness');
   git(dir, 'config', 'user.email', 'harness@example.test');

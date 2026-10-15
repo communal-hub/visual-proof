@@ -5,7 +5,7 @@ warm, re-captures the affected screens of a Vite dev app every time you save, an
 `finish` turns the result into a proof block (headline stills plus a markdown summary)
 for HEAD. It fails loudly when a changed screen has no clean frame at HEAD.
 
-Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) the v0.9 motion replay (sidecar scenarios recorded as they run) the v0.11 focus and before/after work (claim-driven headlines, impact smoke, merge-base stills, one model for every decision) and the v0.12 run-friction fixes (an impact cap before the claim exists, claim screens captured when the claim is written, frames kept through unrelated mid-capture changes, a quiet `finish --hook` while capture runs). Vite apps only; Chromium only.
+Status: A1 (capture core), the v0.3 capture-quality work, the v0.4 robustness and latency work (list-endpoint params, flake controls, tunable settle) the v0.6 model decisions (A4: image check, route pruning, claim verdict, captions, via OpenRouter) the v0.7 interaction work (sidecar scenarios, replay video) the v0.8 dynamic route params (session params, link discovery) the v0.9 motion replay (sidecar scenarios recorded as they run) the v0.11 focus and before/after work (claim-driven headlines, impact smoke, merge-base stills, one model for every decision) the v0.12 run-friction fixes (an impact cap before the claim exists, claim screens captured when the claim is written, frames kept through unrelated mid-capture changes, a quiet `finish --hook` while capture runs) and the v0.13 claim-first work (claim screens captured and reported before impact routes, `ready --claim`, a separate `finishWaitMs`, saves that change nothing ignored, `backendScope`, `sidecar try`, `before --claim`, `classify`, impact routes captured side by side). Vite apps only; Chromium only.
 
 ## Install
 
@@ -64,7 +64,8 @@ Only `appUrl` is required.
 | `replay` | `{ "enabled": true, "maxFrames": 60, "secondsPerFrame": 1.2, "maxHeight": 1600, "motion": true }` | the replay video `finish` builds when ffmpeg is on PATH; `motion` records sidecar scenarios as clips for it; see "Replay video" |
 | `screenGlobs` | `src/**/*.vue` | files whose changes trigger a capture |
 | `ignoreScreenGlobs` | `[]` | files that match `screenGlobs` but are not screens |
-| `backendGlobs` | `[]` | backend files; a change re-captures routes already captured this session (as does a screen file with no route) |
+| `backendGlobs` | `[]` | backend files; a change re-captures routes already captured this session (as does a screen file with no route); see `backendScope` |
+| `backendScope` | `"session"` | `session` or `claim`: what a backend change re-captures. `claim` re-captures the claim screens (and the batch's own routes) instead of every route of the session; see "Claim first" |
 | `login` | `{ "type": "none" }` | `http-hook`: `url`, `email`, `tokenHeader`, `tokenFile` |
 | `appRoot` | `#app` | element that must have children, else the frame is `blank` |
 | `spinnerSelectors` | `[".spinner", "[aria-busy=true]"]` | a visible match marks the frame `loading` |
@@ -81,10 +82,11 @@ Only `appUrl` is required.
 | `blockHosts` | analytics and trackers, see below | hostname globs whose requests are aborted before navigation (replaces the default list; `[]` blocks nothing) |
 | `allowHosts` | `[]` | hostname globs exempt from `blockHosts` |
 | `maxFrames` | `200` | oldest frames are evicted beyond this |
-| `finishBudgetMs` | `25000` | how long `finish` waits for in-flight captures |
+| `finishBudgetMs` | `25000` | time `finish` has for its own work: reading frames, model decisions, the replay video. Waiting for the watcher is not counted (v0.13) |
+| `finishWaitMs` | `150000` | how long `finish` waits for the watcher to capture the headlines (impact routes are never waited for). With the default budget, `finish` stays under a 280 s agent shell limit |
 | `baseRef` | `main` | branch that `finish` diffs against |
 | `decisions` | see "Model decisions" | OpenRouter-backed checks at bounded decision points: `enabled`, `model`, `triage`, `prune`, `verdict`, `captions`, `budgetMs` |
-| `focus` | `{ "mode": "claim", "maxImpact": 40 }` | which routes get stills (headlines) and which are only smoke-checked (impact); see "Focus: headlines and impact" |
+| `focus` | `{ "mode": "claim", "maxImpact": 40, "impactConcurrency": 2 }` | which routes get stills (headlines) and which are only smoke-checked (impact); `impactConcurrency` (1 to 4) impact routes are captured side by side; see "Focus: headlines and impact" and "Claim first" |
 | `before` | `{ "mode": "warn", "links": ["node_modules", ".env"] }` | before/after pairs from the merge-base frontend: `mode` (`require`, `warn`, `off`), `links`, `viteConfig`, `startTimeoutMs`; see "Before / after" |
 | `claimFile` | `<statusDir>/claim.md` | the claim the change should prove (bullet or numbered lines are criteria); relative to the config dir |
 
@@ -312,11 +314,32 @@ bounded (60 s), so a scenario never hangs.
 `invalid selector: ...`, `navigation failed: ...`, `cannot fill <route key>: ... (add routeParams)`,
 `unknown role "..."` and `scenario exceeded 60 s`.
 
-**When the watcher replays a scenario:** when its file changes; when a batch touches a screen file that renders
-one of its `goto` routes (through the import graph, as for route stills); and, on a backend change or a screen
-file with no route, when it has run this session. It goes through the same serialized queue and the same
-tree-hash check as route captures. A scenario that does not parse is skipped with a `warning: sidecar ...` line
-in `watcher.log`.
+**When the watcher replays a scenario:** when its file changes (that scenario only: a sidecar edit never makes a
+route frame stale); when a batch touches a screen file that renders one of its `goto` routes (through the import
+graph, as for route stills); and, on a backend change or a screen file with no route, when it has run this session
+(with `backendScope: "claim"`, only when the claim names one of its stills). It goes through the same serialized
+queue and the same tree-hash check as route captures. A scenario with a still the claim names runs right after the
+claim's routes, before any other capture (v0.13); a changed one runs with the other headlines; the rest after the
+impact routes. A scenario that does not parse is skipped with a `warning: sidecar ...` line in `watcher.log`.
+
+**Trying a scenario (v0.13).** `npx visual-proof sidecar try <file>` replays one scenario now, in a browser of its
+own against the running app: no watcher, no commit, no frame record. `goto` route keys are filled from session
+params, the seed file and `routeParams`, then from what the watcher filled before. It prints every step with its
+line and time, the stills (written to `<scratch>/try/<scenario>-<still>.png`) and a summary, and exits 1 when a
+step failed or a still is not clean (0 otherwise; `--json` prints the result):
+
+```
+sidecar .visual-proof/sidecars/refund.vp (refund) against http://localhost:5173
+  ok   line 2  goto /manage/invoices/:id (812 ms)
+  ok   line 3  click [data-test=invoice-refund] (264 ms)
+  FAIL line 4  wait [data-test=refund-modal] (5002 ms): selector not found
+  skip line 5  still refund-modal
+  still refund-modal (step failed): error (line 4 wait [data-test=refund-modal]: selector not found) -> /tmp/.../try/refund-failed.png
+failed at .visual-proof/sidecars/refund.vp:4 wait [data-test=refund-modal]: selector not found (2/4 steps passed, 7.1 s)
+```
+
+A file that does not parse is reported line by line without starting a browser. The file need not match the
+`sidecars` globs, so a scenario can be tried before it is put where the watcher sees it.
 
 **finish.** A sidecar file that exists at HEAD and was touched in the diff, or visits a route that is expected
 anyway, becomes expected: each of its stills needs a clean frame at HEAD's tree.
@@ -503,8 +526,8 @@ When nothing qualifies as a headline (no claim screen matched, no page changed, 
 headline as before, with a note saying to name the screens in the claim; when some of them have no frame, a hint
 says the same and gives the claim file's path. `focus.mode: "all"` turns focus off.
 
-The watcher follows the same split: claim screens and changed pages are captured first, then at most
-`focus.maxImpact` (default 40) impact routes per batch; the rest are logged as not captured. Since v0.12 the cap
+The watcher follows the same split: claim screens are captured (and reported) first, then changed pages, then at
+most `focus.maxImpact` (default 40) impact routes per batch; the rest are logged as not captured. See "Claim first". Since v0.12 the cap
 holds before the claim exists too (agents often write it after their first save, and a shared component could
 otherwise queue hundreds of routes): only changed pages are headlines then, and the watcher logs once
 `focus: no claim screens yet (<claim path>); capturing changed pages first and at most N other routes`.
@@ -512,8 +535,79 @@ otherwise queue hundreds of routes): only changed pages are headlines then, and 
 The watcher also watches the claim file. When it names a screen it did not name before, the claim screens without a
 clean frame at the current tree are captured (trigger `claim`): a route key (`/facilities/:id`, filled through the
 params chain), a concrete path (`/facilities/3`) or a `sidecar <name> / <still>` line, whose scenario is replayed.
-Screens that already have a clean frame are not captured again, and an edit that names no new screen captures
-nothing.
+Screens that already have a clean frame (at the current tree, or an earlier one nothing changed since can reach) are
+not captured again, and an edit that names no new screen captures nothing.
+
+## Claim first (v0.13)
+
+Agents waited on captures that decided nothing: a shared component reaches hundreds of routes, the watcher captured
+the whole batch, and `ready` and `finish` waited for all of it. Since v0.13 the claim screens go first and are
+reported as soon as they are captured.
+
+**Order.** A batch is captured in rounds. The claim screens (routes the claim names, then the sidecar scenarios with
+a still the claim names) are the first round; the watcher hashes the tree, records them and updates
+`status.json` before anything else is captured. The second round is the other headlines (changed pages, `params set`
+routes, changed sidecars), then the impact routes and the scenarios replayed for them. Impact routes run
+`focus.impactConcurrency` at a time (default 2, at most 4) as pages of one browser context; claim screens and
+headlines run one at a time, and a scenario never runs next to another capture (`login <role>` switches the shared
+session).
+
+**Preemption.** The second round stops between captures as soon as new work is queued (a save, a claim that names a
+new screen, a claim request). What it did not start goes to the next batch, which captures its own claim screens
+first. Nothing is lost and nothing is captured twice; the log says
+`preempted: N capture(s) of this batch moved behind new work (claim screens first)`.
+
+**`ready --claim`** (also `status --wait --claim`) returns once every screen the claim names has a clean frame that
+stands at the current tree: one at that tree, or an earlier clean one that nothing changed since can reach (the
+rules `finish` carries frames by). Impact routes and later batches do not matter. It first writes
+`claim-request.json`, which makes the watcher look at the claim screens at once (capturing those without such a
+frame ahead of anything else), and it only trusts an answer given after that request, with no file event since, so
+a save made just before it is accounted for. It fails fast, with the reason on stderr, when the claim names no
+screens, a claim screen's frame is not clean, its params are unfilled, the freshness marker is missing, or the
+watcher is older than v0.13. On a timeout it says what is outstanding:
+
+```
+visual-proof status: not ready: not ready after 300 s: claim: 1/2 captured (/facilities/:id queued); impact: 31 queued (status: ..., log: ...)
+```
+
+Plain `ready` names the outstanding work the same way when it times out.
+
+**Claim status.** `status.json` has a `claim` object, kept current by the watcher:
+
+```json
+{
+  "claim": {
+    "file": "/tmp/cursor/visual-proof/claim.md",
+    "tree": "4be5…", "current": true, "ready": false, "total": 2, "captured": 1, "request": 1760530000000,
+    "screens": [
+      { "screen": "/facilities/:id", "kind": "route", "target": "/facilities/3", "state": "clean", "frameId": "f-41" },
+      { "screen": "sidecar booking / open", "kind": "sidecar", "target": ".visual-proof/sidecars/booking.vp", "state": "queued" },
+      { "screen": "Note", "kind": "unmatched", "state": "unmatched" }
+    ]
+  },
+  "remaining": { "claim": 1, "headline": 0, "impact": 31 }
+}
+```
+
+`state` is `clean`, `carried` (an earlier clean frame stands), `not-clean`, `queued`, `missing`, `unfilled` (a route
+key nothing fills) or `unmatched` (a claim line that names neither a route nor a sidecar still; not waited on).
+`current` turns false at the first file event after `tree` was hashed. `remaining` counts what is left of the batch
+being captured, by tier.
+
+**`finish`** waits only for the headlines, never for impact routes, and a headline whose earlier frame carries to
+HEAD is not waited for either. While it waits it writes a claim request, so the claim screens jump ahead of impact
+routes the watcher is busy with. The wait is bounded by `finishWaitMs` (default 150 s), and it does not eat
+`finishBudgetMs` (default 25 s), which is for `finish`'s own work: reading frames, decisions, the replay video. When
+the wait runs out, the failure names what was missing:
+`capture still in progress after 150.0 s (waiting for /facilities/3; claim: 0/1 captured; impact: 31 queued)`.
+`finish --hook` waits at most `finishBudgetMs`.
+
+**`backendScope: "claim"`.** A backend change re-captures every route and sidecar captured this session, because any
+page may show the data. With `"claim"` it re-captures the claim screens (forced, even when their frames look clean:
+a gitignored backend file does not change the tree) plus the routes of the batch itself. Until the claim names
+screens it behaves like `"session"`, and says so in the log. At `finish` the impact routes it skipped are listed as
+`not re-captured after the backend change (backendScope "claim")`, not as failures. Use it when `backendGlobs`
+includes generated or broad files (`lang/**`).
 
 ## Before / after (v0.11)
 
@@ -537,6 +631,16 @@ A headline without a before frame is a note (`before.mode: "warn"`, the default)
 `"off"` shows no before column. A before frame that shows an error is still shown: the screen may not have existed
 yet. Exit codes: 0 every headline captured, 1 one could not be, 3 setup (no merge-base, no Vite config).
 
+**Before the edits (v0.13).** `npx visual-proof before --claim` captures the screens the claim names (route lines,
+and the scenarios of `sidecar <name> / <still>` lines) instead of the headlines of the diff, so it works with an
+empty diff, before any commit. Write the claim, start it in the background, and code meanwhile: it is off the
+critical path. A screen that already has a before frame at the merge-base tree is not captured again (by `before
+--claim` or by `before`; the merge-base does not move with your commits), and when all of them have one no server is
+started (`before /a at merge-base 1a2b3c4d: clean (captured earlier)`). Sidecars are replayed as committed; an
+uncommitted one is skipped with a note, or replayed as it is on disk with `--working-tree-sidecars`. A claim line
+that names neither a route nor a sidecar still is noted. On a branch that has no commits of its own yet, `finish` and
+`before` no longer diff the base branch's last commit (`HEAD~1..HEAD`): an empty `main...HEAD` is trusted there.
+
 ## Commands
 
 ```sh
@@ -544,16 +648,47 @@ npx visual-proof doctor     # check browser, trigger, HMR barrier, login, routes
 npx visual-proof start      # start the watcher (reattaches if running); prints status JSON
 npx visual-proof status     # status JSON; a dead watcher is reported as stale
 npx visual-proof status --wait [--timeout <s>]   # block until ready (alias: npx visual-proof ready)
+npx visual-proof ready --claim [--timeout <s>]   # block until the claim screens are captured, not the impact routes
 npx visual-proof before     # capture the headlines with the frontend at the merge-base (before/after pairs)
+npx visual-proof before --claim [--working-tree-sidecars]   # the claim screens at the merge-base, before any edit
 npx visual-proof finish     # after committing: write the proof block, print its path
 npx visual-proof params set '<routeKey>' key=value ...   # use these route params now (captures at once); also: params list, params clear
+npx visual-proof sidecar try <file>   # replay one sidecar scenario now: each step's pass/fail, the stills, the time
+npx visual-proof classify [paths...]  # do these files (default: the branch's changes) need proof, and which screens
 npx visual-proof stop
 npx visual-proof watch      # run the watcher in the foreground
 ```
 
-Options: `--config <path>`, `--json` (finish, before, doctor, params list), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
-time-capped, always exits 0), `--wait` and `--timeout <s>` (status; params set). Run
-`npx visual-proof --help` for details.
+Options: `--config <path>`, `--json` (finish, before, doctor, params list, classify, sidecar try), `--normalize` (doctor --json), `--probe-decisions` (doctor), `--hook` (finish: quiet,
+time-capped, always exits 0), `--wait` and `--timeout <s>` (status; params set), `--claim` (status --wait, ready,
+before), `--working-tree-sidecars` (before). Run `npx visual-proof --help` for details.
+
+A run that keeps proof off the critical path:
+
+```sh
+npx visual-proof start
+echo '- /facilities/:id: the booking calendar shows the new legend' > /tmp/cursor/visual-proof/claim.md
+npx visual-proof before --claim &       # the claim screens at the merge-base, while you code
+# ... edit, save ...
+npx visual-proof ready --claim          # seconds after the save, whatever the impact routes are doing
+git commit -am '...' && npx visual-proof finish
+```
+
+**`classify`** says whether files need visual proof, by the rules the watcher and `finish` use (`screenGlobs` minus
+`ignoreScreenGlobs`, `backendGlobs`, `sidecars`), and which screens each one reaches through the import graph (route
+keys; `sidecar <name> / <still>` for a scenario file). Without paths it classifies the files changed on the branch,
+as `finish` would diff them. A PR gate can use it instead of keeping its own copy of the rules:
+
+```
+$ npx visual-proof classify src/components/FormDatePickerBase.vue lang/en-CA.json docs/notes.md
+src/components/FormDatePickerBase.vue  screen         -> /bookings, /bookings/:id, /events, /events/:id, /facilities, /facilities/:id (+236 more)
+lang/en-CA.json                        backend        -> any page (the routes captured this session)
+docs/notes.md                          none
+needs proof: yes (1 screen, 1 backend, 0 sidecar file(s); 242 screen(s) reached)
+```
+
+`--json` prints `{ needsProof, files: [{ path, kinds, screens, unmapped }], screens, backend, range }`; a screen file
+no route renders has `unmapped: true` (`finish` fails on it). It always exits 0 (3 on a bad config).
 
 `finish --hook` is meant for a pre-push hook, which runs seconds after the commit, often while the watcher is still
 capturing it. When the watcher is capturing or has a batch pending (or the budget ran out waiting for it), the hook
@@ -572,13 +707,14 @@ becomes `Chromium <version>`. Check the output into your repo as a golden file a
 `starting`, `warmup.state: "running"`). To block until the first capture can be trusted, run
 `status --wait` (or `ready`): it exits 0 when the state is `ready` with `pending: false`, and 1
 with a one-line reason on stderr (plus the `status.json` and `watcher.log` paths) when the state is
-`error`, the watcher died or was stopped, or `--timeout` (default 300 s) passed. stdout is always
-the status JSON.
+`error`, the watcher died or was stopped, or `--timeout` (default 300 s) passed; on a timeout the
+reason says what is still queued. stdout is always the status JSON. To wait for the claim screens
+only, use `ready --claim` (see "Claim first").
 
 | Exit | Meaning |
 | --- | --- |
 | 0 | ok (`finish`: every changed screen has a clean frame at HEAD, or none changed) |
-| 1 | `finish`: proof failures; `params set`: the capture was not clean or not confirmed; `doctor`: browser or trigger missing; `status --wait` / `ready`: not ready |
+| 1 | `finish`: proof failures; `params set`: the capture was not clean or not confirmed; `doctor`: browser or trigger missing; `status --wait` / `ready`: not ready; `sidecar try`: a step failed or a still is not clean |
 | 2 | usage error |
 | 3 | setup or config error (invalid config, not a git repo, watcher cannot start) |
 | 4 | internal error |
@@ -614,11 +750,24 @@ the log says `kept N frame(s), discarded M: <why>; stale: /a (src/pages/A.vue)`.
 import graph, git cannot compare the trees, a trigger that only counts events) the whole batch is discarded and
 re-queued as before. Either way a batch is re-queued at most twice (`giving up after repeated changes`).
 
+**Saves that change nothing (v0.13).** The watcher compares content, not events. It knows every watched file's git
+blob id from the tree it started at, and remembers the content of each file at its last event; a write that leaves
+a file as it was (a `touch`, an amend or a pre-commit hook that rewrites the same bytes, regenerating
+`lang/en-CA.json` to what it already held) is not an event at all: it starts no batch, makes no frame stale, and is
+logged as `ignored: lang/en-CA.json written with the same content (nothing to capture)`. A file the starting tree
+does not have (a gitignored one) counts on its first event and is remembered from then on. Files over 16 MB are not
+hashed and always count.
+
+**Sidecar edits (v0.13).** A sidecar file only ever makes its own run stale: a change during a capture that touched
+only sidecar files keeps every route frame even when there is no import graph, and a sidecar edit (or amend) replays
+that scenario and nothing else.
+
 ## Files written
 
 In the status dir:
 
-- `daemon.pid`, `status.json` (state, warm-up, pending work, `queue` (routes and scenarios in the batch being captured), anchor, last error, last finish)
+- `daemon.pid`, `status.json` (state, warm-up, pending work, `queue` (routes and scenarios in the batch being captured), `remaining` (what is left of it, by tier), `claim` (claim readiness per claim screen), `repoDir`, anchor, last error, last finish)
+- `claim-request.json` (written by `ready --claim` and `finish`: capture the claim screens first)
 - `anchors.json` (the diff anchor per repo root and branch; survives daemon restarts, entries expire after 24 h)
 - `watcher.log` (one line per event)
 - `doctor.json` (last doctor report)
@@ -626,6 +775,7 @@ In the status dir:
 - `decisions-cache.json` (route pruning decisions per file content, shared by the watcher and `finish`)
 - `proof-block.md` (written by `finish` on every outcome)
 - `scratch/index.jsonl` (one frame record per line, with `timing`) and `scratch/frames/<id>.png`
+- `scratch/try/<scenario>-<still>.png` (the stills of the last `sidecar try` of each scenario)
 
 Headline stills are copied to the artifact dir as `<route-slug>-<shortTree>.png` (sidecar stills as
 `sidecar-<scenario>-<still>-<shortTree>.png`), and the replay video as `replay-<shortTree>.mp4`.

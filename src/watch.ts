@@ -6,14 +6,16 @@ import picomatch from 'picomatch';
 import { Browser, type Capturer, type CaptureSignals, type CaptureTiming, type ScenarioPlan } from './browser.js';
 import type { Config } from './config.js';
 import { resolveAnchor } from './anchor.js';
-import { headCommit, treeDiff, workingTreeHash } from './git.js';
-import { staleCheck } from './carry.js';
+import { headCommit, treeBlobs, treeDiff, workingTreeHash } from './git.js';
+import { staleCheck, type FrameDependencies } from './carry.js';
+import { readClaimRequest, screenReady, type ClaimScreenState, type ClaimScreenStatus, type ClaimStatus } from './claim-status.js';
 import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { ParamSourceResolver, type SourceOutcome } from './resolve/param-sources.js';
 import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
 import {
+  FAILED_STILL,
   findSidecarFiles,
   formatSidecarError,
   gotoRouteKeys,
@@ -84,6 +86,8 @@ export interface WatchOptions {
   watchSession?: typeof watchSessionParams;
   /** v0.12: replaces the watcher on the claim file (tests). */
   watchClaim?: typeof watchFile;
+  /** v0.13: replaces the watcher on `claim-request.json` (tests). */
+  watchClaimRequest?: typeof watchFile;
 }
 
 export interface FrameEvent {
@@ -125,6 +129,8 @@ interface Pending {
   retrySidecars: Map<string, Trigger>;
   /** v0.12: changed screen files behind a retry; the retry waits on the HMR barrier for them. */
   retryWait: Set<string>;
+  /** v0.13: the `claim-request.json` rev this batch answers; acknowledged in `claim.request` once the claim screens are checked. */
+  requestRev?: number;
   startedAt: number;
   attempts: number;
 }
@@ -139,7 +145,38 @@ interface Target {
   paramsFrom?: ParamsFrom;
   foundOn?: string;
   discoveryMs?: number;
+  /** v0.13: where the capture goes in the batch; a re-queued target keeps it. */
+  tier?: Tier;
 }
+
+/** Where a capture goes in a batch (v0.13): claim screens first, then the other headlines, then impact routes. */
+type Tier = 'claim' | 'headline' | 'impact';
+
+/** One capture of a batch: a route, or a sidecar scenario run. */
+type Job = { tier: Tier; route: Target } | { tier: Tier; scenario: ScenarioJob };
+
+function jobKey(job: Job): string {
+  return 'route' in job ? job.route.path : `sidecar:${job.scenario.sidecar.file}`;
+}
+
+function isImpactRoute(job: Job): boolean {
+  return job.tier === 'impact' && 'route' in job;
+}
+
+/** Run `fn` over `items`, `size` at a time, starting no new item once `halt` says so; returns the items not started. */
+async function runPool<T>(items: T[], size: number, fn: (item: T) => Promise<void>, halt: () => boolean): Promise<T[]> {
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length && !halt()) await fn(items[next++]!);
+  };
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, worker));
+  return items.slice(next);
+}
+
+/** What one round of a batch came to; `unknown` when the frames could not be checked against a change during it. */
+type RoundOutcome =
+  | { unknown: string; routes: string[] }
+  | { after: string; eventsAfter: number; kept: string[]; dropped: string[]; captureFailed: boolean; requeued: boolean; preempted: boolean };
 
 /** A sidecar scenario chosen to run in a batch. */
 interface ScenarioJob {
@@ -166,6 +203,17 @@ interface Captured {
 }
 
 const STALE_MESSAGE = 'stale: freshness marker missing, capture refused';
+
+/** A claim request this recent when the watcher starts was made for it (while it was starting). */
+const RECENT_REQUEST_MS = 120_000;
+
+/** Worst first when several sidecar stills stand for one claim screen. */
+const STATE_RANK: Record<ClaimScreenState, number> = { clean: 0, carried: 1, unmatched: 2, queued: 3, missing: 4, 'not-clean': 5, unfilled: 6 };
+
+function frameNumber(id: string): number {
+  const n = Number(id.slice(2));
+  return Number.isFinite(n) ? n : 0;
+}
 
 /** Which tier filled a route's params (v0.8); empty for a route without params. */
 interface Provenance {
@@ -208,6 +256,19 @@ class Watcher {
   private claimSeen = new Set<string>();
   /** Whether "no claim screens yet" was logged since the claim last named one. */
   private noClaimNoted = false;
+  // v0.13 claim readiness
+  private requestWatch: SessionWatchHandle | null = null;
+  /** Highest claim request merged into a batch, so a rewrite of the same request is not queued twice. */
+  private requestSeen = 0;
+  /** Routes (by path) and sidecars (`sidecar:<file>`) of the running batch not captured yet. */
+  private jobsLeft = new Set<string>();
+  /** The last tree hashed and the event count read before it, for refreshing the claim status between batches. */
+  private lastTree: { tree: string; events: number } | null = null;
+  /** Files whose events were dropped for an unchanged content, logged together. */
+  private unchangedFiles = new Set<string>();
+  private unchangedTimer: NodeJS.Timeout | null = null;
+  /** Bumped by every claim-status refresh; a slower, older one must not overwrite a newer answer. */
+  private claimSeq = 0;
 
   private capturer: Capturer | null = null;
   private barrier: BarrierSource | null = null;
@@ -269,6 +330,7 @@ class Watcher {
       pendingSince: null,
       lastError: null,
       frames: 0,
+      repoDir: config.repoDir,
     };
     this.handle = { sessionId: this.sessionId, events: this.events, stop: () => this.stop() };
   }
@@ -282,7 +344,8 @@ class Watcher {
 
     try {
       const treeHash = this.opts.treeHash ?? workingTreeHash;
-      await treeHash(this.config.repoDir, this.dirs.scratchDir); // fail fast outside a git repo
+      const startTree = await treeHash(this.config.repoDir, this.dirs.scratchDir); // fail fast outside a git repo
+      this.lastTree = { tree: startTree, events: 0 };
       await this.resolveAnchor();
 
       await this.startBarrier();
@@ -306,6 +369,9 @@ class Watcher {
         sidecarGlobs: this.config.sidecars,
         ignorePaths: [this.dirs.statusDir, this.dirs.scratchDir, this.dirs.artifactDir],
         debounceMs: this.opts.debounceMs,
+        // v0.13: what every file held at start, so a save that writes the same bytes is not a change.
+        baseline: await treeBlobs(this.config.repoDir, startTree).catch(() => new Map<string, string>()),
+        onUnchanged: (file) => this.onUnchanged(file),
         onEvent: () => this.onFileEvent(),
         onBatch: (batch) => this.enqueue(batch),
         onError: (err) => this.fail(err),
@@ -313,6 +379,7 @@ class Watcher {
 
       await this.startSessionWatch();
       await this.startClaimWatch();
+      await this.startRequestWatch();
 
       await this.warmUp().catch((err: Error) => {
         // Never fatal: the watcher works without a warm Vite, only its first capture is slower.
@@ -332,6 +399,8 @@ class Watcher {
     this.writeStatus();
     this.log(`ready (trigger=fs-watch, barrier=${this.status.barrier})`);
     this.endWarmup();
+    this.onClaimRequest(); // one made while starting
+    void this.refreshClaimIdle();
   }
 
   private async resolveAnchor(): Promise<void> {
@@ -491,6 +560,8 @@ class Watcher {
     await this.trigger?.stop().catch(() => {});
     await this.sessionWatch?.stop().catch(() => {});
     await this.claimWatch?.stop().catch(() => {});
+    await this.requestWatch?.stop().catch(() => {});
+    if (this.unchangedTimer) clearTimeout(this.unchangedTimer);
     await this.barrier?.stop().catch(() => {});
     await this.capturer?.close().catch(() => {});
   }
@@ -524,7 +595,22 @@ class Watcher {
     if (this.stopping) return;
     this.status.lastEventAt = new Date().toISOString();
     this.debouncing = true;
-    if (this.refreshPending()) this.writeStatus();
+    const claimWasCurrent = this.status.claim?.current === true;
+    if (this.status.claim) this.status.claim.current = false; // the claim screens must be looked at again
+    if (this.refreshPending() || claimWasCurrent) this.writeStatus();
+  }
+
+  /** A save that left the file as it was: logged (a burst together), never captured. */
+  private onUnchanged(file: string): void {
+    if (this.stopping) return;
+    this.unchangedFiles.add(file);
+    this.unchangedTimer ??= setTimeout(() => {
+      this.unchangedTimer = null;
+      const files = [...this.unchangedFiles].sort();
+      this.unchangedFiles.clear();
+      const listed = files.length > 5 ? `${files.slice(0, 5).join(', ')} and ${files.length - 5} more` : files.join(', ');
+      this.log(`ignored: ${listed} written with the same content (nothing to capture)`);
+    }, 500);
   }
 
   /** Recompute `pending` / `pendingSince` from the queue; true when `pending` flipped. */
@@ -555,6 +641,7 @@ class Watcher {
     params?: Iterable<string>;
     paramsRev?: number;
     claim?: boolean;
+    requestRev?: number;
     retry?: Map<string, Target>;
     retrySidecars?: Map<string, Trigger>;
     retryWait?: Iterable<string>;
@@ -582,6 +669,7 @@ class Watcher {
     for (const [f, t] of part.retrySidecars ?? []) if (!pending.retrySidecars.has(f)) pending.retrySidecars.set(f, t);
     for (const f of part.retryWait ?? []) pending.retryWait.add(f);
     if (part.paramsRev !== undefined) pending.paramsRev = Math.max(pending.paramsRev ?? 0, part.paramsRev);
+    if (part.requestRev !== undefined) pending.requestRev = Math.max(pending.requestRev ?? 0, part.requestRev);
     pending.startedAt = Math.min(pending.startedAt, part.startedAt);
     pending.attempts = Math.max(pending.attempts, part.attempts);
   }
@@ -616,6 +704,7 @@ class Watcher {
     if (marker && !fs.existsSync(path.resolve(this.config.repoDir, marker))) {
       this.log(STALE_MESSAGE);
       this.status.lastError = STALE_MESSAGE; // so `finish` can say why there is no frame
+      this.claimRefused(batch, STALE_MESSAGE);
       this.writeStatus();
       this.events.emit('refused', { reason: STALE_MESSAGE, marker, screen, backend });
       this.ackSessionParams(batch);
@@ -638,9 +727,13 @@ class Watcher {
       beforeP.catch(() => {});
 
       const params = this.readRouteParams();
+      // v0.13: the claim decides what is captured first; read once so the whole batch agrees.
+      const claims = this.claimScreens();
       const targets = new Map<string, Target>();
       // Routes captured earlier this session are re-captured when the change cannot be traced to a route.
       let recapture: { trigger: Trigger; why: string; sourceFile: string } | null = null;
+      // v0.13 backendScope "claim": a backend change re-captures the claim screens, not every route of the session.
+      let backendClaim = false;
       // The data behind the list endpoints may have changed (a re-seed): look the ids up again.
       if (backend.length > 0) {
         this.paramSources.invalidate();
@@ -666,7 +759,13 @@ class Watcher {
       }
       if (backend.length > 0) {
         if (screen.length === 0) this.log(`batch backend=${backend.join(',')}`);
-        recapture = { trigger: 'backend', why: 'backend change', sourceFile: backend[0]! };
+        if (this.config.backendScope === 'claim' && claims.size > 0) {
+          backendClaim = true;
+          this.log(`backend change: backendScope "claim", re-capturing the claim screens, not the ${this.sessionRoutes.size} route(s) captured this session`);
+        } else {
+          if (this.config.backendScope === 'claim') this.log('backend change: backendScope "claim", but the claim names no screens yet, so every route captured this session is re-captured');
+          recapture = { trigger: 'backend', why: 'backend change', sourceFile: backend[0]! };
+        }
       }
       // v0.8: `visual-proof params set` routes are captured at the current tree whatever else changed.
       if (paramKeys.length > 0) this.addSessionTargets(paramKeys, targets);
@@ -688,7 +787,7 @@ class Watcher {
             provenance = { paramsFrom: outcome.from, foundOn: outcome.foundOn, discoveryMs: outcome.discoveryMs };
           }
           if (!targets.has(routePath)) {
-            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: recapture.trigger, sourceFile: recapture.sourceFile, ...provenance });
+            targets.set(routePath, { path: routePath, routeKey: route.routeKey, url, trigger: recapture.trigger, sourceFile: recapture.sourceFile, tier: 'impact', ...provenance });
           }
         }
         if (this.sessionRoutes.size === 0) this.log(`${recapture.why}: no routes captured this session yet`);
@@ -696,8 +795,10 @@ class Watcher {
       }
       for (const [routePath, target] of batch.retry) if (!targets.has(routePath)) targets.set(routePath, target);
       const extraScenarios = new Map(batch.retrySidecars);
-      if (batch.claim) {
-        for (const [file, trigger] of await this.addClaimTargets(targets, params, await beforeP)) {
+      const before = await beforeP;
+      if (batch.claim || backendClaim) {
+        const force = backendClaim ? { trigger: 'backend' as const, sourceFile: backend[0]! } : undefined;
+        for (const [file, trigger] of await this.addClaimTargets(targets, params, before, force)) {
           if (!extraScenarios.has(file)) extraScenarios.set(file, trigger);
         }
       }
@@ -706,187 +807,335 @@ class Watcher {
 
       if (targets.size === 0 && scenarios.length === 0) {
         this.log('no routes to capture');
-        await beforeP.catch(() => {}); // the tree hash writes into the scratch dir; do not leave git running behind a finished batch
         done('no-routes');
+        await this.refreshClaim(before, eventsBefore, batch);
         return;
       }
 
-      const before = await beforeP;
       mark('resolve');
-      this.status.queue = targets.size + scenarios.length;
+      // v0.13: the claim screens (routes, then the sidecars with a claimed still) are a round of their own, recorded
+      // before anything else is captured, so `ready --claim` and `finish` need not wait for the impact routes.
+      const jobs = this.orderJobs(targets, scenarios, claims);
+      const rounds = [jobs.filter((j) => j.tier === 'claim'), jobs.filter((j) => j.tier !== 'claim')].filter((r) => r.length > 0);
+      this.status.queue = jobs.length;
+      this.status.remaining = { claim: 0, headline: 0, impact: 0 };
+      for (const job of jobs) this.status.remaining[job.tier]++;
+      this.jobsLeft = new Set(jobs.map(jobKey));
       this.writeStatus();
-      const captureStart = Date.now();
-      const captured: Captured[] = [];
+      if (rounds[0]![0]!.tier !== 'claim') await this.refreshClaim(before, eventsBefore, batch);
+
+      let tree = before;
+      let events = eventsBefore;
+      const kept: string[] = [];
+      const dropped: string[] = [];
       let captureFailed = false;
-      for (const target of targets.values()) {
-        if (this.stopping) return;
-        try {
-          const result = await this.capturer!.capture(target.url);
-          captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null, timing: result.timing, pageText: result.pageText });
-        } catch (err) {
-          captureFailed = true;
-          this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
-        }
-      }
-
-      const ranScenarios: string[] = [];
-      for (const job of scenarios) {
-        if (this.stopping) return;
-        const file = job.sidecar.file;
-        if (!this.capturer!.runScenario) {
-          this.log(`sidecar ${file} skipped: this capturer cannot run scenarios`);
-          continue;
-        }
-        const recording = (await this.motionEnabled()) ? this.timeline.newClip() : undefined;
-        const plan: ScenarioPlan = recording ? { ...job.plan, record: { dir: recording.dir, holdMs: Math.round(this.config.replay.secondsPerFrame * 1000) } } : job.plan;
-        try {
-          const result = await this.capturer!.runScenario(plan);
-          const clip = recording && result.clip ? recording.clip : undefined;
-          if (recording && !clip) this.timeline.dropClip(recording.clip);
-          for (const still of result.stills) {
-            const route = sidecarRoute(file, still.name);
-            captured.push({
-              target: { path: route, routeKey: route, url: '', trigger: job.trigger, sourceFile: file },
-              at: still.at,
-              png: still.png,
-              signals: still.signals,
-              renderedFiles: still.renderedFiles,
-              timing: still.timing,
-              pageText: still.pageText,
-              steps: still.steps,
-              clip,
-              job,
-            });
-          }
-          ranScenarios.push(file);
-          this.log(
-            `sidecar ${file}: ${result.stills.filter((x) => !x.failed).length} still(s) in ${result.ms} ms` +
-              (result.clip ? `; clip of ${result.clip.seconds} s (${result.clip.frames} frames)` : '') +
-              (result.failure ? `; failed at line ${result.failure.line} ${result.failure.text}: ${result.failure.reason}` : ''),
-          );
-        } catch (err) {
-          if (recording) this.timeline.dropClip(recording.clip);
-          captureFailed = true;
-          this.fail(new Error(`sidecar ${file} failed: ${(err as Error).message}`));
-        }
-      }
-
-      mark('captures');
-      const after = await treeHash(this.config.repoDir, this.dirs.scratchDir);
-      mark('hash');
-      if (this.stopping) return;
-      const eventsDuring = (this.trigger?.eventCount() ?? 0) - eventsBefore;
-      let keep = captured;
-      const droppedRuns = new Set<string>();
-      let keptRoutes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
-      if (after !== before || eventsDuring > 0) {
-        const maxRequeues = this.opts.maxRequeues ?? 2;
-        const why =
-          after !== before
-            ? `working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})`
-            : `${eventsDuring} file event(s) arrived during capture (tree unchanged: ${after.slice(0, 8)})`;
-        const split = await this.splitMidCapture(captured, { before, after, eventsBefore, eventsDuring });
-        if (this.stopping) return;
-        if ('unknown' in split) {
-          // Cannot tell which frames the change reaches: none of them can be trusted.
-          const requeue = batch.attempts < maxRequeues;
-          this.log(`discarded ${captured.length} frame(s): ${why}; ${split.unknown}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
-          for (const clip of new Set(captured.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
-          const routes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
-          this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
+      // Called by the batch's last round right after it records its frames, so the batch event follows them at once.
+      const close = (outcome: Extract<RoundOutcome, { after: string }>): void => {
+        kept.push(...outcome.kept);
+        dropped.push(...outcome.dropped);
+        captureFailed ||= outcome.captureFailed;
+        mark('write');
+        if (!captureFailed && kept.length > 0) this.status.lastError = null; // the last problem is resolved
+        this.log(`timing ${JSON.stringify(lap)} (ms since batch start; the debounce before it is not included)`);
+        if (kept.length === 0 && dropped.length > 0) done('discarded', dropped);
+        else done('captured', kept);
+      };
+      for (const [index, round] of rounds.entries()) {
+        const claimRound = round[0]!.tier === 'claim';
+        const last = index === rounds.length - 1;
+        const outcome = await this.captureRound(round, { batch, before: tree, eventsBefore: events, preemptible: !claimRound, mark, close: last ? close : undefined });
+        if (outcome === null) return; // stopping
+        if ('unknown' in outcome) {
+          // Cannot tell which frames the change reaches: none of this round can be trusted; the whole batch goes again.
+          const requeue = batch.attempts < (this.opts.maxRequeues ?? 2);
           if (requeue) {
             // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
-            this.merge({ screen, backend, sidecar, params: paramKeys, paramsRev: batch.paramsRev, claim: batch.claim, retry: batch.retry, retrySidecars: batch.retrySidecars, retryWait, startedAt: Date.now(), attempts: batch.attempts + 1 });
+            this.merge({ screen, backend, sidecar, params: paramKeys, paramsRev: batch.paramsRev, claim: batch.claim, requestRev: batch.requestRev, retry: batch.retry, retrySidecars: batch.retrySidecars, retryWait, startedAt: Date.now(), attempts: batch.attempts + 1 });
             requeued = true;
           }
-          done('discarded', routes);
+          done('discarded', [...dropped, ...outcome.routes]);
+          if (!requeue) await this.refreshClaim(tree, events, batch); // given up: still answer a claim request
           return;
         }
-        keep = split.kept;
-        keptRoutes = keep.map((c) => c.target.path);
-        if (split.dropped.length === 0) {
-          this.log(`kept ${keep.length} frame(s), discarded 0: ${why}, but nothing they show depends on ${split.files.join(', ') || 'it'}`);
-        } else {
-          const requeue = batch.attempts < maxRequeues;
-          const reasons = split.dropped.map((d) => `${d.label} (${d.why})`);
-          const listed = reasons.length > 5 ? [...reasons.slice(0, 5), `${reasons.length - 5} more`] : reasons;
-          this.log(
-            `kept ${keep.length} frame(s), discarded ${split.dropped.length}: ${why}; stale: ${listed.join(', ')}` +
-              (requeue ? '; re-queued' : '; giving up after repeated changes'),
-          );
-          const droppedEntries = split.dropped.flatMap((d) => d.entries);
-          for (const entry of droppedEntries) if (entry.job) droppedRuns.add(entry.job.sidecar.file);
-          for (const clip of new Set(droppedEntries.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
-          const routes = droppedEntries.map((c) => c.target.path);
-          this.events.emit('discarded', { routes, kept: keptRoutes, before, after, requeued: requeue, events: eventsDuring });
-          if (requeue) {
-            const retry = new Map<string, Target>();
-            const retrySidecars = new Map<string, Trigger>();
-            for (const entry of droppedEntries) {
-              if (entry.job) retrySidecars.set(entry.job.sidecar.file, entry.job.trigger);
-              else retry.set(entry.target.path, entry.target);
-            }
-            // Since the capture started, not before: the barrier must not credit a message for the save that began this batch.
-            this.merge({ screen: [], backend: [], sidecar: [], paramsRev: batch.paramsRev, retry, retrySidecars, retryWait: split.screenFiles, startedAt: captureStart, attempts: batch.attempts + 1 });
-            requeued = true;
-          }
-          if (keep.length === 0) {
-            done('discarded', routes);
-            return;
-          }
-        }
+        tree = outcome.after;
+        events = outcome.eventsAfter;
+        requeued ||= outcome.requeued;
+        if (last) break;
+        kept.push(...outcome.kept);
+        dropped.push(...outcome.dropped);
+        captureFailed ||= outcome.captureFailed;
+        // The claim round is recorded: say so now, before the rest of the batch is captured.
+        await this.refreshClaim(tree, events, batch);
       }
-
-      // A kept frame depends on nothing that differs between `before` and `after`, so it shows `after` as much as
-      // `before`; recording it at `after`, the current tree, lets `finish` match it at HEAD without carrying it.
-      for (const { target, at, png, signals, renderedFiles, timing, pageText, steps, clip } of keep) {
-        const verdict = triage(signals);
-        const frame = this.timeline.append(
-          {
-            sessionId: this.sessionId,
-            route: target.path,
-            routeKey: target.routeKey,
-            at,
-            treeHash: after,
-            trigger: target.trigger,
-            sourceFile: target.sourceFile,
-            status: verdict.status,
-            reasons: verdict.reasons,
-            renderedFiles,
-            ...(timing ? { timing: { ...timing, ...(target.discoveryMs !== undefined ? { discoveryMs: target.discoveryMs } : {}) } } : {}),
-            ...(steps ? { steps } : {}),
-            ...(clip ? { clip } : {}),
-            ...(target.paramsFrom ? { paramsFrom: target.paramsFrom } : {}),
-            ...(target.foundOn ? { paramsFoundOn: target.foundOn } : {}),
-          },
-          png,
-        );
-        // A4: the page text for the claim check lives next to the PNG, not in index.jsonl.
-        if (pageText !== undefined && this.config.decisions.verdict && this.config.decisions.enabled !== false) {
-          writeTextSidecar(this.timeline.pngPath(frame), pageText);
-        }
-        if (!steps) this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url, paramsFrom: target.paramsFrom, foundOn: target.foundOn });
-        this.status.frames++;
-        this.status.lastCaptureAt = at;
-        this.log(
-          `frame ${frame.id} ${frame.route} ${frame.status}${frame.reasons.length ? ` (${frame.reasons[0]})` : ''} tree=${after.slice(0, 8)}`,
-        );
-        this.events.emit('frame', { frame, signals, pngPath: this.timeline.pngPath(frame) } satisfies FrameEvent);
-      }
-      for (const file of ranScenarios) if (!droppedRuns.has(file)) this.sidecarsRun.add(file);
-      mark('write');
-      if (!captureFailed && keep.length > 0) this.status.lastError = null; // the last problem is resolved
-      this.log(`timing ${JSON.stringify(lap)} (ms since batch start; the debounce before it is not included)`);
-      done('captured', keptRoutes);
+      // The batch event went out with the last frames; the claim status follows.
+      await this.refreshClaim(tree, events, batch);
     } catch (err) {
       this.fail(err as Error);
       done('error');
     } finally {
       delete this.status.queue;
+      delete this.status.remaining;
+      this.jobsLeft = new Set();
       if (!requeued) this.ackSessionParams(batch);
       if (!this.stopping) this.setState('ready');
       if (this.graphStale && !this.stopping) this.refreshGraph();
     }
+  }
+
+  /**
+   * The captures of a batch in the order they run: claim screens (routes, then sidecars with a claimed still), then
+   * the other headlines (changed pages, `params set` routes, changed sidecars), then impact routes and the scenarios
+   * replayed for them.
+   */
+  private orderJobs(targets: Map<string, Target>, scenarios: ScenarioJob[], claims: Set<string>): Job[] {
+    const named = (labels: string[]): boolean => labels.some((label) => claims.has(normalizeScreen(label)));
+    const routeJobs: Job[] = [...targets.values()].map((target) => {
+      const tier: Tier = named([target.path, target.routeKey]) ? 'claim' : target.tier === 'impact' ? 'impact' : 'headline';
+      return { tier, route: { ...target, tier } };
+    });
+    const scenarioJobs: Job[] = scenarios.map((scenario) => {
+      const { file, name, stills } = scenario.sidecar;
+      const claimed = stills.some((still) => named(screenLabels({ route: '', routeKey: '', sourceFiles: [], via: 'sidecar', scenario: { file, name, still } })));
+      const tier: Tier = claimed ? 'claim' : scenario.trigger === 'sidecar' || scenario.trigger === 'claim' ? 'headline' : 'impact';
+      return { tier, scenario };
+    });
+    const order: Tier[] = ['claim', 'headline', 'impact'];
+    return order.flatMap((tier) => [...routeJobs.filter((j) => j.tier === tier), ...scenarioJobs.filter((j) => j.tier === tier)]);
+  }
+
+  /**
+   * Capture one round of a batch, then hash the tree and keep the frames the changes made meanwhile cannot reach. A
+   * preemptible round (everything after the claim screens) stops between captures once new work is queued (a save,
+   * a claim request) and hands what it did not start to the next batch, so claim screens never wait behind impact
+   * routes. Impact routes run `focus.impactConcurrency` at a time. Null when the watcher is stopping.
+   */
+  private async captureRound(
+    jobs: Job[],
+    ctx: {
+      batch: Pending;
+      before: string;
+      eventsBefore: number;
+      preemptible: boolean;
+      mark: (name: string) => void;
+      /** Set on the batch's last round: called right after the frames are recorded. */
+      close?: (outcome: Extract<RoundOutcome, { after: string }>) => void;
+    },
+  ): Promise<RoundOutcome | null> {
+    const treeHash = this.opts.treeHash ?? workingTreeHash;
+    const { before, eventsBefore, batch } = ctx;
+    const captureStart = Date.now();
+    const captured: Captured[] = [];
+    const attempted: string[] = [];
+    const ranScenarios: string[] = [];
+    let captureFailed = false;
+    let leftover: Job[] = [];
+    const halt = (): boolean => this.stopping || (ctx.preemptible && this.pending !== null);
+
+    const runRoute = async (target: Target): Promise<void> => {
+      attempted.push(target.path);
+      try {
+        const result = await this.capturer!.capture(target.url);
+        captured.push({ target, at: new Date().toISOString(), png: result.png, signals: result.signals, renderedFiles: result.renderedFiles ?? null, timing: result.timing, pageText: result.pageText });
+      } catch (err) {
+        captureFailed = true;
+        this.fail(new Error(`capture ${target.path} failed: ${(err as Error).message}`));
+      }
+    };
+    const runScenario = async (job: ScenarioJob): Promise<void> => {
+      const file = job.sidecar.file;
+      if (!this.capturer!.runScenario) {
+        this.log(`sidecar ${file} skipped: this capturer cannot run scenarios`);
+        return;
+      }
+      const recording = (await this.motionEnabled()) ? this.timeline.newClip() : undefined;
+      const plan: ScenarioPlan = recording ? { ...job.plan, record: { dir: recording.dir, holdMs: Math.round(this.config.replay.secondsPerFrame * 1000) } } : job.plan;
+      try {
+        const result = await this.capturer!.runScenario(plan);
+        const clip = recording && result.clip ? recording.clip : undefined;
+        if (recording && !clip) this.timeline.dropClip(recording.clip);
+        for (const still of result.stills) {
+          const route = sidecarRoute(file, still.name);
+          captured.push({
+            target: { path: route, routeKey: route, url: '', trigger: job.trigger, sourceFile: file },
+            at: still.at,
+            png: still.png,
+            signals: still.signals,
+            renderedFiles: still.renderedFiles,
+            timing: still.timing,
+            pageText: still.pageText,
+            steps: still.steps,
+            clip,
+            job,
+          });
+        }
+        ranScenarios.push(file);
+        this.log(
+          `sidecar ${file}: ${result.stills.filter((x) => !x.failed).length} still(s) in ${result.ms} ms` +
+            (result.clip ? `; clip of ${result.clip.seconds} s (${result.clip.frames} frames)` : '') +
+            (result.failure ? `; failed at line ${result.failure.line} ${result.failure.text}: ${result.failure.reason}` : ''),
+        );
+      } catch (err) {
+        if (recording) this.timeline.dropClip(recording.clip);
+        captureFailed = true;
+        this.fail(new Error(`sidecar ${file} failed: ${(err as Error).message}`));
+      }
+    };
+    const run = async (job: Job): Promise<void> => {
+      if ('route' in job) await runRoute(job.route);
+      else await runScenario(job.scenario);
+      this.jobDone(job);
+    };
+
+    const concurrency = this.config.focus.impactConcurrency;
+    for (let i = 0; i < jobs.length; ) {
+      if (this.stopping) return null;
+      if (halt()) {
+        leftover = jobs.slice(i);
+        break;
+      }
+      let end = i + 1;
+      if (concurrency > 1 && isImpactRoute(jobs[i]!)) while (end < jobs.length && isImpactRoute(jobs[end]!)) end++;
+      if (end - i > 1) {
+        // Impact routes side by side; a scenario never runs next to them (`login <role>` switches the shared session).
+        const notStarted = await runPool(jobs.slice(i, end), concurrency, run, halt);
+        if (this.stopping) return null;
+        if (notStarted.length > 0) {
+          leftover = [...notStarted, ...jobs.slice(end)];
+          break;
+        }
+      } else {
+        await run(jobs[i]!);
+      }
+      i = end;
+    }
+
+    ctx.mark('captures');
+    // Events from here on may be about the tree hashed next; the next round counts them as its own too.
+    const eventsAfter = this.trigger?.eventCount() ?? 0;
+    const after = await treeHash(this.config.repoDir, this.dirs.scratchDir);
+    ctx.mark('hash');
+    if (this.stopping) return null;
+    let requeued = false;
+    if (leftover.length > 0) {
+      const retry = new Map<string, Target>();
+      const retrySidecars = new Map<string, Trigger>();
+      for (const job of leftover) {
+        if ('route' in job) retry.set(job.route.path, job.route);
+        else retrySidecars.set(job.scenario.sidecar.file, job.scenario.trigger);
+      }
+      // Not a failed attempt: the captures were only put off, so the batch keeps its attempt count.
+      this.merge({ screen: [], backend: [], sidecar: [], paramsRev: batch.paramsRev, retry, retrySidecars, startedAt: captureStart, attempts: batch.attempts });
+      requeued = true;
+      this.log(`preempted: ${leftover.length} capture(s) of this batch moved behind new work (claim screens first)`);
+    }
+
+    const eventsDuring = (this.trigger?.eventCount() ?? 0) - eventsBefore;
+    let keep = captured;
+    const droppedRuns = new Set<string>();
+    let keptRoutes = [...attempted, ...captured.filter((c) => c.steps).map((c) => c.target.path)];
+    let droppedRoutes: string[] = [];
+    if (after !== before || eventsDuring > 0) {
+      const maxRequeues = this.opts.maxRequeues ?? 2;
+      const why =
+        after !== before
+          ? `working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})`
+          : `${eventsDuring} file event(s) arrived during capture (tree unchanged: ${after.slice(0, 8)})`;
+      const split = await this.splitMidCapture(captured, { before, after, eventsBefore, eventsDuring });
+      if (this.stopping) return null;
+      if ('unknown' in split) {
+        const requeue = batch.attempts < maxRequeues;
+        this.log(`discarded ${captured.length} frame(s): ${why}; ${split.unknown}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
+        for (const clip of new Set(captured.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
+        const routes = [...attempted, ...captured.filter((c) => c.steps).map((c) => c.target.path)];
+        this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
+        return { unknown: split.unknown, routes };
+      }
+      keep = split.kept;
+      keptRoutes = keep.map((c) => c.target.path);
+      if (split.dropped.length === 0) {
+        this.log(`kept ${keep.length} frame(s), discarded 0: ${why}, but nothing they show depends on ${split.files.join(', ') || 'it'}`);
+      } else {
+        const requeue = batch.attempts < maxRequeues;
+        const reasons = split.dropped.map((d) => `${d.label} (${d.why})`);
+        const listed = reasons.length > 5 ? [...reasons.slice(0, 5), `${reasons.length - 5} more`] : reasons;
+        this.log(
+          `kept ${keep.length} frame(s), discarded ${split.dropped.length}: ${why}; stale: ${listed.join(', ')}` +
+            (requeue ? '; re-queued' : '; giving up after repeated changes'),
+        );
+        const droppedEntries = split.dropped.flatMap((d) => d.entries);
+        for (const entry of droppedEntries) if (entry.job) droppedRuns.add(entry.job.sidecar.file);
+        for (const clip of new Set(droppedEntries.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
+        droppedRoutes = droppedEntries.map((c) => c.target.path);
+        this.events.emit('discarded', { routes: droppedRoutes, kept: keptRoutes, before, after, requeued: requeue, events: eventsDuring });
+        if (requeue) {
+          const retry = new Map<string, Target>();
+          const retrySidecars = new Map<string, Trigger>();
+          for (const entry of droppedEntries) {
+            if (entry.job) retrySidecars.set(entry.job.sidecar.file, entry.job.trigger);
+            else retry.set(entry.target.path, entry.target);
+          }
+          // Since the capture started, not before: the barrier must not credit a message for the save that began this batch.
+          this.merge({ screen: [], backend: [], sidecar: [], paramsRev: batch.paramsRev, retry, retrySidecars, retryWait: split.screenFiles, startedAt: captureStart, attempts: batch.attempts + 1 });
+          requeued = true;
+        }
+      }
+    }
+
+    this.record(keep, after);
+    for (const file of ranScenarios) if (!droppedRuns.has(file)) this.sidecarsRun.add(file);
+    const outcome = { after, eventsAfter, kept: keptRoutes, dropped: droppedRoutes, captureFailed, requeued, preempted: leftover.length > 0 };
+    ctx.close?.(outcome);
+    return outcome;
+  }
+
+  /**
+   * Record frames at `after`. A kept frame depends on nothing that differs between the tree its round started at and
+   * `after`, so it shows `after` as much as the earlier tree; recording it at the current tree lets `finish` match it at
+   * HEAD without carrying it.
+   */
+  private record(keep: Captured[], after: string): void {
+    for (const { target, at, png, signals, renderedFiles, timing, pageText, steps, clip } of keep) {
+      const verdict = triage(signals);
+      const frame = this.timeline.append(
+        {
+          sessionId: this.sessionId,
+          route: target.path,
+          routeKey: target.routeKey,
+          at,
+          treeHash: after,
+          trigger: target.trigger,
+          sourceFile: target.sourceFile,
+          status: verdict.status,
+          reasons: verdict.reasons,
+          renderedFiles,
+          ...(timing ? { timing: { ...timing, ...(target.discoveryMs !== undefined ? { discoveryMs: target.discoveryMs } : {}) } } : {}),
+          ...(steps ? { steps } : {}),
+          ...(clip ? { clip } : {}),
+          ...(target.paramsFrom ? { paramsFrom: target.paramsFrom } : {}),
+          ...(target.foundOn ? { paramsFoundOn: target.foundOn } : {}),
+        },
+        png,
+      );
+      // A4: the page text for the claim check lives next to the PNG, not in index.jsonl.
+      if (pageText !== undefined && this.config.decisions.verdict && this.config.decisions.enabled !== false) {
+        writeTextSidecar(this.timeline.pngPath(frame), pageText);
+      }
+      if (!steps) this.sessionRoutes.set(target.path, { routeKey: target.routeKey, url: target.url, paramsFrom: target.paramsFrom, foundOn: target.foundOn });
+      this.status.frames++;
+      this.status.lastCaptureAt = at;
+      this.log(
+        `frame ${frame.id} ${frame.route} ${frame.status}${frame.reasons.length ? ` (${frame.reasons[0]})` : ''} tree=${after.slice(0, 8)}`,
+      );
+      this.events.emit('frame', { frame, signals, pngPath: this.timeline.pngPath(frame) } satisfies FrameEvent);
+    }
+  }
+
+  /** One capture of the batch is over: count it off `status.remaining`. */
+  private jobDone(job: Job): void {
+    this.jobsLeft.delete(jobKey(job));
+    const remaining = this.status.remaining;
+    if (remaining && remaining[job.tier] > 0) remaining[job.tier]--;
+    this.writeStatus();
   }
 
   /**
@@ -915,14 +1164,17 @@ class Watcher {
       if (files === null) return { unknown: 'git cannot compare the two trees' };
       diff = files;
     }
+    const files = [...new Set([...diff, ...touched])].sort();
+    const { isScreen, isSidecar } = classifier(this.config);
     let graph: ImportGraph;
     try {
       graph = await this.getGraph();
     } catch {
-      return { unknown: 'no import graph to tell which frames the change reaches' };
+      // v0.13: a sidecar file can only change its own run; no graph is needed to tell that.
+      if (files.length === 0 || !files.every((f) => isSidecar(f))) return { unknown: 'no import graph to tell which frames the change reaches' };
+      graph = { fileToRoutes: new Map(), routes: [], unresolved: [] };
     }
     const stale = staleCheck(this.config, graph);
-    const files = [...new Set([...diff, ...touched])].sort();
     const knownKeys = [...graph.routes.map((r) => r.path), ...Object.values(this.config.staticRoutes).flat()];
 
     const kept: Captured[] = [];
@@ -945,7 +1197,6 @@ class Watcher {
       if (why === null) kept.push(...entries);
       else dropped.push({ label: `sidecar ${job.sidecar.file}`, why, entries });
     }
-    const { isScreen } = classifier(this.config);
     return { kept, dropped, files, screenFiles: files.filter((f) => isScreen(f)) };
   }
 
@@ -1129,12 +1380,15 @@ class Watcher {
       resolution.routes = routes;
       resolution.skipped = skipped;
     }
+    // v0.13: claim screens are picked out again when the batch is ordered; here only headline vs impact matters.
+    const tierOf = (r: { path?: string; routeKey: string; sourceFiles: string[] }): Tier => (isHeadline === null || isHeadline(r) ? 'headline' : 'impact');
     const targets: Target[] = resolution.routes.map((r) => ({
       path: r.path,
       routeKey: r.routeKey,
       url: r.url,
       trigger: 'screen' as const,
       sourceFile: r.sourceFiles[0],
+      tier: tierOf(r),
       ...this.provenanceOf(r.routeKey),
     }));
     for (const skip of resolution.skipped) {
@@ -1154,6 +1408,7 @@ class Watcher {
         url: joinUrl(this.config.appUrl, outcome.path),
         trigger: 'screen',
         sourceFile: skip.sourceFiles[0],
+        tier: tierOf(skip),
         paramsFrom: outcome.from,
         foundOn: outcome.foundOn,
         discoveryMs: outcome.discoveryMs,
@@ -1268,7 +1523,7 @@ class Watcher {
     for (const routeKey of keys) {
       const entry = routes[routeKey];
       if (!entry) continue;
-      targets.set(entry.path, { path: entry.path, routeKey, url: joinUrl(this.config.appUrl, entry.path), trigger: 'params', paramsFrom: 'session' });
+      targets.set(entry.path, { path: entry.path, routeKey, url: joinUrl(this.config.appUrl, entry.path), trigger: 'params', paramsFrom: 'session', tier: 'headline' });
     }
   }
 
@@ -1340,7 +1595,10 @@ class Watcher {
     const screens = this.claimScreens();
     const added = [...screens].filter((s) => !this.claimSeen.has(s));
     this.claimSeen = screens;
-    if (added.length === 0) return;
+    if (added.length === 0) {
+      void this.refreshClaimIdle(); // screens may have gone; the status should say so
+      return;
+    }
     this.log(`claim names ${added.join(', ')}; capturing the claim screens that have no clean frame at the current tree`);
     this.merge({ screen: [], backend: [], sidecar: [], claim: true, startedAt: Date.now(), attempts: 0 });
     if (!this.warmingUp) this.running ??= this.drain();
@@ -1350,14 +1608,20 @@ class Watcher {
 
   /**
    * Add a target for every claim screen that is a route (a key like `/facilities/:id`, filled through the params
-   * chain, or a concrete path like `/facilities/3`) without a clean frame at `tree`; return the sidecar files with a
-   * still the claim names and no clean frame at `tree`, to replay.
+   * chain, or a concrete path like `/facilities/3`) without a clean frame that stands at `tree`; return the sidecar files
+   * with a still the claim names and no such frame, to replay. A frame stands when it is at `tree`, or at an earlier
+   * tree and nothing changed since can reach it (v0.13). `force` (a backend change with `backendScope: "claim"`)
+   * captures every claim screen again, with that trigger.
    */
-  private async addClaimTargets(targets: Map<string, Target>, params: Record<string, string>, tree: string): Promise<Map<string, Trigger>> {
+  private async addClaimTargets(
+    targets: Map<string, Target>,
+    params: Record<string, string>,
+    tree: string,
+    force?: { trigger: Trigger; sourceFile: string },
+  ): Promise<Map<string, Trigger>> {
     const screens = this.claimScreens();
     const scenarios = new Map<string, Trigger>();
     if (screens.size === 0) return scenarios;
-    const clean = (route: string): boolean => this.timeline.latestAtTree(route, tree)?.status === 'clean';
     let knownKeys: string[] = Object.values(this.config.staticRoutes).flat();
     try {
       const graph = await this.getGraph();
@@ -1365,9 +1629,12 @@ class Watcher {
     } catch (err) {
       this.log(`claim: import graph unavailable: ${(err as Error).message.split('\n')[0]}`);
     }
+    const carry = this.carryCheck(tree);
+    const stands = async (route: string, deps: FrameDependencies): Promise<boolean> => !force && screenReady((await carry(route, deps)).state);
+    const trigger = force?.trigger ?? 'claim';
     const added: string[] = [];
     for (const screen of [...screens].sort()) {
-      if (!screen.startsWith('/') || clean(screen)) continue;
+      if (!screen.startsWith('/')) continue;
       let routeKey = screen;
       let routePath: string;
       let provenance: Provenance = {};
@@ -1392,8 +1659,16 @@ class Watcher {
         routePath = screen;
         routeKey = gotoRouteKeys(screen, knownKeys)[0] ?? screen;
       }
-      if (targets.has(routePath) || clean(routePath)) continue;
-      targets.set(routePath, { path: routePath, routeKey, url: joinUrl(this.config.appUrl, routePath), trigger: 'claim', ...provenance });
+      if (targets.has(routePath) || (await stands(routePath, { keys: [routeKey] }))) continue;
+      targets.set(routePath, {
+        path: routePath,
+        routeKey,
+        url: joinUrl(this.config.appUrl, routePath),
+        trigger,
+        ...(force ? { sourceFile: force.sourceFile } : {}),
+        tier: 'claim',
+        ...provenance,
+      });
       added.push(routePath);
     }
     if (this.config.sidecars.length > 0) {
@@ -1402,14 +1677,204 @@ class Watcher {
         const named = sidecar.stills.some((still) =>
           screenLabels({ route: '', routeKey: '', sourceFiles: [], via: 'sidecar', scenario: { file, name: sidecar.name, still } }).some((label) => screens.has(normalizeScreen(label))),
         );
-        if (named && !sidecar.stills.every((still) => clean(sidecarRoute(file, still)))) {
-          scenarios.set(file, 'claim');
+        if (!named) continue;
+        const deps = { keys: scenarioRouteKeys(sidecar, knownKeys), sidecarFile: file };
+        let standing = true;
+        for (const still of sidecar.stills) if (!(await stands(sidecarRoute(file, still), deps))) standing = false;
+        if (!standing) {
+          scenarios.set(file, trigger);
           added.push(`sidecar ${file}`);
         }
       }
     }
     this.log(added.length > 0 ? `claim: capturing ${added.join(', ')}` : 'claim: every claim screen already has a clean frame at the current tree');
     return scenarios;
+  }
+
+  // ---- claim readiness (v0.13) ------------------------------------------------
+
+  /**
+   * Whether a route (or a sidecar still) has a frame that stands at `tree`: one at that tree, or a clean one at an
+   * earlier tree that nothing changed since can reach, by the rules `finish` carries frames forward with.
+   */
+  private carryCheck(tree: string): (route: string, deps: FrameDependencies) => Promise<{ state: ClaimScreenState; frame?: Frame; reason?: string }> {
+    const diffs = new Map<string, Promise<string[] | null>>();
+    let check: Promise<ReturnType<typeof staleCheck> | null> | null = null;
+    return async (route, deps) => {
+      const atTree = this.timeline.latestAtTree(route, tree);
+      if (atTree) return atTree.status === 'clean' ? { state: 'clean', frame: atTree } : { state: 'not-clean', frame: atTree, reason: atTree.reasons[0] ?? atTree.status };
+      const older = this.timeline.latest(route);
+      if (!older) return { state: 'missing' };
+      const short = older.treeHash.slice(0, 8);
+      if (older.status !== 'clean') return { state: 'missing', reason: `the last frame (tree ${short}) is ${older.status}` };
+      check ??= this.getGraph().then(
+        (graph) => staleCheck(this.config, graph),
+        () => null,
+      );
+      const stale = await check;
+      if (!stale) return { state: 'missing', reason: `the last clean frame is at tree ${short}, and there is no import graph to carry it` };
+      let diff = diffs.get(older.treeHash);
+      if (!diff) diffs.set(older.treeHash, (diff = treeDiff(this.config.repoDir, older.treeHash, tree)));
+      const files = await diff;
+      if (files === null) return { state: 'missing', reason: `the last clean frame is at tree ${short}, which git cannot compare` };
+      const why = stale(files, { ...deps, renderedFiles: older.renderedFiles });
+      return why === null ? { state: 'carried', frame: older } : { state: 'missing', reason: `stale: ${why} changed since tree ${short}` };
+    };
+  }
+
+  /**
+   * Work out, for every screen the claim names, whether it has a frame that stands at `tree` (hashed after `eventsAt`
+   * events), and write it to `status.claim`. `batch` is the batch that looked; its claim request is acknowledged.
+   */
+  private async refreshClaim(tree: string, eventsAt: number, batch?: Pending): Promise<void> {
+    try {
+      await this.lookAtClaim(tree, eventsAt, batch);
+    } catch (err) {
+      // Never fatal for the batch: the next look tries again.
+      this.log(`claim: could not check the claim screens: ${(err as Error).message.split('\n')[0]}`);
+    }
+  }
+
+  private async lookAtClaim(tree: string, eventsAt: number, batch?: Pending): Promise<void> {
+    const seq = ++this.claimSeq;
+    this.lastTree = { tree, events: eventsAt };
+    const screens = [...this.claimScreens()].sort();
+    const carry = this.carryCheck(tree);
+    const params = screens.some((s) => hasParams(s)) ? this.layered().params : {};
+    let knownKeys: string[] = Object.values(this.config.staticRoutes).flat();
+    try {
+      knownKeys = [...(await this.getGraph()).routes.map((r) => r.path), ...knownKeys];
+    } catch {
+      // Without a graph, a concrete claim path stands for itself.
+    }
+    const sidecars =
+      this.config.sidecars.length > 0 && screens.some((s) => !s.startsWith('/'))
+        ? findSidecarFiles(this.config.repoDir, this.config.sidecars).map((file) => loadSidecar(this.config.repoDir, file))
+        : [];
+    const pending = this.pending;
+    const queued = (key: string): boolean =>
+      this.jobsLeft.has(key) || pending?.claim === true || pending?.retry.has(key) === true || pending?.retrySidecars.has(key.replace(/^sidecar:/, '')) === true;
+    const entry = (screen: string, kind: 'route' | 'sidecar', target: string, found: { state: ClaimScreenState; frame?: Frame; reason?: string }, isQueued: boolean): ClaimScreenStatus => {
+      const state: ClaimScreenState = screenReady(found.state) || !isQueued ? found.state : 'queued';
+      return {
+        screen,
+        kind,
+        target,
+        state,
+        ...(found.frame && state !== 'queued' ? { frameId: found.frame.id } : {}),
+        ...(state === 'carried' && found.frame ? { frameTree: found.frame.treeHash } : {}),
+        ...(found.reason && state !== 'queued' ? { reason: found.reason } : {}),
+      };
+    };
+
+    const entries: ClaimScreenStatus[] = [];
+    for (const screen of screens) {
+      if (screen.startsWith('/')) {
+        let route = screen;
+        let routeKey = screen;
+        if (hasParams(screen)) {
+          const concrete = concretePath(screen, params);
+          const filled = concrete.ok ? concrete.path : this.timeline.list().filter((f) => f.routeKey === screen).at(-1)?.route;
+          if (!filled) {
+            const reason = this.status.paramDiscovery?.[screen]?.error ?? this.status.paramSources?.[screen]?.error ?? (concrete.ok ? undefined : concrete.reason);
+            entries.push({ screen, kind: 'route', state: pending?.claim ? 'queued' : 'unfilled', ...(reason ? { reason } : {}) });
+            continue;
+          }
+          route = filled;
+        } else {
+          routeKey = gotoRouteKeys(screen, knownKeys)[0] ?? screen;
+        }
+        entries.push(entry(screen, 'route', route, await carry(route, { keys: [routeKey] }), queued(route)));
+        continue;
+      }
+      let worst: ClaimScreenStatus | null = null;
+      for (const sidecar of sidecars) {
+        const deps = { keys: scenarioRouteKeys(sidecar, knownKeys), sidecarFile: sidecar.file };
+        for (const still of sidecar.stills) {
+          const labels = screenLabels({ route: '', routeKey: '', sourceFiles: [], via: 'sidecar', scenario: { file: sidecar.file, name: sidecar.name, still } });
+          if (!labels.some((label) => normalizeScreen(label) === screen)) continue;
+          let found = await carry(sidecarRoute(sidecar.file, still), deps);
+          // A step that failed after the last still leaves a frame of its own; newer than the still, it stands for the run.
+          const failed = this.timeline.latestAtTree(sidecarRoute(sidecar.file, FAILED_STILL), tree);
+          if (failed && found.frame && frameNumber(failed.id) > frameNumber(found.frame.id)) found = { state: 'not-clean', frame: failed, reason: failed.reasons[0] ?? 'a step failed' };
+          const e = entry(screen, 'sidecar', sidecar.file, found, queued(`sidecar:${sidecar.file}`));
+          if (!worst || STATE_RANK[e.state] > STATE_RANK[worst.state]) worst = e;
+        }
+      }
+      entries.push(worst ?? { screen, kind: 'unmatched', state: 'unmatched' });
+    }
+    if (seq !== this.claimSeq) return; // a later look already wrote a newer answer
+
+    const waited = entries.filter((e) => e.kind !== 'unmatched');
+    const captured = waited.filter((e) => screenReady(e.state)).length;
+    const claim: ClaimStatus = {
+      file: this.claimFile(),
+      tree,
+      current: (this.trigger?.eventCount() ?? 0) === eventsAt,
+      ready: waited.length > 0 && captured === waited.length,
+      total: waited.length,
+      captured,
+      screens: entries,
+      request: Math.max(this.status.claim?.request ?? 0, batch?.requestRev ?? 0),
+    };
+    const changed = JSON.stringify(claim) !== JSON.stringify(this.status.claim);
+    this.status.claim = claim;
+    if (changed) {
+      const waiting = entries.filter((e) => e.kind !== 'unmatched' && !screenReady(e.state));
+      this.log(
+        waited.length === 0
+          ? 'claim: no claim screens to check'
+          : `claim: ${captured}/${waited.length} claim screen(s) ready at tree ${tree.slice(0, 8)}` + (waiting.length > 0 ? ` (${waiting.map((e) => `${e.screen} ${e.state}`).join(', ')})` : ''),
+      );
+    }
+    this.writeStatus();
+  }
+
+  /** Refresh the claim status between batches (a batch refreshes it itself). */
+  private async refreshClaimIdle(): Promise<void> {
+    if (this.stopping || this.running || this.pending || !this.lastTree) return;
+    await this.refreshClaim(this.lastTree.tree, this.lastTree.events);
+  }
+
+  /** The claim screens cannot be captured (a stale freshness marker): say so, and acknowledge the request. */
+  private claimRefused(batch: Pending, reason: string): void {
+    const claim = this.status.claim;
+    this.status.claim = {
+      file: this.claimFile(),
+      tree: claim?.tree ?? null,
+      current: true,
+      ready: false,
+      total: claim?.total ?? 0,
+      captured: 0,
+      screens: claim?.screens ?? [],
+      request: Math.max(claim?.request ?? 0, batch.requestRev ?? 0),
+      error: reason,
+    };
+  }
+
+  /** Watch `claim-request.json`: `ready --claim` and `finish` ask for the claim screens to be captured first. */
+  private async startRequestWatch(): Promise<void> {
+    const file = this.files.claimRequest;
+    const earlier = readClaimRequest(file);
+    // A request made while this watcher was starting (`start` then `ready --claim`) is answered once it is ready; an
+    // older one was for another watcher.
+    const at = earlier ? Date.parse(earlier.at) : Number.NaN;
+    if (earlier && !(Number.isFinite(at) && Date.now() - at < RECENT_REQUEST_MS)) this.requestSeen = earlier.rev;
+    if (!this.opts.watchClaimRequest && !fs.existsSync(path.dirname(file))) return;
+    const watch = this.opts.watchClaimRequest ?? watchFile;
+    this.requestWatch = await watch(file, () => this.onClaimRequest(), (err) => this.fail(err));
+  }
+
+  private onClaimRequest(): void {
+    if (this.stopping) return;
+    const request = readClaimRequest(this.files.claimRequest);
+    if (!request || request.rev <= this.requestSeen) return;
+    this.requestSeen = request.rev;
+    this.log(`claim request from ${request.from}: capturing the claim screens${this.running ? ' before the rest of the running batch' : ''}`);
+    this.merge({ screen: [], backend: [], sidecar: [], claim: true, requestRev: request.rev, startedAt: Date.now(), attempts: 0 });
+    if (!this.warmingUp) this.running ??= this.drain();
+    this.refreshPending();
+    this.writeStatus();
   }
 
   private getGraph(): Promise<ImportGraph> {

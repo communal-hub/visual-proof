@@ -156,6 +156,8 @@ export interface ScenarioResult {
   /** The step that stopped the scenario, if any. */
   failure?: { line: number; text: string; reason: string };
   ms: number;
+  /** v0.13: how long each step that ran took (ms), in order; the failing step is the last one. */
+  steps?: Array<{ line: number; ms: number }>;
 }
 
 export interface RecordedClip {
@@ -408,7 +410,18 @@ export class Browser implements Capturer {
 
   // ---- lifecycle -----------------------------------------------------------
 
-  private async ensureContext(): Promise<BrowserContext> {
+  /** v0.13: one launch at a time, however many captures ask for the context at once. */
+  private contextInFlight: Promise<BrowserContext> | null = null;
+
+  private ensureContext(): Promise<BrowserContext> {
+    if (this.context && this.browser?.isConnected() !== false) return Promise.resolve(this.context);
+    this.contextInFlight ??= this.doEnsureContext().finally(() => {
+      this.contextInFlight = null;
+    });
+    return this.contextInFlight;
+  }
+
+  private async doEnsureContext(): Promise<BrowserContext> {
     if (this.browser && !this.browser.isConnected()) {
       this.log('browser disconnected; relaunching');
       await this.close();
@@ -483,7 +496,17 @@ export class Browser implements Capturer {
 
   // ---- login ---------------------------------------------------------------
 
-  private async ensureLoggedIn(): Promise<void> {
+  /** v0.13: impact routes are captured side by side; they share one login rather than racing to log in. */
+  private loginInFlight: Promise<void> | null = null;
+
+  private ensureLoggedIn(): Promise<void> {
+    this.loginInFlight ??= this.doEnsureLoggedIn().finally(() => {
+      this.loginInFlight = null;
+    });
+    return this.loginInFlight;
+  }
+
+  private async doEnsureLoggedIn(): Promise<void> {
     if (this.config.login.type !== 'http-hook') return;
     // A scenario that logged in as another role leaves the context on that role until it restores the default.
     if (this.loggedIn && this.sessionEmail === this.config.login.email) return;
@@ -785,6 +808,7 @@ export class Browser implements Capturer {
       recorder,
       holdMs: plan.record?.holdMs ?? 0,
       mouse: { x: Math.round(this.config.viewport.width / 2), y: Math.round(this.config.viewport.height / 2) },
+      timings: [],
     };
 
     let clip: RecordedClip | undefined;
@@ -814,7 +838,7 @@ export class Browser implements Capturer {
       await page.close().catch(() => {});
       await this.restoreDefaultLogin();
     }
-    return { stills: run.stills, ...(clip ? { clip } : {}), ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started };
+    return { stills: run.stills, ...(clip ? { clip } : {}), ...(run.failure ? { failure: run.failure } : {}), ms: Date.now() - started, steps: run.timings };
   }
 
   private async runSteps(run: ScenarioRun): Promise<void> {
@@ -831,7 +855,9 @@ export class Browser implements Capturer {
         if (!run.recorder.started && step.verb !== 'goto' && step.verb !== 'login') await this.beginRecording(run);
         run.recorder.caption(`${run.plan.name} / ${step.text}`);
       }
+      const stepStarted = Date.now();
       const reason = await this.runStep(run, step);
+      run.timings.push({ line: step.line, ms: Date.now() - stepStarted });
       if (run.cancelled) return;
       if (run.recorder && reason === null && step.verb === 'goto') {
         if (!run.recorder.started) await this.beginRecording(run);
@@ -1327,6 +1353,8 @@ interface ScenarioRun {
   holdMs: number;
   /** Where the mouse is (viewport px); glides start here. */
   mouse: Point;
+  /** Time per step that ran. */
+  timings: Array<{ line: number; ms: number }>;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

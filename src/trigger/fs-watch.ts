@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import chokidar from 'chokidar';
 import { classifier } from '../globs.js';
@@ -37,6 +39,15 @@ export interface FsWatchOptions {
    * missed, more under CPU load; 25 ms was enough in 120 trials). Default 100 ms.
    */
   settleMs?: number;
+  /**
+   * Content of the watched files when watching began, as git blob ids keyed by repo-relative path (`git ls-tree` of the
+   * working-tree hash). An event that leaves a file as it was (a touch, an amend or a regeneration that writes the
+   * same bytes) is no event at all: it is not counted, reported or batched. A file missing here counts on its first
+   * event; after that its content is remembered.
+   */
+  baseline?: ReadonlyMap<string, string>;
+  /** Called for each event dropped because the file's content did not change. */
+  onUnchanged?: (file: string) => void;
   /** Called for every relevant file event, before debouncing; lets the owner mark work as pending right away. */
   onEvent?: () => void;
   onBatch: (batch: WatchBatch) => void;
@@ -59,6 +70,8 @@ export interface FsWatchHandle {
 }
 
 const ALWAYS_IGNORED = new Set(['node_modules', '.git']);
+/** Files larger than this are not hashed: every event on them counts. */
+const MAX_HASHED_BYTES = 16 * 1024 * 1024;
 /** Event paths kept for {@link FsWatchHandle.eventsSince}; far more than one capture batch sees. */
 const KEPT_EVENTS = 10_000;
 
@@ -112,6 +125,7 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
   let eventCount = 0;
   /** Paths of the most recent events; `recent[i]` is event number `eventCount - recent.length + i`. */
   let recent: string[] = [];
+  const contents = new FileContents(options.baseline);
 
   const flush = (): void => {
     timer = null;
@@ -135,6 +149,10 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
     const b = isBackend(rel);
     const c = isSidecar(rel);
     if (!s && !b && !c) return;
+    if (!contents.changed(rel, abs)) {
+      options.onUnchanged?.(rel);
+      return;
+    }
     eventCount++;
     recent.push(rel);
     if (recent.length > KEPT_EVENTS * 2) recent = recent.slice(-KEPT_EVENTS);
@@ -169,6 +187,42 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
       await watcher.close();
     },
   };
+}
+
+/**
+ * The last known content of each file that had an event, as a git blob id (null: the file is absent), falling back
+ * to the baseline. A file that cannot be read, or is too big to hash, always counts as changed.
+ */
+class FileContents {
+  private readonly known = new Map<string, string | null>();
+  private readonly algorithm: 'sha1' | 'sha256';
+
+  constructor(private readonly baseline: ReadonlyMap<string, string> = new Map()) {
+    const sample = baseline.values().next().value;
+    this.algorithm = typeof sample === 'string' && sample.length === 64 ? 'sha256' : 'sha1';
+  }
+
+  /** Whether the file's content differs from what it was at its last event (or in the baseline); remembers it. */
+  changed(rel: string, abs: string): boolean {
+    const now = blobId(abs, this.algorithm);
+    const before = this.known.has(rel) ? this.known.get(rel) : this.baseline.get(rel);
+    if (now === undefined) this.known.delete(rel);
+    else this.known.set(rel, now);
+    return now === undefined || before === undefined || now !== before;
+  }
+}
+
+/** The git blob id of a file's content (as `git hash-object` gives it without filters), null when absent, undefined when unknown. */
+export function blobId(abs: string, algorithm: 'sha1' | 'sha256' = 'sha1'): string | null | undefined {
+  let content: Buffer;
+  try {
+    const stat = fs.statSync(abs);
+    if (!stat.isFile() || stat.size > MAX_HASHED_BYTES) return undefined;
+    content = fs.readFileSync(abs);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? null : undefined;
+  }
+  return crypto.createHash(algorithm).update(`blob ${content.length}\0`).update(content).digest('hex');
 }
 
 /** Leading non-glob directory of a glob (`src/**` -> `src`, `**\/*.vue` -> ``). */

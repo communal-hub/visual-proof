@@ -19,6 +19,7 @@ import {
   validateSidecar,
 } from './sidecar.js';
 import { readStatusFile, watcherPid, writeFileAtomic, type Status } from './status.js';
+import { outstanding, requestClaimCapture } from './claim-status.js';
 import { describeError } from './text.js';
 import { Timeline, type Frame, type ParamsFrom } from './timeline.js';
 import type { FrameStatus } from './triage.js';
@@ -53,6 +54,8 @@ export interface FinishOptions {
   dirs?: Dirs;
   /** Overrides `config.finishBudgetMs`. */
   budgetMs?: number;
+  /** Overrides `config.finishWaitMs` (v0.13): how long to wait for the watcher, on top of the budget. */
+  waitMs?: number;
   now?: () => number;
   buildGraph?: (config: Config) => Promise<ImportGraph>;
   /** How often to re-check a daemon that is still capturing. Default 200 ms. */
@@ -215,7 +218,8 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
   ensureDirs(dirs);
   const now = opts.now ?? Date.now;
   const budgetMs = opts.budgetMs ?? config.finishBudgetMs;
-  const deadline = now() + budgetMs;
+  // v0.13: the budget is for finish's own work; time spent waiting for the watcher (up to finishWaitMs) moves it out.
+  const clock: Clock = { deadline: now() + budgetMs, waited: 0, waitingSince: null };
 
   const state: State = {
     tree: null,
@@ -237,16 +241,22 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
     env: opts.env ?? process.env,
     configDir: config.repoDir,
     client: opts.decisionsClient,
-    capAt: deadline - 250, // finish's own deadline wins over the decision budget
+    capAt: () => clock.deadline - 250, // finish's own deadline wins over the decision budget
     now,
     log: (message) => logLine(dirs, message),
   });
 
   let timer: NodeJS.Timeout | undefined;
   const expired = new Promise<'expired'>((resolve) => {
-    timer = setTimeout(() => resolve('expired'), budgetMs);
+    // Re-armed while the deadline moves (waiting for the watcher does not eat the budget).
+    const arm = (): void => {
+      const left = clock.deadline + (clock.waitingSince === null ? 0 : now() - clock.waitingSince) - now();
+      if (left <= 0) resolve('expired');
+      else timer = setTimeout(arm, left);
+    };
+    timer = setTimeout(arm, budgetMs);
   });
-  const core = collect(config, dirs, opts, state, deadline, now, runtime);
+  const core = collect(config, dirs, opts, state, clock, now, runtime);
   core.catch(() => {}); // after an expiry its rejection must not go unhandled
   try {
     const outcome = await Promise.race([core.then(() => 'done' as const), expired]);
@@ -256,11 +266,21 @@ export async function runFinish(config: Config, opts: FinishOptions = {}): Promi
     state.closed = true;
   }
   if (state.truncated) {
+    const waited = clock.waited > 0 ? ` (plus ${Math.round(clock.waited)} ms waiting for the watcher)` : '';
     state.failures.push(
-      `truncated: finish budget of ${budgetMs} ms exceeded after ${state.routes.length} of ${state.expectedCount} route(s)`,
+      `truncated: finish budget of ${budgetMs} ms${waited} exceeded after ${state.routes.length} of ${state.expectedCount} route(s)`,
     );
   }
   return finalize(dirs, state, !opts.planOnly);
+}
+
+/** finish's deadline, which moves out by the time spent waiting for the watcher. */
+interface Clock {
+  deadline: number;
+  /** Time spent waiting so far. */
+  waited: number;
+  /** Set while finish waits for the watcher: the deadline is on hold. */
+  waitingSince: number | null;
 }
 
 async function collect(
@@ -268,11 +288,11 @@ async function collect(
   dirs: Dirs,
   opts: FinishOptions,
   state: State,
-  deadline: number,
+  clock: Clock,
   now: () => number,
   runtime: DecisionRuntime,
 ): Promise<void> {
-  await gather(config, dirs, opts, state, deadline, now, runtime);
+  await gather(config, dirs, opts, state, clock, now, runtime);
   if (!state.closed && state.failures.length > 0) await addHints(config, dirs, state);
 }
 
@@ -281,7 +301,7 @@ async function gather(
   dirs: Dirs,
   opts: FinishOptions,
   state: State,
-  deadline: number,
+  clock: Clock,
   now: () => number,
   runtime: DecisionRuntime,
 ): Promise<void> {
@@ -469,6 +489,9 @@ async function gather(
   }
 
   state.expectedCount = list.length;
+  const carrier = new Carrier({ config, graph: graphFailed ? null : graph, headTree: tree });
+  const scenarioKeys = new Map(scenarios.map((sc) => [sc.file, sc.keys]));
+  const carryTarget = (route: RouteProof) => (route.scenario ? { keys: scenarioKeys.get(route.scenario.file) ?? [], sidecarFile: route.scenario.file } : { keys: [route.routeKey] });
   await waitForDaemon({
     config,
     dirs,
@@ -477,10 +500,14 @@ async function gather(
     timeline,
     changed,
     state,
-    deadline,
-    budgetMs: opts.budgetMs ?? config.finishBudgetMs,
+    clock,
+    waitMs: opts.waitMs ?? config.finishWaitMs,
     now,
     pollMs: opts.pollMs ?? 200,
+    carried: async (route) => {
+      const older = timeline.latest(route.route);
+      return older !== undefined && (await carrier.check(older, carryTarget(route))).ok;
+    },
   });
   if (state.closed) return;
   const shortTree = tree.slice(0, SHORT_TREE);
@@ -491,11 +518,9 @@ async function gather(
   if (base) state.baseCommit = base.commit;
   else if (config.before.mode !== 'off') state.notes.push(`before/after: no merge-base with ${config.baseRef}, so there is nothing to compare against`);
   const beforeTimeline = base ? new Timeline(path.join(dirs.scratchDir, BEFORE_SCRATCH), config.maxFrames) : null;
-  const carrier = new Carrier({ config, graph: graphFailed ? null : graph, headTree: tree });
-  const scenarioKeys = new Map(scenarios.map((sc) => [sc.file, sc.keys]));
   for (const route of list) {
     if (state.closed) return;
-    if (now() >= deadline) {
+    if (now() >= clock.deadline) {
       state.truncated = true;
       return;
     }
@@ -507,7 +532,7 @@ async function gather(
       // The watcher only re-captures what a save affects: an earlier clean frame stands when nothing it depends on changed since.
       const older = timeline.latest(route.route);
       if (older) {
-        const carried = await carrier.check(older, scenario ? { keys: scenarioKeys.get(scenario.file) ?? [], sidecarFile: scenario.file } : { keys: [route.routeKey] });
+        const carried = await carrier.check(older, carryTarget(route));
         if (state.closed) return;
         if (carried.ok) {
           frame = older;
@@ -579,13 +604,13 @@ async function gather(
   }
 
   const cleanFrames = new Map(headlines);
-  if (impact) smokeImpact({ state, impact, impactList, timeline, tree, screenFiles, cleanFrames, base, beforeTimeline });
+  if (impact) smokeImpact({ state, impact, impactList, timeline, tree, screenFiles, cleanFrames, base, beforeTimeline, backendScope: config.backendScope });
   if (base && config.before.mode !== 'off') checkBefore(config, state, list, base);
 
   noteProvenance(state, list);
   checkRendered(config, state, [...list, ...impactList], cleanFrames);
   if (!state.closed && !state.truncated) await decide(config, dirs, state, runtime, graph, timeline, headlines);
-  if (!state.closed && state.failures.length === 0 && list.length > 0) await addReplay(config, dirs, opts, state, timeline, status?.sessionId, shortTree, deadline, now);
+  if (!state.closed && state.failures.length === 0 && list.length > 0) await addReplay(config, dirs, opts, state, timeline, status?.sessionId, shortTree, clock.deadline, now);
 }
 
 // ---- focus and before/after (v0.11) ---------------------------------------------
@@ -630,6 +655,7 @@ interface SmokeContext {
   cleanFrames: Map<RouteProof, Frame>;
   base: MergeBase | null;
   beforeTimeline: Timeline | null;
+  backendScope: Config['backendScope'];
 }
 
 /**
@@ -643,7 +669,8 @@ function smokeImpact(ctx: SmokeContext): void {
     state.routes.push(route);
     const frame = timeline.latestAtTree(route.route, tree);
     if (!frame) {
-      impact.notCaptured.push({ route: route.route, reason: 'no frame at HEAD' });
+      const reason = route.via === 'backend' && ctx.backendScope === 'claim' ? 'not re-captured after the backend change (backendScope "claim")' : 'no frame at HEAD';
+      impact.notCaptured.push({ route: route.route, reason });
       continue;
     }
     if (route.route === route.routeKey) route.route = frame.route;
@@ -897,10 +924,14 @@ interface WaitContext {
   /** Changed files (config-relative), whose mtimes show edits the daemon may not have heard about yet. */
   changed: string[];
   state: State;
-  deadline: number;
-  budgetMs: number;
+  /** Moved out by the time spent waiting: the wait does not eat finish's own budget. */
+  clock: Clock;
+  /** Most time to wait for the watcher (`finishWaitMs`). */
+  waitMs: number;
   now: () => number;
   pollMs: number;
+  /** v0.13: whether a route's last clean frame, from an earlier tree, still stands at HEAD; such a route is not waited for. */
+  carried: (route: RouteProof) => Promise<boolean>;
 }
 
 /** A save this recent may still be on its way through the watcher's debounce, barrier and capture. */
@@ -910,29 +941,48 @@ const RECENT_EVENT_MS = 2000;
  * `finish` can run right after the last save and commit, while the watcher is still debouncing,
  * waiting on the HMR barrier or capturing. Reading the timeline then would report "no frame at HEAD"
  * for a frame that is a second away. So while a live daemon is busy (capturing, a batch pending, or
- * a change newer than the last frame it heard about), poll until every expected route has a frame at
- * HEAD's tree or the daemon goes idle, within the finish budget. An idle daemon, or none, means the
- * timeline is final.
+ * a change newer than the last frame it heard about), poll until every headline has a frame at HEAD's
+ * tree (or one that carries to it) or the daemon goes idle, for at most `finishWaitMs`. Impact routes are
+ * never waited for. While it waits, it asks the watcher to capture the claim screens ahead of whatever impact
+ * routes it is busy with (`claim-request.json`). An idle daemon, or none, means the timeline is final.
  */
 async function waitForDaemon(ctx: WaitContext): Promise<void> {
   const { config, dirs, tree, list, timeline, state } = ctx;
-  const statusFile = statusFiles(dirs).status;
-  // Stop a little before the overall budget so the specific failure below wins over "truncated".
-  const waitUntil = ctx.deadline - Math.min(500, ctx.budgetMs * 0.2);
+  const files = statusFiles(dirs);
   const startedAt = ctx.now();
-
-  for (;;) {
-    if (state.closed) return;
-    if (list.every((route) => timeline.latestAtTree(route.route, tree))) return;
-    const status = readStatusFile(statusFile);
-    if (!status || status.state === 'stopped' || status.state === 'error' || watcherPid(dirs, status) === null) return;
-    if (!(await daemonBusy(config, dirs, ctx.changed, status, timeline))) return;
-    if (ctx.now() >= waitUntil) {
-      const seconds = ((ctx.now() - startedAt) / 1000).toFixed(1);
-      state.failures.push(`capture still in progress after ${seconds} s`);
-      return;
+  ctx.clock.waitingSince = startedAt;
+  const settled = new Set<RouteProof>();
+  let asked = false;
+  try {
+    for (;;) {
+      if (state.closed) return;
+      for (const route of list) {
+        if (!settled.has(route) && (timeline.latestAtTree(route.route, tree) || (await ctx.carried(route)))) settled.add(route);
+      }
+      if (state.closed || settled.size === list.length) return;
+      const status = readStatusFile(files.status);
+      if (!status || status.state === 'stopped' || status.state === 'error' || watcherPid(dirs, status) === null) return;
+      if (!(await daemonBusy(config, dirs, ctx.changed, status, timeline))) return;
+      if (!asked) {
+        asked = true;
+        requestClaimCapture(files.claimRequest, 'finish');
+        logLine(dirs, `waiting up to ${Math.round(ctx.waitMs / 1000)} s for ${list.length - settled.size} headline(s); asked the watcher for the claim screens first`);
+      }
+      if (ctx.now() - startedAt >= ctx.waitMs) {
+        const seconds = ((ctx.now() - startedAt) / 1000).toFixed(1);
+        const missing = list.filter((r) => !settled.has(r)).map((r) => stillLabel(r));
+        const left = outstanding(status as Record<string, unknown>);
+        const waitingFor = `waiting for ${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ` and ${missing.length - 3} more` : ''}`;
+        state.failures.push(`capture still in progress after ${seconds} s (${[waitingFor, left].filter(Boolean).join('; ')})`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, ctx.pollMs));
     }
-    await new Promise((resolve) => setTimeout(resolve, ctx.pollMs));
+  } finally {
+    const waited = ctx.now() - startedAt;
+    ctx.clock.waitingSince = null;
+    ctx.clock.waited += waited;
+    ctx.clock.deadline += waited;
   }
 }
 
@@ -1265,7 +1315,8 @@ export async function finishCommand(ctx: FinishCommandContext): Promise<number> 
   try {
     const cwd = ctx.cwd ?? process.cwd();
     const config = loadConfig({ configPath: path.resolve(cwd, ctx.configPath ?? CONFIG_FILE_NAME), cwd, env: ctx.env });
-    result = await runFinish(config, { env: ctx.env, dirs });
+    // A pre-push hook must not hold the push for minutes: it waits no longer than finish's own budget.
+    result = await runFinish(config, { env: ctx.env, dirs, ...(ctx.hook ? { waitMs: Math.min(config.finishWaitMs, config.finishBudgetMs) } : {}) });
     code = result.ok ? EXIT.OK : EXIT.FAILURES;
   } catch (e) {
     const setup = e instanceof ConfigError || e instanceof SetupError;

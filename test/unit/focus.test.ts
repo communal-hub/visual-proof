@@ -120,7 +120,7 @@ describe('focus helpers', () => {
     const routes = ['/users', '/edit'].map((route) => ({ route, routeKey: route, sourceFiles: [SHARED], via: 'screen' as const }));
     const input = { focus: config.focus, claimScreens: [], graph: GRAPH, changed: [SHARED] };
     expect(selectHeadlines(routes, input)).toMatchObject({ headlines: routes, impact: [], fallback: true });
-    expect(selectHeadlines(routes, { ...input, focus: { mode: 'all' as const, maxImpact: 40 } })).toMatchObject({ headlines: routes, fallback: false });
+    expect(selectHeadlines(routes, { ...input, focus: { mode: 'all' as const, maxImpact: 40, impactConcurrency: 1 } })).toMatchObject({ headlines: routes, fallback: false });
   });
 });
 

@@ -165,7 +165,21 @@ export interface Config {
   /** When a page counts as settled: no network for `networkIdleMs`, waiting at most `maxWaitMs`. */
   settle: { networkIdleMs: number; maxWaitMs: number };
   maxFrames: number;
+  /**
+   * What `finish` has for its own work: reading frames, model decisions and the replay video. Waiting for the watcher
+   * is not counted; that is {@link finishWaitMs}.
+   */
   finishBudgetMs: number;
+  /**
+   * v0.13: how long `finish` waits for the watcher to capture the headlines before it reports them missing. With the
+   * default budget, `finish` stays under a 280 s agent shell limit.
+   */
+  finishWaitMs: number;
+  /**
+   * v0.13: what a backend change (`backendGlobs`) re-captures: `session` (default) every route and sidecar captured this
+   * session; `claim` the claim screens and the routes of the batch only (until the claim names screens, as `session`).
+   */
+  backendScope: BackendScope;
   baseRef: string;
   // A4 decisions (src/decisions/**): model calls at bounded decision points, never navigation.
   decisions: DecisionsConfig;
@@ -179,11 +193,15 @@ export interface Config {
 
 export type FocusMode = 'claim' | 'all';
 
+export type BackendScope = 'session' | 'claim';
+
 export interface FocusConfig {
   /** `claim` (default): claim screens, page components that changed and touched sidecars are headlines, the rest impact. `all`: every route is a headline. */
   mode: FocusMode;
   /** At most this many impact routes are captured per batch (headlines always are); `0` captures none. */
   maxImpact: number;
+  /** v0.13: impact routes captured side by side (pages of one browser context); headlines are always one at a time, first. */
+  impactConcurrency: number;
 }
 
 export type BeforeMode = 'require' | 'warn' | 'off';
@@ -316,7 +334,9 @@ export function parseConfig(
       maxWaitMs: settle?.posInt('maxWaitMs') ?? DEFAULT_SETTLE_MAX_WAIT_MS,
     },
     maxFrames: v.posInt('maxFrames') ?? 200,
-    finishBudgetMs: v.posInt('finishBudgetMs') ?? 25_000,
+    finishBudgetMs: v.posInt('finishBudgetMs') ?? DEFAULT_FINISH_BUDGET_MS,
+    finishWaitMs: v.nonNegInt('finishWaitMs') ?? DEFAULT_FINISH_WAIT_MS,
+    backendScope: parseBackendScope(v.string('backendScope'), errors),
     baseRef: v.string('baseRef') ?? 'main',
     decisions: parseDecisions(raw.decisions, errors),
     claimFile: v.string('claimFile'),
@@ -457,16 +477,21 @@ function parseRoles(raw: Record<string, string> | undefined, errors: string[]): 
 }
 
 export const DEFAULT_MAX_IMPACT = 40;
+export const DEFAULT_IMPACT_CONCURRENCY = 2;
+/** Most impact captures that may run side by side; more only starves the dev server. */
+export const MAX_IMPACT_CONCURRENCY = 4;
+export const DEFAULT_FINISH_BUDGET_MS = 25_000;
+export const DEFAULT_FINISH_WAIT_MS = 150_000;
 export const DEFAULT_BEFORE_START_TIMEOUT_MS = 180_000;
 
 function parseFocus(value: unknown, errors: string[]): FocusConfig {
-  const focus: FocusConfig = { mode: 'claim', maxImpact: DEFAULT_MAX_IMPACT };
+  const focus: FocusConfig = { mode: 'claim', maxImpact: DEFAULT_MAX_IMPACT, impactConcurrency: DEFAULT_IMPACT_CONCURRENCY };
   if (value === undefined) return focus;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     errors.push('"focus" must be an object');
     return focus;
   }
-  const { mode, maxImpact } = value as Record<string, unknown>;
+  const { mode, maxImpact, impactConcurrency } = value as Record<string, unknown>;
   if (mode !== undefined) {
     if (mode === 'claim' || mode === 'all') focus.mode = mode;
     else errors.push(`"focus.mode" must be "claim" or "all", got ${JSON.stringify(mode)}`);
@@ -474,6 +499,10 @@ function parseFocus(value: unknown, errors: string[]): FocusConfig {
   if (maxImpact !== undefined) {
     if (Number.isInteger(maxImpact) && (maxImpact as number) >= 0) focus.maxImpact = maxImpact as number;
     else errors.push(`"focus.maxImpact" must be a non-negative integer, got ${JSON.stringify(maxImpact)}`);
+  }
+  if (impactConcurrency !== undefined) {
+    if (Number.isInteger(impactConcurrency) && (impactConcurrency as number) >= 1 && (impactConcurrency as number) <= MAX_IMPACT_CONCURRENCY) focus.impactConcurrency = impactConcurrency as number;
+    else errors.push(`"focus.impactConcurrency" must be an integer from 1 to ${MAX_IMPACT_CONCURRENCY}, got ${JSON.stringify(impactConcurrency)}`);
   }
   return focus;
 }
@@ -503,6 +532,13 @@ function parseBefore(value: unknown, errors: string[]): BeforeConfig {
     else errors.push(`"before.startTimeoutMs" must be a positive integer, got ${JSON.stringify(startTimeoutMs)}`);
   }
   return before;
+}
+
+function parseBackendScope(value: string | undefined, errors: string[]): BackendScope {
+  if (value === undefined) return 'session';
+  if (value === 'session' || value === 'claim') return value;
+  errors.push(`"backendScope" must be "session" or "claim", got ${JSON.stringify(value)}`);
+  return 'session';
 }
 
 function parseRenderCheck(value: string | undefined, errors: string[]): RenderCheckMode {
@@ -594,6 +630,15 @@ class Validator {
     if (value === undefined) return undefined;
     if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
       return this.fail(key, 'a positive integer', value);
+    }
+    return value;
+  }
+
+  nonNegInt(key: string): number | undefined {
+    const value = this.raw[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      return this.fail(key, 'a non-negative integer', value);
     }
     return value;
   }

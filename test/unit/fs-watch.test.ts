@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { globBase, startFsWatch, type FsWatchHandle, type WatchBatch } from '../../src/trigger/fs-watch.js';
+import { blobId, globBase, startFsWatch, type FsWatchHandle, type WatchBatch } from '../../src/trigger/fs-watch.js';
 import { tmpDir, write } from './helpers.js';
 
 let root: string;
@@ -175,6 +175,65 @@ describe('startFsWatch', () => {
     write(root, 'src/a.vue', 'x');
     await until(() => batches.length === 1);
     expect(batches[0]!.screen).toEqual(['src/a.vue']);
+  });
+});
+
+describe('content-aware events (v0.13)', () => {
+  const baselineOf = (...files: string[]) => new Map(files.map((f) => [f, blobId(path.join(root, f))!]));
+
+  it('drops a write that leaves the content as the baseline had it: no count, no batch, onUnchanged instead', async () => {
+    const unchanged: string[] = [];
+    const h = await start({ debounceMs: 60, baseline: baselineOf('src/a.vue', 'server/data.json'), onUnchanged: (f) => unchanged.push(f) });
+    write(root, 'server/data.json', '{}'); // a regeneration that writes the same bytes
+    write(root, 'src/a.vue', 'a');
+    await until(() => unchanged.length >= 2);
+    await sleep(200);
+    expect(h.eventCount()).toBe(0);
+    expect(batches).toEqual([]);
+    expect(new Set(unchanged)).toEqual(new Set(['server/data.json', 'src/a.vue']));
+
+    write(root, 'src/a.vue', 'a2');
+    await until(() => batches.length === 1);
+    expect(batches[0]!.screen).toEqual(['src/a.vue']);
+  });
+
+  it('remembers the content of the last event: writing it again is nothing, going back to the old content is a change', async () => {
+    const h = await start({ debounceMs: 60, baseline: baselineOf('src/a.vue') });
+    write(root, 'src/a.vue', 'v2');
+    await until(() => batches.length === 1);
+    const counted = h.eventCount();
+    write(root, 'src/a.vue', 'v2');
+    await sleep(250);
+    expect(h.eventCount()).toBe(counted);
+    expect(batches).toHaveLength(1);
+    write(root, 'src/a.vue', 'a'); // back to what the baseline had: a real change from v2
+    await until(() => batches.length === 2);
+  });
+
+  it('counts the first event of a file the baseline does not know, then remembers it', async () => {
+    const h = await start({ debounceMs: 60, baseline: new Map() });
+    write(root, 'src/b.vue', 'b');
+    await until(() => batches.length === 1);
+    const counted = h.eventCount();
+    write(root, 'src/b.vue', 'b');
+    await sleep(250);
+    expect(h.eventCount()).toBe(counted);
+  });
+
+  it('counts a deletion, and a file coming back with the same content', async () => {
+    await start({ debounceMs: 60, baseline: baselineOf('src/a.vue') });
+    fs.rmSync(path.join(root, 'src/a.vue'));
+    await until(() => batches.length === 1);
+    write(root, 'src/a.vue', 'a');
+    await until(() => batches.length === 2);
+  });
+});
+
+describe('blobId', () => {
+  it('is the git blob id, null for a missing file', () => {
+    write(root, 'src/c.vue', 'hello\n');
+    expect(blobId(path.join(root, 'src/c.vue'))).toBe('ce013625030ba8dba906f756967f9e9ca394464a');
+    expect(blobId(path.join(root, 'src/none.vue'))).toBeNull();
   });
 });
 

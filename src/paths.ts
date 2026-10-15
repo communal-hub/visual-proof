@@ -30,6 +30,8 @@ export function statusFiles(dirs: Dirs) {
     // v0.8 dynamic params: what the agent set, and what link discovery found this watcher session.
     sessionParams: path.join(dirs.statusDir, 'session-params.json'),
     paramDiscovery: path.join(dirs.statusDir, 'param-discovery.json'),
+    // v0.13: `ready --claim` and `finish` ask the watcher to capture the claim screens ahead of impact routes.
+    claimRequest: path.join(dirs.statusDir, 'claim-request.json'),
   };
 }
 
