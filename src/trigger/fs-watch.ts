@@ -49,11 +49,18 @@ export interface FsWatchHandle {
    * a screen or backend file, before debouncing). Two equal readings mean no event arrived between.
    */
   eventCount(): number;
+  /**
+   * Repo-relative paths of the events after the first `count` (a reading of {@link eventCount}), oldest first and
+   * possibly repeated; null when events that old are no longer kept. Optional: a trigger without it only counts.
+   */
+  eventsSince?(count: number): string[] | null;
   /** Stops watching and cancels any pending (unemitted) batch. Safe to call twice. */
   stop(): Promise<void>;
 }
 
 const ALWAYS_IGNORED = new Set(['node_modules', '.git']);
+/** Event paths kept for {@link FsWatchHandle.eventsSince}; far more than one capture batch sees. */
+const KEPT_EVENTS = 10_000;
 
 /**
  * Chokidar watcher over `screenGlobs` and `backendGlobs`. Resolves once the initial scan is done
@@ -103,6 +110,8 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
   let stopped = false;
   let startedAt = 0;
   let eventCount = 0;
+  /** Paths of the most recent events; `recent[i]` is event number `eventCount - recent.length + i`. */
+  let recent: string[] = [];
 
   const flush = (): void => {
     timer = null;
@@ -127,6 +136,8 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
     const c = isSidecar(rel);
     if (!s && !b && !c) return;
     eventCount++;
+    recent.push(rel);
+    if (recent.length > KEPT_EVENTS * 2) recent = recent.slice(-KEPT_EVENTS);
     options.onEvent?.();
     if (screen.size === 0 && backend.size === 0 && sidecar.size === 0) startedAt = Date.now();
     if (s) screen.add(rel);
@@ -144,6 +155,10 @@ export async function startFsWatch(options: FsWatchOptions): Promise<FsWatchHand
 
   return {
     eventCount: () => eventCount,
+    eventsSince: (count) => {
+      const skip = count - (eventCount - recent.length);
+      return skip < 0 ? null : recent.slice(skip);
+    },
     async stop() {
       stopped = true;
       if (timer) clearTimeout(timer);

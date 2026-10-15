@@ -68,6 +68,20 @@ describe('startFsWatch', () => {
     expect(h.eventCount()).toBe(settled);
   });
 
+  it('reports the paths of the events after a count reading', async () => {
+    const h = await start();
+    write(root, 'src/a.vue', 'a2');
+    await until(() => h.eventCount() >= 1);
+    const mark = h.eventCount();
+    expect(h.eventsSince!(mark)).toEqual([]);
+    write(root, 'server/data.json', '{"n":3}');
+    await until(() => h.eventCount() > mark);
+    const since = h.eventsSince!(mark)!;
+    expect(since.length).toBe(h.eventCount() - mark);
+    expect(new Set(since)).toEqual(new Set(['server/data.json']));
+    expect(h.eventsSince!(0)![0]).toBe('src/a.vue');
+  });
+
   it('does not report files matching ignoreScreenGlobs as screens', async () => {
     write(root, 'src/stories/s.vue', 's');
     await start({ ignoreScreenGlobs: ['src/stories/**'] });

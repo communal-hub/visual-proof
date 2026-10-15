@@ -6,7 +6,9 @@ import picomatch from 'picomatch';
 import { Browser, type Capturer, type CaptureSignals, type CaptureTiming, type ScenarioPlan } from './browser.js';
 import type { Config } from './config.js';
 import { resolveAnchor } from './anchor.js';
-import { headCommit, workingTreeHash } from './git.js';
+import { headCommit, treeDiff, workingTreeHash } from './git.js';
+import { staleCheck } from './carry.js';
+import { classifier } from './globs.js';
 import { ensureDirs, resolveDirs, statusFiles, type Dirs } from './paths.js';
 import { buildImportGraph, type ImportGraph } from './resolve/import-graph.js';
 import { ParamSourceResolver, type SourceOutcome } from './resolve/param-sources.js';
@@ -14,6 +16,7 @@ import { concretePath, joinUrl, resolveRoutes } from './resolve/routes.js';
 import {
   findSidecarFiles,
   formatSidecarError,
+  gotoRouteKeys,
   loadSidecar,
   scenarioRouteKeys,
   sidecarRoute,
@@ -33,14 +36,14 @@ import { writeTextSidecar } from './decisions/sidecar.js';
 import { pruneForWatch } from './decisions/watch.js';
 import { claimPath, readClaim } from './decisions/claim.js';
 import { directlyTouches } from './decisions/prune.js';
-import { normalizeScreen, parseExpectations } from './focus.js';
+import { normalizeScreen, parseExpectations, screenLabels } from './focus.js';
 // v0.8 dynamic params hooks: the tiers, discovery and the session file live in src/resolve/param-*.ts and session-*.ts.
 import { ParamDiscoverer, writeDiscoveryCache, type DiscoveryOutcome } from './resolve/param-discovery.js';
 import { ParamFiller, type FillOutcome } from './resolve/param-fill.js';
 import { loadLayeredParams, type LayeredParams } from './resolve/param-tiers.js';
 import { hasParams } from './resolve/route-pattern.js';
 import { changedSessionRoutes, readSessionParams, type SessionEntry } from './resolve/session-params.js';
-import { watchSessionParams, type SessionWatchHandle } from './resolve/session-watch.js';
+import { watchFile, watchSessionParams, type SessionWatchHandle } from './resolve/session-watch.js';
 
 export type { DaemonState, Status };
 
@@ -79,6 +82,8 @@ export interface WatchOptions {
   decisionsClient?: DecisionsApi;
   /** v0.8: replaces the watcher on `session-params.json` (tests). */
   watchSession?: typeof watchSessionParams;
+  /** v0.12: replaces the watcher on the claim file (tests). */
+  watchClaim?: typeof watchFile;
 }
 
 export interface FrameEvent {
@@ -112,6 +117,14 @@ interface Pending {
   params: Set<string>;
   /** v0.8: the session file revision the `params` come from; acknowledged in `status.json` when handled. */
   paramsRev?: number;
+  /** v0.12: the claim names screens it did not before; capture those without a clean frame at the current tree. */
+  claim: boolean;
+  /** v0.12: targets whose frames a change during their capture made stale, to capture again (by concrete path). */
+  retry: Map<string, Target>;
+  /** v0.12: sidecar files whose run a change during it made stale, with the trigger the run had. */
+  retrySidecars: Map<string, Trigger>;
+  /** v0.12: changed screen files behind a retry; the retry waits on the HMR barrier for them. */
+  retryWait: Set<string>;
   startedAt: number;
   attempts: number;
 }
@@ -133,6 +146,23 @@ interface ScenarioJob {
   sidecar: Sidecar;
   plan: ScenarioPlan;
   trigger: Trigger;
+}
+
+/** One capture of a batch, before it is recorded. */
+interface Captured {
+  target: Target;
+  at: string;
+  png: Buffer;
+  signals: CaptureSignals;
+  renderedFiles: string[] | null;
+  timing?: CaptureTiming;
+  pageText?: string;
+  /** Sidecar stills only. */
+  steps?: FrameStep[];
+  /** Sidecar stills of a recorded run (v0.9). */
+  clip?: string;
+  /** Sidecar stills only: the run they came from. */
+  job?: ScenarioJob;
 }
 
 const STALE_MESSAGE = 'stale: freshness marker missing, capture refused';
@@ -172,6 +202,12 @@ class Watcher {
   /** The session entries last seen, to tell which ones a change of the file is about. */
   private sessionSeen: Record<string, SessionEntry> = {};
   private sessionWatch: SessionWatchHandle | null = null;
+  // v0.12 claim
+  private claimWatch: SessionWatchHandle | null = null;
+  /** The claim screens last seen (normalized), to tell when the claim names a new one. */
+  private claimSeen = new Set<string>();
+  /** Whether "no claim screens yet" was logged since the claim last named one. */
+  private noClaimNoted = false;
 
   private capturer: Capturer | null = null;
   private barrier: BarrierSource | null = null;
@@ -276,6 +312,7 @@ class Watcher {
       });
 
       await this.startSessionWatch();
+      await this.startClaimWatch();
 
       await this.warmUp().catch((err: Error) => {
         // Never fatal: the watcher works without a warm Vite, only its first capture is slower.
@@ -453,6 +490,7 @@ class Watcher {
     this.stopping = true;
     await this.trigger?.stop().catch(() => {});
     await this.sessionWatch?.stop().catch(() => {});
+    await this.claimWatch?.stop().catch(() => {});
     await this.barrier?.stop().catch(() => {});
     await this.capturer?.close().catch(() => {});
   }
@@ -516,14 +554,22 @@ class Watcher {
     sidecar: Iterable<string>;
     params?: Iterable<string>;
     paramsRev?: number;
+    claim?: boolean;
+    retry?: Map<string, Target>;
+    retrySidecars?: Map<string, Trigger>;
+    retryWait?: Iterable<string>;
     startedAt: number;
     attempts: number;
   }): void {
-    const pending = (this.pending ??= {
+    const pending: Pending = (this.pending ??= {
       screen: new Set(),
       backend: new Set(),
       sidecar: new Set(),
       params: new Set(),
+      claim: false,
+      retry: new Map(),
+      retrySidecars: new Map(),
+      retryWait: new Set(),
       startedAt: part.startedAt,
       attempts: part.attempts,
     });
@@ -531,6 +577,10 @@ class Watcher {
     for (const f of part.backend) pending.backend.add(f);
     for (const f of part.sidecar) pending.sidecar.add(f);
     for (const k of part.params ?? []) pending.params.add(k);
+    if (part.claim) pending.claim = true;
+    for (const [p, t] of part.retry ?? []) if (!pending.retry.has(p)) pending.retry.set(p, t);
+    for (const [f, t] of part.retrySidecars ?? []) if (!pending.retrySidecars.has(f)) pending.retrySidecars.set(f, t);
+    for (const f of part.retryWait ?? []) pending.retryWait.add(f);
     if (part.paramsRev !== undefined) pending.paramsRev = Math.max(pending.paramsRev ?? 0, part.paramsRev);
     pending.startedAt = Math.min(pending.startedAt, part.startedAt);
     pending.attempts = Math.max(pending.attempts, part.attempts);
@@ -556,6 +606,7 @@ class Watcher {
     const backend = [...batch.backend].sort();
     const sidecar = [...batch.sidecar].sort();
     const paramKeys = [...batch.params].sort(); // v0.8: routes whose session params were just set
+    const retryWait = [...batch.retryWait].filter((f) => !batch.screen.has(f)).sort();
     let requeued = false;
     const done = (outcome: BatchEvent['outcome'], routes: string[] = []): void => {
       this.events.emit('batch', { screen, backend, sidecar, routes, outcome } satisfies BatchEvent);
@@ -597,7 +648,7 @@ class Watcher {
       }
       if (screen.length > 0) {
         const [barrier, resolution] = await Promise.all([
-          this.waitBarrier(batch.startedAt, screen),
+          this.waitBarrier(batch.startedAt, [...screen, ...retryWait]),
           this.resolveScreen(screen, params),
         ]);
         mark('barrier+routes');
@@ -608,6 +659,10 @@ class Watcher {
           // keep every frame of the session at HEAD, as for a backend change.
           recapture = { trigger: 'screen', why: `no route for ${resolution.unmapped.join(',')}`, sourceFile: resolution.unmapped[0]! };
         }
+      } else if (retryWait.length > 0) {
+        const barrier = await this.waitBarrier(batch.startedAt, retryWait);
+        mark('barrier');
+        this.log(`batch retry (${retryWait.join(',')} changed during the last capture) barrier=${barrier}`);
       }
       if (backend.length > 0) {
         if (screen.length === 0) this.log(`batch backend=${backend.join(',')}`);
@@ -639,8 +694,15 @@ class Watcher {
         if (this.sessionRoutes.size === 0) this.log(`${recapture.why}: no routes captured this session yet`);
         else if (recapture.trigger === 'screen') this.log(`${recapture.why}: re-capturing ${this.sessionRoutes.size} route(s) captured this session`);
       }
+      for (const [routePath, target] of batch.retry) if (!targets.has(routePath)) targets.set(routePath, target);
+      const extraScenarios = new Map(batch.retrySidecars);
+      if (batch.claim) {
+        for (const [file, trigger] of await this.addClaimTargets(targets, params, await beforeP)) {
+          if (!extraScenarios.has(file)) extraScenarios.set(file, trigger);
+        }
+      }
 
-      const scenarios = await this.pickScenarios({ changed: sidecar, screen, recapture: recapture?.trigger ?? null, params });
+      const scenarios = await this.pickScenarios({ changed: sidecar, screen, recapture: recapture?.trigger ?? null, params, extra: extraScenarios });
 
       if (targets.size === 0 && scenarios.length === 0) {
         this.log('no routes to capture');
@@ -651,19 +713,10 @@ class Watcher {
 
       const before = await beforeP;
       mark('resolve');
-      const captured: Array<{
-        target: Target;
-        at: string;
-        png: Buffer;
-        signals: CaptureSignals;
-        renderedFiles: string[] | null;
-        timing?: CaptureTiming;
-        pageText?: string;
-        /** Sidecar stills only. */
-        steps?: FrameStep[];
-        /** Sidecar stills of a recorded run (v0.9). */
-        clip?: string;
-      }> = [];
+      this.status.queue = targets.size + scenarios.length;
+      this.writeStatus();
+      const captureStart = Date.now();
+      const captured: Captured[] = [];
       let captureFailed = false;
       for (const target of targets.values()) {
         if (this.stopping) return;
@@ -702,6 +755,7 @@ class Watcher {
               pageText: still.pageText,
               steps: still.steps,
               clip,
+              job,
             });
           }
           ranScenarios.push(file);
@@ -722,26 +776,70 @@ class Watcher {
       mark('hash');
       if (this.stopping) return;
       const eventsDuring = (this.trigger?.eventCount() ?? 0) - eventsBefore;
+      let keep = captured;
+      const droppedRuns = new Set<string>();
+      let keptRoutes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
       if (after !== before || eventsDuring > 0) {
-        const requeue = batch.attempts < (this.opts.maxRequeues ?? 2);
+        const maxRequeues = this.opts.maxRequeues ?? 2;
         const why =
           after !== before
             ? `working tree changed during capture (${before.slice(0, 8)} -> ${after.slice(0, 8)})`
             : `${eventsDuring} file event(s) arrived during capture (tree unchanged: ${after.slice(0, 8)})`;
-        this.log(`discarded ${captured.length} frame(s): ${why}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
-        for (const clip of new Set(captured.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
-        const routes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
-        this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
-        if (requeue) {
-          // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
-          this.merge({ screen, backend, sidecar, params: paramKeys, paramsRev: batch.paramsRev, startedAt: Date.now(), attempts: batch.attempts + 1 });
-          requeued = true;
+        const split = await this.splitMidCapture(captured, { before, after, eventsBefore, eventsDuring });
+        if (this.stopping) return;
+        if ('unknown' in split) {
+          // Cannot tell which frames the change reaches: none of them can be trusted.
+          const requeue = batch.attempts < maxRequeues;
+          this.log(`discarded ${captured.length} frame(s): ${why}; ${split.unknown}` + (requeue ? '; re-queued' : '; giving up after repeated changes'));
+          for (const clip of new Set(captured.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
+          const routes = [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)];
+          this.events.emit('discarded', { routes, before, after, requeued: requeue, events: eventsDuring });
+          if (requeue) {
+            // Not the old batch's startedAt: that would let a message from before this capture satisfy the next barrier.
+            this.merge({ screen, backend, sidecar, params: paramKeys, paramsRev: batch.paramsRev, claim: batch.claim, retry: batch.retry, retrySidecars: batch.retrySidecars, retryWait, startedAt: Date.now(), attempts: batch.attempts + 1 });
+            requeued = true;
+          }
+          done('discarded', routes);
+          return;
         }
-        done('discarded', routes);
-        return;
+        keep = split.kept;
+        keptRoutes = keep.map((c) => c.target.path);
+        if (split.dropped.length === 0) {
+          this.log(`kept ${keep.length} frame(s), discarded 0: ${why}, but nothing they show depends on ${split.files.join(', ') || 'it'}`);
+        } else {
+          const requeue = batch.attempts < maxRequeues;
+          const reasons = split.dropped.map((d) => `${d.label} (${d.why})`);
+          const listed = reasons.length > 5 ? [...reasons.slice(0, 5), `${reasons.length - 5} more`] : reasons;
+          this.log(
+            `kept ${keep.length} frame(s), discarded ${split.dropped.length}: ${why}; stale: ${listed.join(', ')}` +
+              (requeue ? '; re-queued' : '; giving up after repeated changes'),
+          );
+          const droppedEntries = split.dropped.flatMap((d) => d.entries);
+          for (const entry of droppedEntries) if (entry.job) droppedRuns.add(entry.job.sidecar.file);
+          for (const clip of new Set(droppedEntries.map((c) => c.clip))) if (clip) this.timeline.dropClip(clip);
+          const routes = droppedEntries.map((c) => c.target.path);
+          this.events.emit('discarded', { routes, kept: keptRoutes, before, after, requeued: requeue, events: eventsDuring });
+          if (requeue) {
+            const retry = new Map<string, Target>();
+            const retrySidecars = new Map<string, Trigger>();
+            for (const entry of droppedEntries) {
+              if (entry.job) retrySidecars.set(entry.job.sidecar.file, entry.job.trigger);
+              else retry.set(entry.target.path, entry.target);
+            }
+            // Since the capture started, not before: the barrier must not credit a message for the save that began this batch.
+            this.merge({ screen: [], backend: [], sidecar: [], paramsRev: batch.paramsRev, retry, retrySidecars, retryWait: split.screenFiles, startedAt: captureStart, attempts: batch.attempts + 1 });
+            requeued = true;
+          }
+          if (keep.length === 0) {
+            done('discarded', routes);
+            return;
+          }
+        }
       }
 
-      for (const { target, at, png, signals, renderedFiles, timing, pageText, steps, clip } of captured) {
+      // A kept frame depends on nothing that differs between `before` and `after`, so it shows `after` as much as
+      // `before`; recording it at `after`, the current tree, lets `finish` match it at HEAD without carrying it.
+      for (const { target, at, png, signals, renderedFiles, timing, pageText, steps, clip } of keep) {
         const verdict = triage(signals);
         const frame = this.timeline.append(
           {
@@ -775,19 +873,80 @@ class Watcher {
         );
         this.events.emit('frame', { frame, signals, pngPath: this.timeline.pngPath(frame) } satisfies FrameEvent);
       }
-      for (const file of ranScenarios) this.sidecarsRun.add(file);
+      for (const file of ranScenarios) if (!droppedRuns.has(file)) this.sidecarsRun.add(file);
       mark('write');
-      if (!captureFailed && captured.length > 0) this.status.lastError = null; // the last problem is resolved
+      if (!captureFailed && keep.length > 0) this.status.lastError = null; // the last problem is resolved
       this.log(`timing ${JSON.stringify(lap)} (ms since batch start; the debounce before it is not included)`);
-      done('captured', [...targets.keys(), ...captured.filter((c) => c.steps).map((c) => c.target.path)]);
+      done('captured', keptRoutes);
     } catch (err) {
       this.fail(err as Error);
       done('error');
     } finally {
+      delete this.status.queue;
       if (!requeued) this.ackSessionParams(batch);
       if (!this.stopping) this.setState('ready');
       if (this.graphStale && !this.stopping) this.refreshGraph();
     }
+  }
+
+  /**
+   * Which frames of a batch still stand after files changed while it was being captured. The files are those that
+   * differ between the trees before and after the capture plus those with a file event during it (a save reverted
+   * before the second hash still counts); a frame goes when one of them can have changed it, by the rules `finish`
+   * carries frames forward with ({@link staleCheck}). A sidecar run is kept or dropped as a whole. `unknown` says why
+   * this cannot be established (no import graph, git cannot compare the trees, a trigger that only counts events).
+   */
+  private async splitMidCapture(
+    captured: Captured[],
+    change: { before: string; after: string; eventsBefore: number; eventsDuring: number },
+  ): Promise<
+    | { kept: Captured[]; dropped: Array<{ label: string; why: string; entries: Captured[] }>; files: string[]; screenFiles: string[] }
+    | { unknown: string }
+  > {
+    let touched: string[] = [];
+    if (change.eventsDuring > 0) {
+      const paths = this.trigger?.eventsSince?.(change.eventsBefore);
+      if (!paths) return { unknown: 'the trigger does not say which files the events were for' };
+      touched = paths;
+    }
+    let diff: string[] = [];
+    if (change.after !== change.before) {
+      const files = await treeDiff(this.config.repoDir, change.before, change.after);
+      if (files === null) return { unknown: 'git cannot compare the two trees' };
+      diff = files;
+    }
+    let graph: ImportGraph;
+    try {
+      graph = await this.getGraph();
+    } catch {
+      return { unknown: 'no import graph to tell which frames the change reaches' };
+    }
+    const stale = staleCheck(this.config, graph);
+    const files = [...new Set([...diff, ...touched])].sort();
+    const knownKeys = [...graph.routes.map((r) => r.path), ...Object.values(this.config.staticRoutes).flat()];
+
+    const kept: Captured[] = [];
+    const dropped: Array<{ label: string; why: string; entries: Captured[] }> = [];
+    const runs = new Map<ScenarioJob, Captured[]>();
+    for (const entry of captured) {
+      if (entry.job) {
+        const run = runs.get(entry.job) ?? [];
+        run.push(entry);
+        runs.set(entry.job, run);
+        continue;
+      }
+      const why = stale(files, { keys: [entry.target.routeKey], renderedFiles: entry.renderedFiles });
+      if (why === null) kept.push(entry);
+      else dropped.push({ label: entry.target.path, why, entries: [entry] });
+    }
+    for (const [job, entries] of runs) {
+      const keys = scenarioRouteKeys(job.sidecar, knownKeys);
+      const why = entries.map((e) => stale(files, { keys, sidecarFile: job.sidecar.file, renderedFiles: e.renderedFiles })).find((w) => w !== null) ?? null;
+      if (why === null) kept.push(...entries);
+      else dropped.push({ label: `sidecar ${job.sidecar.file}`, why, entries });
+    }
+    const { isScreen } = classifier(this.config);
+    return { kept, dropped, files, screenFiles: files.filter((f) => isScreen(f)) };
   }
 
   // ---- sidecars ------------------------------------------------------------
@@ -812,14 +971,16 @@ class Watcher {
   /**
    * The scenarios to replay for this batch: the sidecar files that changed; those with a `goto` on a route that a
    * changed screen file renders (through the import graph); and, when the batch re-captures routes (a backend
-   * change, or a screen file with no route), every scenario that has run this session. A scenario that does not
-   * parse is logged and skipped: `finish` reports it.
+   * change, or a screen file with no route), every scenario that has run this session; plus `extra` (v0.12: runs to
+   * repeat after a change during them, and scenarios with a still the claim names). A scenario that does not parse
+   * is logged and skipped: `finish` reports it.
    */
   private async pickScenarios(batch: {
     changed: string[];
     screen: string[];
     recapture: Trigger | null;
     params: Record<string, string>;
+    extra?: Map<string, Trigger>;
   }): Promise<ScenarioJob[]> {
     if (this.config.sidecars.length === 0) return [];
     const existing = new Set(findSidecarFiles(this.config.repoDir, this.config.sidecars));
@@ -832,6 +993,7 @@ class Watcher {
     if (batch.recapture) {
       for (const file of this.sidecarsRun) if (!reasons.has(file)) reasons.set(file, batch.recapture);
     }
+    for (const [file, trigger] of batch.extra ?? []) if (existing.has(file) && !reasons.has(file)) reasons.set(file, trigger);
 
     const loaded = new Map<string, Sidecar>();
     const load = (file: string): Sidecar => {
@@ -1002,14 +1164,20 @@ class Watcher {
 
   /**
    * Whether a route is a headline (a claim screen, or a page whose own component or layout changed), or null when
-   * focus does not apply: `focus.mode` is `all`, or the claim names no screen (every route is then a headline, as
-   * `finish` falls back to).
+   * focus does not apply (`focus.mode` is `all`). Before the claim names a screen, only changed pages are headlines,
+   * so a shared component still captures at most `focus.maxImpact` other routes (v0.12); naming the screens later
+   * captures them (see {@link onClaim}).
    */
   private headlineTest(graph: ImportGraph): ((r: { path?: string; routeKey: string; sourceFiles: string[] }) => boolean) | null {
     if (this.config.focus.mode !== 'claim') return null;
-    const claim = readClaim(claimPath(this.config.claimFile, this.config.repoDir, this.dirs.statusDir));
-    const screens = new Set([...parseExpectations('text' in claim ? claim.text : undefined).keys()].map(normalizeScreen));
-    if (screens.size === 0) return null;
+    const screens = this.claimScreens();
+    if (screens.size === 0 && !this.noClaimNoted) {
+      this.noClaimNoted = true;
+      this.log(
+        `focus: no claim screens yet (${this.claimFile()}); capturing changed pages first and at most ${this.config.focus.maxImpact} other routes. ` +
+          'Name the screens in the claim to pick the headlines.',
+      );
+    }
     return (r) =>
       (r.path !== undefined && screens.has(normalizeScreen(r.path))) ||
       screens.has(normalizeScreen(r.routeKey)) ||
@@ -1138,6 +1306,110 @@ class Watcher {
   private ackSessionParams(batch: Pending): void {
     if (batch.paramsRev === undefined || this.stopping) return;
     this.status.sessionParamsRev = Math.max(this.status.sessionParamsRev ?? 0, batch.paramsRev);
+  }
+
+  // ---- claim (v0.12) -------------------------------------------------------
+
+  private claimFile(): string {
+    return claimPath(this.config.claimFile, this.config.repoDir, this.dirs.statusDir);
+  }
+
+  /** The screens the claim's `<screen>: <what must be visible>` lines name, normalized; empty without a claim. */
+  private claimScreens(): Set<string> {
+    const claim = readClaim(this.claimFile());
+    const screens = new Set([...parseExpectations('text' in claim ? claim.text : undefined).keys()].map(normalizeScreen));
+    if (screens.size > 0) this.noClaimNoted = false;
+    return screens;
+  }
+
+  /** Watch the claim file: when it names a new screen, capture the claim screens that have no clean frame yet. */
+  private async startClaimWatch(): Promise<void> {
+    if (this.config.focus.mode !== 'claim') return;
+    this.claimSeen = this.claimScreens(); // a claim from before this watcher started is read per batch, not captured by itself
+    const file = this.claimFile();
+    if (!this.opts.watchClaim && !fs.existsSync(path.dirname(file))) {
+      this.log(`claim: ${path.dirname(file)} does not exist, so a claim written later is read on the next save only`);
+      return;
+    }
+    const watch = this.opts.watchClaim ?? watchFile;
+    this.claimWatch = await watch(file, () => this.onClaim(), (err) => this.fail(err));
+  }
+
+  private onClaim(): void {
+    if (this.stopping) return;
+    const screens = this.claimScreens();
+    const added = [...screens].filter((s) => !this.claimSeen.has(s));
+    this.claimSeen = screens;
+    if (added.length === 0) return;
+    this.log(`claim names ${added.join(', ')}; capturing the claim screens that have no clean frame at the current tree`);
+    this.merge({ screen: [], backend: [], sidecar: [], claim: true, startedAt: Date.now(), attempts: 0 });
+    if (!this.warmingUp) this.running ??= this.drain();
+    this.refreshPending();
+    this.writeStatus();
+  }
+
+  /**
+   * Add a target for every claim screen that is a route (a key like `/facilities/:id`, filled through the params
+   * chain, or a concrete path like `/facilities/3`) without a clean frame at `tree`; return the sidecar files with a
+   * still the claim names and no clean frame at `tree`, to replay.
+   */
+  private async addClaimTargets(targets: Map<string, Target>, params: Record<string, string>, tree: string): Promise<Map<string, Trigger>> {
+    const screens = this.claimScreens();
+    const scenarios = new Map<string, Trigger>();
+    if (screens.size === 0) return scenarios;
+    const clean = (route: string): boolean => this.timeline.latestAtTree(route, tree)?.status === 'clean';
+    let knownKeys: string[] = Object.values(this.config.staticRoutes).flat();
+    try {
+      const graph = await this.getGraph();
+      knownKeys = [...graph.routes.map((r) => r.path), ...knownKeys];
+    } catch (err) {
+      this.log(`claim: import graph unavailable: ${(err as Error).message.split('\n')[0]}`);
+    }
+    const added: string[] = [];
+    for (const screen of [...screens].sort()) {
+      if (!screen.startsWith('/') || clean(screen)) continue;
+      let routeKey = screen;
+      let routePath: string;
+      let provenance: Provenance = {};
+      if (hasParams(screen)) {
+        const concrete = concretePath(screen, params);
+        if (concrete.ok) {
+          routePath = concrete.path;
+          provenance = this.provenanceOf(screen);
+        } else if (this.filler?.canFill(screen)) {
+          const outcome = await this.fillRoute(screen);
+          if (!outcome.ok) {
+            this.log(`claim: skipped ${screen}: ${outcome.reason}`);
+            continue;
+          }
+          routePath = outcome.path;
+          provenance = { paramsFrom: outcome.from, foundOn: outcome.foundOn, discoveryMs: outcome.discoveryMs };
+        } else {
+          this.log(`claim: skipped ${screen}: ${concrete.reason}`);
+          continue;
+        }
+      } else {
+        routePath = screen;
+        routeKey = gotoRouteKeys(screen, knownKeys)[0] ?? screen;
+      }
+      if (targets.has(routePath) || clean(routePath)) continue;
+      targets.set(routePath, { path: routePath, routeKey, url: joinUrl(this.config.appUrl, routePath), trigger: 'claim', ...provenance });
+      added.push(routePath);
+    }
+    if (this.config.sidecars.length > 0) {
+      for (const file of findSidecarFiles(this.config.repoDir, this.config.sidecars)) {
+        const sidecar = loadSidecar(this.config.repoDir, file);
+        const named = sidecar.stills.some((still) =>
+          screenLabels({ route: '', routeKey: '', sourceFiles: [], via: 'sidecar', scenario: { file, name: sidecar.name, still } }).some((label) => screens.has(normalizeScreen(label))),
+        );
+        if (named && !sidecar.stills.every((still) => clean(sidecarRoute(file, still)))) {
+          scenarios.set(file, 'claim');
+          added.push(`sidecar ${file}`);
+        }
+      }
+    }
+    this.log(added.length > 0 ? `claim: capturing ${added.join(', ')}` : 'claim: every claim screen already has a clean frame at the current tree');
+    return scenarios;
   }
 
   private getGraph(): Promise<ImportGraph> {

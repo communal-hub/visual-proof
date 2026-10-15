@@ -6,6 +6,14 @@ export interface SessionWatchHandle {
 }
 
 /**
+ * Calls `onChange` whenever `file` is created, rewritten or removed. The watcher uses it for `session-params.json`
+ * (below) and for the claim file (v0.12), which an agent often writes only after its first save.
+ */
+export async function watchFile(file: string, onChange: () => void, onError?: (error: Error) => void): Promise<SessionWatchHandle> {
+  return watchSessionParams(file, onChange, onError);
+}
+
+/**
  * Calls `onChange` whenever `session-params.json` is created, rewritten (the CLI replaces it atomically) or removed.
  * This is how a running watcher learns of `visual-proof params set`: it needs no socket or signal, only the status
  * dir both processes already share. Resolves once the OS watch is armed, so a `set` made after it is seen.

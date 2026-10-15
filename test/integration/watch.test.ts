@@ -137,4 +137,13 @@ describe('watch against the vite-vue fixture', () => {
     const event = await h.waitForFrame((e) => e.signals.text.includes('fresh again'), 5000);
     expect(event.frame.status).toBe('clean');
   });
+
+  it('a claim written after the first saves captures the claim screen that has no frame', async () => {
+    const from = h.frames.length;
+    fs.writeFileSync(path.join(h.dirs.statusDir, 'claim.md'), '- /reports: the reports heading\n- not a route: ignored\n');
+    const event = await h.waitForFrame((e) => e.frame.route === '/reports', 10_000, { from });
+    expect(event.frame).toMatchObject({ trigger: 'claim', status: 'clean' });
+    await sleep(500);
+    expect(h.frames.slice(from).map((f) => f.frame.route)).toEqual(['/reports']);
+  });
 });
