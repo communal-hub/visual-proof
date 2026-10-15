@@ -477,7 +477,7 @@ function parseRoles(raw: Record<string, string> | undefined, errors: string[]): 
 }
 
 export const DEFAULT_MAX_IMPACT = 40;
-export const DEFAULT_IMPACT_CONCURRENCY = 2;
+export const DEFAULT_IMPACT_CONCURRENCY = 3;
 /** Most impact captures that may run side by side; more only starves the dev server. */
 export const MAX_IMPACT_CONCURRENCY = 4;
 export const DEFAULT_FINISH_BUDGET_MS = 25_000;
